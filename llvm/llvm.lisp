@@ -14,15 +14,45 @@
                   (sb-sys:sap-int (sb-vm:context-pc context))))))
 (sb-sys:enable-interrupt sb-posix:sigabrt #'sigabrt-handler)
 
+;; END HACK
 
+(cffi::defcallback intern :int64 ((name :string) (package :string))
+  (sb-kernel:get-lisp-obj-address (intern name package)))
+
+(cffi::defcallback symbol-function :int64 ((symbol :int64))
+  (sb-kernel:get-lisp-obj-address (symbol-function (sb-kernel:make-lisp-obj symbol))))
 
 (defun LispObjType ()
   (LLVMInt64TypeInContext *llvm-context*))
 
+(defun declare-intrinsic-function (mod name ret-type arg-types &key (global-mapping nil))
+  (let ((previous-fun (LLVMGetNamedFunction mod name)))
+    (if (cffi:pointer-eq previous-fun (cffi:null-pointer))
+        (let ((function (LLVMAddFunction mod name
+                                         (LLVMFunctionType* ret-type arg-types 0))))
+          (LLVMSetFunctionCallConv function (cffi:foreign-enum-value 'LLVMCallConv :LLVMCCallConv))
+          (LLVMSetLinkage function :LLVMExternalLinkage)
+          (assert (eql 1 (LLVMIsDeclaration function)))
+          (when (eql (mismatch "llvm." name) 5) ; name starts with llvm.
+            (assert (/= 0 (LLVMGetIntrinsicID function))))
+          (when global-mapping
+            (LLVMAddGlobalMapping *jit-execution-engine*
+                                  function
+                                  global-mapping))
+          function)
+        previous-fun)))
+
 (defun define-support-fns (mod)
-  (LLVMAddFunction mod "call_into_lisp"
-                   (LLVMFunctionType* (LispObjType) (list (LispObjType) (LLVMPointerType (LispObjType) 0) (LLVMInt32TypeInContext *llvm-context*)) 0))
-)
+  (declare-intrinsic-function mod "call_into_lisp" 
+    (LispObjType)
+    (list (LispObjType) (LLVMPointerType (LispObjType) 0) (LLVMInt32TypeInContext *llvm-context*)))
+  (declare-intrinsic-function mod "intern"
+                              (LispObjType) (list (LLVMPointerType (LLVMInt8TypeInContext *llvm-context*) 0)
+                                                  (LLVMPointerType (LLVMInt8TypeInContext *llvm-context*) 0))
+                              :global-mapping (cffi::callback intern))
+  (declare-intrinsic-function mod "symbol-function"
+                              (LispObjType) (list (LispObjType))
+                              :global-mapping (cffi::callback symbol-function)))
 ;  (LLVMAddGlobal mod (LLVMFunctionType* (LispObjType) (list (LLVMPointerType (LispObjType) 0)) 0)
 ;                 "call_into_lisp"))
 ;  (CLLLVM_LLVMParseAssemblyString
@@ -97,6 +127,74 @@
           (sb-c::creturn (llvm-convert-return llfun builder node)))
         ))))
 
+(defmacro with-load-time-builder (builder &body body)
+  `(let ((,builder *ltv-builder*))
+     ,@body))
+
+
+(defun llvm-emit-global-string (mod str)
+  (cffi:with-foreign-string ((foreign-string num-bytes) str)
+    (let ((global (LLVMAddGlobal mod (LLVMArrayType (LLVMInt8Type) (+ 1 num-bytes)) ".str")))
+      (LLVMSetInitializer global (LLVMConstStringInContext *llvm-context* foreign-string num-bytes 0))
+      (LLVMSetGlobalConstant global 1)
+      global)))
+
+(defun llvm-emit-symbol-ref (builder value)
+  ;; Check for static symbols?
+  (let* ((global (LLVMAddGlobal *jit-module* (LispObjType) (symbol-name value)))
+         (name-var (llvm-emit-global-string *jit-module* (symbol-name value)))
+         (package-name-var (llvm-emit-global-string *jit-module* (package-name (symbol-package value)))))
+    (LLVMSetLinkage global :LLVMInternalLinkage)
+    (LLVMSetInitializer global (LLVMConstInt (LispObjType) 0 0))
+    (LLVMBuildStore builder
+                    (LLVMBuildCall* builder (LLVMGetNamedFunction *jit-module* "intern")
+                                    (list
+                                     (LLVMBuildGEP* builder name-var (llvmconstify (LLVMInt32TypeInContext *llvm-context*) (list 0 0)))
+                                     (LLVMBuildGEP* builder package-name-var (llvmconstify (LLVMInt32TypeInContext *llvm-context*) (list 0 0))))
+                                    "intern")
+                    global)
+    (LLVMBuildLoad builder global "symbol")))
+
+(defun llvm-emit-symbol-function (builder value)
+  (LLVMBuildCall* builder (LLVMGetNamedFunction *jit-module* "symbol-function")
+                  (list
+                   (llvm-emit-symbol-ref builder value))
+                  "symbol-function"))
+
+(defun llvm-emit-constant (builder leaf)
+  (let ((value (sb-c::constant-value leaf)))
+    (typecase value
+      ;; most-*-fixnum should have sb!xc: prefix
+      ((integer #.most-negative-fixnum #.most-positive-fixnum)
+         (LLVMConstInt (LispObjType) (* value 8) 0)) ; FIXME: fixnum mult = 8
+      (integer
+         (FIXME-BIGINT))
+      (character
+         (FIXME-CHARACTER))
+      (symbol
+         (llvm-emit-symbol-ref builder value)
+)
+      #|
+      (when (static-symbol-p value)
+      (sc-number-or-lose 'immediate)))
+      (single-float
+      (sc-number-or-lose
+      (if (eql value 0f0) 'fp-single-zero 'fp-single-immediate)))
+      (double-float
+      (sc-number-or-lose
+      (if (eql value 0d0) 'fp-double-zero 'fp-double-immediate)))
+      ((complex single-float)
+      (sc-number-or-lose
+      (if (eql value #c(0f0 0f0))
+      'fp-complex-single-zero
+      'fp-complex-single-immediate)))
+      ((complex double-float)
+      (sc-number-or-lose
+      (if (eql value #c(0d0 0d0))
+      'fp-complex-double-zero
+      'fp-complex-double-immediate)))|#)
+    ))
+
 ;;; Convert a REF node. The reference must not be delayed.
 (defun llvm-convert-ref (llfun builder node)
   (declare (type sb-c::ref node))
@@ -109,31 +207,35 @@
              FIXME #|(vop value-cell-ref node block tn res)|#
              (setf (sb-c::lvar-info lvar) llvm-var))))
       (sb-c::constant
-         FIXME #|(emit-move node block (constant-tn leaf) res)|#)
+         (setf (sb-c::lvar-info lvar)
+               (or (sb-c::leaf-info leaf)
+                   (llvm-emit-constant builder leaf)))
+         (assert (not (null (sb-c::lvar-info lvar))))
+         )
       (sb-c::functional
-         FIXME #|(ir2-convert-closure node block leaf res)|#)
+         (FIXME-FUNCTIONAL) #|(ir2-convert-closure node block leaf res)|#)
       (sb-c::global-var
-         FIXME
-       #|(let ((unsafe (policy node (zerop safety)))
-             (name (leaf-source-name leaf)))
-         (ecase (global-var-kind leaf)
-           ((:special :unknown)
-            (aver (symbolp name))
-            (let ((name-tn (emit-constant name)))
-              (if (or unsafe (info :variable :always-bound name))
-                  (vop fast-symbol-value node block name-tn res)
-                  (vop symbol-value node block name-tn res))))
-           (:global
-            (aver (symbolp name))
-            (let ((name-tn (emit-constant name)))
-              (if (or unsafe (info :variable :always-bound name))
-                  (vop fast-symbol-global-value node block name-tn res)
-                  (vop symbol-global-value node block name-tn res))))
-           (:global-function
-            (let ((fdefn-tn (make-load-time-constant-tn :fdefinition name)))
-              (if unsafe
-                  (vop fdefn-fun node block fdefn-tn res)
-                  (vop safe-fdefn-fun node block fdefn-tn res))))))|#)
+         (let ((unsafe (sb-c::policy node (zerop safety)))
+               (name (sb-c::leaf-source-name leaf)))
+           (ecase (sb-c::global-var-kind leaf)
+             ((:special :unknown)
+                #|(aver (symbolp name))
+                (let ((name-tn (emit-constant name)))
+                  (if (or unsafe (info :variable :always-bound name))
+                      (vop fast-symbol-value node block name-tn res)
+                      (vop symbol-value node block name-tn res)))|#)
+             (:global
+                #|(aver (symbolp name))
+                (let ((name-tn (emit-constant name)))
+                  (if (or unsafe (info :variable :always-bound name))
+                      (vop fast-symbol-global-value node block name-tn res)
+                      (vop symbol-global-value node block name-tn res)))|#)
+             (:global-function
+                (setf (sb-c::lvar-info lvar) (llvm-emit-symbol-function builder name))
+                #|(let ((fdefn-tn (make-load-time-constant-tn :fdefinition name)))
+                  (if unsafe
+                      (vop fdefn-fun node block fdefn-tn res)
+                      (vop safe-fdefn-fun node block fdefn-tn res)))|#))))
          ))
   (values))
 
@@ -147,15 +249,13 @@
          (arg-count-llc (LLVMConstInt (LLVMInt32TypeInContext *llvm-context*) arg-count 0))
          (arg-mem (LLVMBuildArrayAlloca builder (LispObjType)
                                       arg-count-llc "CIL-array")))
-;    (setf (sb-c::lvar-info lvar) (sb-c::lvar-info (sb-c::combination-fun node)))
-;    (return-from llvm-convert-combination nil)
     (loop for arg in (sb-c::combination-args node)
           for n from 0
           do
           (let ((GEP (LLVMBuildGEP* builder arg-mem (llvmconstify (LLVMInt32TypeInContext *llvm-context*) (list n)))))
             (LLVMBuildStore builder (sb-c::lvar-info arg) GEP)))
 
- ; pass array as pointer to first element.
+    ;; BuildGEP is because we pass array as pointer to first element.
     (let* ((arg-mem-ptr (LLVMBuildGEP* builder arg-mem (llvmconstify (LLVMInt32TypeInContext *llvm-context*) (list 0))))
            (call-into-lisp (LLVMGetNamedFunction *jit-module* "call_into_lisp"))
            (callee (sb-c::lvar-info (sb-c::combination-fun node))))
