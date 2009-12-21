@@ -1,0 +1,62 @@
+This is currently a set of hacks off to the side of SBCL to implement
+LLVM compilation. It depends on CL-LLVM, which you can get from:
+  http://repo.or.cz/w/cl-llvm.git
+
+There are two parts:
+
+1) llvm/compile.lisp: Hacked up copies of a few functions in SBCL to
+compile an expression, but stop after IR1.
+2) llvm/llvm.lisp: emit LLVM code from IR1.
+
+While this is a branch of SBCL, I've not actually modified anything in
+SBCL at the moment...so to run this code, 
+ (require 'cl-llvm)
+ (load (compile-file "llvm/compile.lisp"))
+ (load (compile-file "llvm/llvm.lisp"))
+
+Then, try compiling a function:
+ (llvm-compile '(lambda (x) (+ x 5)))
+
+And try running it:
+ (run-fun * 3)
+
+It's not been entirely clear whether it's a good idea to emit LLVM
+code from IR1 or IR2, but I'm going with IR1. I think this is the
+right thing to do, because LLVM, despite its "LL" name, really is
+designed to be used in quite a high level.
+
+In particular, I don't think SBCL's stack analysis, copy propagation,
+or vop selection are likely to be useful. I'd like to just let LLVM
+handle as many of the optimizations as is feasible.
+
+Of course, one thing that *is* useful that SBCL does and LLVM does not
+is representation selection.
+
+Here's my current plan of record for replacing rep-selection:
+
+- Where given the choice (registers/stack), store all unboxable items
+  unboxed. Do all immediate operations (non-generic arithmetic) on
+  unboxed values.
+
+- When moving values to other forms, they will need to be
+  boxed. Simply do it on demand.
+
+- Use magic to allow LLVM to optimize away redundant shifts/boxing
+  calls/etc. And I hope magic turns out to be powerful enough for
+  this. :)
+
+
+
+Todo list:
+* Implement cif/branching.
+* Finish off the rest of the simple stuff so I can support most kinds
+  of lisp expressions (NODES: cast, cset; REF: special, global;
+  CONSTANTS: floats, complexes, bignum, character; OTHER: ??)
+* Automatically generate calling-convention-adapting wrapper.
+* Create an LLVM calling convention that supports m-v-return (...and
+  implement m-v-return). Could either use the existing SBCL
+  calling-convention or a new one.
+* GC: Scavenge constant vectors in LLVM-compiled functions.
+* Unwind. This is probably going to be hard...
+* GC: collection of LLVM-compiled functions/modules. (not particularly
+  important for near future)
