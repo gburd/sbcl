@@ -101,6 +101,15 @@
       (format t "~s~%" node))))
 
 
+(defmacro with-entry-block-builder ((builder llfun) &body body)
+  (let ((entry-block-v (gensym "entry-block")))
+    `(let ((,builder (LLVMCreateBuilder))
+           (,entry-block-v (LLVMGetEntryBasicBlock ,llfun)))
+       (LLVMPositionBuilderAtEnd ,builder ,entry-block-v)
+       (prog1
+           (progn ,@body)
+         (LLVMDisposeBuilder ,builder)))))
+
 (defun llvm-compile (lambda)
   (let* ((component (first (sb-c::compile-to-ir1 nil lambda)))
          (fun (second (sb-c::component-lambdas component))))
@@ -117,14 +126,16 @@
                                 fun-args
                                 nil)))
          (setup-block (LLVMAppendBasicBlock llfun "setup"))
-         ;; From lambda-var -> llvm var
-         (*lambda-var-hash* (make-hash-table :test 'eq))
          (builder (LLVMCreateBuilder)))
     (LLVMSetFunctionCallConv llfun (cffi:foreign-enum-value 'LLVMCallConv :LLVMCCallConv))
-    (loop for node in (sb-c::lambda-vars fun)
-          for n from 0
-          do
-          (setf (gethash node *lambda-var-hash*) (LLVMGetParam llfun n)))
+
+    (with-entry-block-builder (builder llfun)
+      (loop for node in (sb-c::lambda-vars fun)
+            for n from 0
+            do
+            (let ((param-alloca (LLVMBuildAlloca builder (LispObjType) "arg")))
+              (setf (sb-c::leaf-info node) param-alloca)
+              (LLVMBuildStore builder (LLVMGetParam llfun n) param-alloca))))
 
     (let ((block (sb-c::ctran-block (sb-c::node-prev (sb-c::lambda-bind fun)))))
       (sb-c::do-blocks (block (sb-c::block-component block) :both)
@@ -164,16 +175,16 @@
         (setf (sb-c::block-info block)
               (LLVMAppendBasicBlock llfun (format nil "block~d" (sb-c::block-number block)))))))
 
+
+(defun build-alloca-in-entry (llfun name)
+  (with-entry-block-builder (builder llfun)
+    (LLVMBuildAlloca builder (LispObjType) name)))
+
 (defun llvm-ensure-lvar (llfun lvar)
   (let ((existing-lvar (sb-c::lvar-info lvar)))
     (if existing-lvar
         existing-lvar
-        (let ((builder (LLVMCreateBuilder))
-              (entry-block (LLVMGetEntryBasicBlock llfun)))
-          (LLVMPositionBuilderAtEnd builder entry-block)
-          (prog1
-              (setf (sb-c::lvar-info lvar) (LLVMBuildAlloca builder (LispObjType) "lvar"))
-            (LLVMDisposeBuilder builder))))))
+        (setf (sb-c::lvar-info lvar) (build-alloca-in-entry llfun "lvar")))))
 
 (defun finish-block (llfun builder block)
   (let* ((last (sb-c::block-last block))
@@ -197,9 +208,14 @@
         (etypecase node
           (sb-c::bind nil) ;; Don't do anything; bind is entirely superfluous.
           (sb-c::ref (llvm-convert-ref llfun builder node))
-          (sb-c::combination (llvm-convert-combination llfun builder node))
+          (sb-c::combination
+             (let ((fun (sb-c::ref-leaf (sb-c::lvar-uses (sb-c::combination-fun node)))))
+               (if (and (sb-c::functional-p fun) (eq (sb-c::functional-kind fun) :let)) ; mv-let, assignment?
+                 (llvm-convert-let llfun builder node)
+                 (llvm-convert-combination llfun builder node))))
           (sb-c::creturn (llvm-convert-return llfun builder node))
-          (sb-c::cif (llvm-convert-if llfun builder node)))
+          (sb-c::cif (llvm-convert-if llfun builder node))
+          (sb-c::cset (llvm-convert-set llfun builder node)))
         ))
     (finish-block llfun builder block)))
 
@@ -286,15 +302,17 @@
          (val
           (etypecase leaf
             (sb-c::lambda-var
-               (let ((llvm-var (gethash leaf *lambda-var-hash*)))
+               (let ((llvm-var (sb-c::leaf-info leaf)))
                  (if (sb-c::lambda-var-indirect leaf)
                      (FIXME) #|(vop value-cell-ref node block tn res)|#
-                     llvm-var)))
+                     (LLVMBuildLoad builder llvm-var ""))))
             (sb-c::constant
                (or (sb-c::leaf-info leaf)
                    (llvm-emit-constant builder leaf)))
             (sb-c::functional
-               (FIXME-FUNCTIONAL) #|(ir2-convert-closure node block leaf res)|#)
+               (if (eq (sb-c::functional-kind leaf) :let) ;; mv-let, assignment?
+                   (return-from llvm-convert-ref nil) ;; Don't need to store anything
+                   (FIXME-FUNCTIONAL) #|(ir2-convert-closure node block leaf res)|#))
             (sb-c::global-var
                (let ((unsafe (sb-c::policy node (zerop safety)))
                      (name (sb-c::leaf-source-name leaf)))
@@ -330,6 +348,18 @@
   (map 'list (lambda (x) (LLVMConstInt type x nil))
        list))
 
+(defun llvm-convert-let (llfun builder node)
+  (let ((fun (sb-c::ref-leaf (sb-c::lvar-uses (sb-c::combination-fun node))))
+        (args (sb-c::combination-args node)))
+    (loop for node in (sb-c::lambda-vars fun)
+          for arg in args
+          for n from 0
+          do
+          (let ((param-alloca (build-alloca-in-entry llfun "let-var")))
+            (setf (sb-c::leaf-info node) param-alloca)
+            (LLVMBuildStore builder (LLVMBuildLoad builder (llvm-ensure-lvar llfun arg) "")
+                            param-alloca)))))
+
 (defun llvm-convert-combination (llfun builder node)
   (let* ((lvar (sb-c::node-lvar node))
          (arg-count (length (sb-c::combination-args node)))
@@ -360,13 +390,36 @@
 
 (defun llvm-convert-if (llfun builder node)
   (LLVMBuildCondBr builder
-                   (LLVMBuildICmp builder :LLVMIntEQ
+                   (LLVMBuildICmp builder :LLVMIntNE
                                   (LLVMBuildLoad builder (llvm-ensure-lvar llfun (sb-c::if-test node)) "")
                                   (LLVMBuildLoad builder (LLVMGetNamedGlobal *jit-module* "SBCL_nil")
                                                                  "")
                                   "nil?")
                    (llvm-ensure-block llfun (sb-c::if-consequent node))
                    (llvm-ensure-block llfun (sb-c::if-alternative node))))
+
+(defun llvm-convert-set (llfun builder node)
+  (let* ((lvar (sb-c::node-lvar node))
+         (leaf (sb-c::set-var node))
+         (val (sb-c::set-value node))
+         (ll-val (LLVMBuildLoad builder (llvm-ensure-lvar llfun val) "")))
+    (etypecase leaf
+      (sb-c::lambda-var
+         (let ((llvm-var (sb-c::leaf-info leaf)))
+           (if (sb-c::lambda-var-indirect leaf)
+               (FIXME) #|(vop value-cell-ref node block tn res)|#
+               (LLVMBuildStore builder ll-val llvm-var))))
+      (sb-c::global-var
+         (ecase (sb-c::global-var-kind leaf)
+           ((:special)
+              (FIXME) #|(vop set node block (emit-constant (leaf-source-name leaf)) val)|#)
+           ((:global)
+              (FIXME) #|(vop %set-symbol-global-value node
+              block (emit-constant (leaf-source-name leaf)) val)|#))))
+
+    ;; *Also* store into the target lvar of this set node.
+    (when lvar
+      (LLVMBuildStore builder ll-val (llvm-ensure-lvar llfun lvar)))))
 
 #|
 (defun print-nodes (fun block)
