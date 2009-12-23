@@ -19,14 +19,21 @@
 
 ;; END HACK
 
-(cffi::defcallback intern :int64 ((name :string) (package :string))
+(cffi::defcallback intern :intptr ((name :string) (package :string))
   (sb-kernel:get-lisp-obj-address (intern name package)))
 
-(cffi::defcallback symbol-function :int64 ((symbol :int64))
+(cffi::defcallback symbol-function :intptr ((symbol :intptr))
   (sb-kernel:get-lisp-obj-address (symbol-function (sb-kernel:make-lisp-obj symbol))))
 
 (defun LispObjType ()
   (LLVMInt64Type))
+
+(defun declare-global-constant (mod name type value)
+  (let ((previous-global (LLVMGetNamedGlobal mod name)))
+    (if (cffi:pointer-eq previous-global (cffi:null-pointer))
+        (let ((global (LLVMAddGlobal mod type name)))
+          (LLVMSetInitializer global (LLVMConstInt type value nil))
+          (LLVMSetGlobalConstant global t)))))
 
 (defun declare-intrinsic-function (mod name ret-type arg-types &key (global-mapping nil))
   (let ((previous-fun (LLVMGetNamedFunction mod name)))
@@ -55,7 +62,9 @@
                               :global-mapping (cffi::callback intern))
   (declare-intrinsic-function mod "symbol-function"
                               (LispObjType) (list (LispObjType))
-                              :global-mapping (cffi::callback symbol-function)))
+                              :global-mapping (cffi::callback symbol-function))
+  (declare-global-constant mod "SBCL_nil" (LispObjType) (sb-kernel:get-lisp-obj-address nil))
+)
 ;  (LLVMAddGlobal mod (LLVMFunctionType (LispObjType) (list (LLVMPointerType (LispObjType) 0)) nil)
 ;                 "call_into_lisp"))
 ;  (CLLLVM_LLVMParseAssemblyString
@@ -65,9 +74,32 @@
 
 ;; Do it now!
 (define-support-fns *jit-module*)
-(LLVMDumpModule *jit-module*)
+;;(LLVMDumpModule *jit-module*)
 
 (defvar *lambda-var-hash*)
+
+(defun dump-ir1 (lambda)
+  (let* ((component (first (sb-c::compile-to-ir1 nil lambda)))
+         (fun (second (sb-c::component-lambdas component))))
+    (let ((block (sb-c::ctran-block (sb-c::node-prev (sb-c::lambda-bind fun)))))
+      (sb-c::do-blocks (block (sb-c::block-component block) :both)
+        (setf (sb-c::block-flag block) nil))
+      (labels ((walk (block)
+                 (unless (sb-c::block-flag block)
+                   (setf (sb-c::block-flag block) t)
+                   (when (sb-c::block-start block)
+                     (dump-block block))
+                   (dolist (block (sb-c::block-succ block))
+                     (walk block)))))
+        (walk block)))))
+
+(defun dump-block (block)
+  (format t "block start ~s~%" (sb-c::block-number block))
+  (do ((ctran (sb-c::block-start block) (sb-c::node-next (sb-c::ctran-next ctran))))
+      ((not ctran))
+    (let ((node (sb-c::ctran-next ctran)))
+      (format t "~s~%" node))))
+
 
 (defun llvm-compile (lambda)
   (let* ((component (first (sb-c::compile-to-ir1 nil lambda)))
@@ -84,9 +116,9 @@
                                 (LispObjType)
                                 fun-args
                                 nil)))
+         (setup-block (LLVMAppendBasicBlock llfun "setup"))
          ;; From lambda-var -> llvm var
          (*lambda-var-hash* (make-hash-table :test 'eq))
-;         (block-hash (make-hash-table :test 'eq))
          (builder (LLVMCreateBuilder)))
     (LLVMSetFunctionCallConv llfun (cffi:foreign-enum-value 'LLVMCallConv :LLVMCCallConv))
     (loop for node in (sb-c::lambda-vars fun)
@@ -104,35 +136,72 @@
                      (build-block llfun builder block))
                    (dolist (block (sb-c::block-succ block))
                      (walk block)))))
-        (walk block)))
+        (walk block))
+      (LLVMPositionBuilderAtEnd builder setup-block)
+      (LLVMBuildBr builder (llvm-ensure-block llfun block)))
 
+    (format t ";; Pre-optimization:~%")
     (LLVMDumpValue llfun)
+    (LLVMRunFunctionPassManager *jit-pass-manager* llfun)
+    (format t ";; Post-optimization:~%")
+    (LLVMDumpValue llfun)
+
     llfun))
 
 ;; Run the code!
 (defmacro run-fun (fun &rest args)
   (let ((ffp-args (loop for arg in args
-                        collect :int64
+                        collect :intptr
                         collect `(sb-kernel:get-lisp-obj-address ,arg)))
         (fun-ptr-v (gensym "fun-ptr")))
   `(let ((,fun-ptr-v (LLVMGetPointerToGlobal *jit-execution-engine* ,fun)))
-     (sb-kernel:make-lisp-obj (cffi:foreign-funcall-pointer ,fun-ptr-v () ,@ffp-args :int64)))))
+     (sb-kernel:make-lisp-obj (cffi:foreign-funcall-pointer ,fun-ptr-v () ,@ffp-args :intptr)))))
+
+(defun llvm-ensure-block (llfun block)
+  (let ((existing-block (sb-c::block-info block)))
+    (if existing-block
+        existing-block
+        (setf (sb-c::block-info block)
+              (LLVMAppendBasicBlock llfun (format nil "block~d" (sb-c::block-number block)))))))
+
+(defun llvm-ensure-lvar (llfun lvar)
+  (let ((existing-lvar (sb-c::lvar-info lvar)))
+    (if existing-lvar
+        existing-lvar
+        (let ((builder (LLVMCreateBuilder))
+              (entry-block (LLVMGetEntryBasicBlock llfun)))
+          (LLVMPositionBuilderAtEnd builder entry-block)
+          (prog1
+              (setf (sb-c::lvar-info lvar) (LLVMBuildAlloca builder (LispObjType) "lvar"))
+            (LLVMDisposeBuilder builder))))))
+
+(defun finish-block (llfun builder block)
+  (let* ((last (sb-c::block-last block))
+         (succ (sb-c::block-succ block)))
+    (unless (sb-c::if-p last)
+      (assert (sb-c::singleton-p succ))
+      (let ((target (first succ)))
+        (cond ((eq target (sb-c::component-tail (sb-c::block-component block)))
+               ;; component-tail isn't a real block, so don't emit a branch to it.
+               nil)
+              (t (LLVMBuildBr builder (llvm-ensure-block llfun target))))))))
 
 (defun build-block (llfun builder block)
-  (format t "block start~%")
-  (let ((llblock (LLVMAppendBasicBlock llfun "blockname")))
+  (format t "block start ~s~%" (sb-c::block-number block))
+  (let ((llblock (llvm-ensure-block llfun block)))
     (LLVMPositionBuilderAtEnd builder llblock)
     (do ((ctran (sb-c::block-start block) (sb-c::node-next (sb-c::ctran-next ctran))))
         ((not ctran))
       (let ((node (sb-c::ctran-next ctran)))
         (format t "~s~%" node)
         (etypecase node
-          ;; Don't do anything; this is entirely superfluous.
-          (sb-c::bind nil)
+          (sb-c::bind nil) ;; Don't do anything; bind is entirely superfluous.
           (sb-c::ref (llvm-convert-ref llfun builder node))
           (sb-c::combination (llvm-convert-combination llfun builder node))
-          (sb-c::creturn (llvm-convert-return llfun builder node)))
-        ))))
+          (sb-c::creturn (llvm-convert-return llfun builder node))
+          (sb-c::cif (llvm-convert-if llfun builder node)))
+        ))
+    (finish-block llfun builder block)))
 
 ;; (defun build-block (llfun builder block)
 ;;   (format t "block start~%")
@@ -150,7 +219,7 @@
   (let* ((ll-str (LLVMConstString str nil))
          (global (LLVMAddGlobal mod (LLVMTypeOf ll-str) ".str")))
       (LLVMSetInitializer global ll-str)
-      (LLVMSetGlobalConstant global 1)
+      (LLVMSetGlobalConstant global t)
       global))
 
 (defun llvm-emit-symbol-ref (builder value)
@@ -211,48 +280,50 @@
 
 ;;; Convert a REF node. The reference must not be delayed.
 (defun llvm-convert-ref (llfun builder node)
-  (declare (ignore llfun))
   (declare (type sb-c::ref node))
   (let* ((lvar (sb-c::node-lvar node))
-         (leaf (sb-c::ref-leaf node)))
-    (etypecase leaf
-      (sb-c::lambda-var
-       (let ((llvm-var (gethash leaf *lambda-var-hash*)))
-         (if (sb-c::lambda-var-indirect leaf)
-             (FIXME) #|(vop value-cell-ref node block tn res)|#
-             (setf (sb-c::lvar-info lvar) llvm-var))))
-      (sb-c::constant
-         (setf (sb-c::lvar-info lvar)
+         (leaf (sb-c::ref-leaf node))
+         (val
+          (etypecase leaf
+            (sb-c::lambda-var
+               (let ((llvm-var (gethash leaf *lambda-var-hash*)))
+                 (if (sb-c::lambda-var-indirect leaf)
+                     (FIXME) #|(vop value-cell-ref node block tn res)|#
+                     llvm-var)))
+            (sb-c::constant
                (or (sb-c::leaf-info leaf)
                    (llvm-emit-constant builder leaf)))
-         (assert (not (null (sb-c::lvar-info lvar))))
-         )
-      (sb-c::functional
-         (FIXME-FUNCTIONAL) #|(ir2-convert-closure node block leaf res)|#)
-      (sb-c::global-var
-         (let ((unsafe (sb-c::policy node (zerop safety)))
-               (name (sb-c::leaf-source-name leaf)))
-           (declare (ignore unsafe))
-           (ecase (sb-c::global-var-kind leaf)
-             ((:special :unknown)
-                #|(aver (symbolp name))
-                (let ((name-tn (emit-constant name)))
-                  (if (or unsafe (info :variable :always-bound name))
+            (sb-c::functional
+               (FIXME-FUNCTIONAL) #|(ir2-convert-closure node block leaf res)|#)
+            (sb-c::global-var
+               (let ((unsafe (sb-c::policy node (zerop safety)))
+                     (name (sb-c::leaf-source-name leaf)))
+                 (declare (ignore unsafe))
+                 (ecase (sb-c::global-var-kind leaf)
+                   ((:special :unknown)
+                      #|(aver (symbolp name))
+                      (let ((name-tn (emit-constant name)))
+                      (if (or unsafe (info :variable :always-bound name))
                       (vop fast-symbol-value node block name-tn res)
                       (vop symbol-value node block name-tn res)))|#)
-             (:global
-                #|(aver (symbolp name))
-                (let ((name-tn (emit-constant name)))
-                  (if (or unsafe (info :variable :always-bound name))
+                   (:global
+                      #|(aver (symbolp name))
+                      (let ((name-tn (emit-constant name)))
+                      (if (or unsafe (info :variable :always-bound name))
                       (vop fast-symbol-global-value node block name-tn res)
                       (vop symbol-global-value node block name-tn res)))|#)
-             (:global-function
-                (setf (sb-c::lvar-info lvar) (llvm-emit-symbol-function builder name))
-                #|(let ((fdefn-tn (make-load-time-constant-tn :fdefinition name)))
-                  (if unsafe
+                   (:global-function
+                      (llvm-emit-symbol-function builder name)
+                      #|(let ((fdefn-tn (make-load-time-constant-tn :fdefinition name)))
+                      (if unsafe
                       (vop fdefn-fun node block fdefn-tn res)
                       (vop safe-fdefn-fun node block fdefn-tn res)))|#))))
-         ))
+            )))
+    (assert val)
+;    (print (CLLLVM_LLVMDumpValueToString val))
+;    (print (CLLLVM_LLVMDumpTypeToString (LLVMTypeOf (llvm-ensure-lvar llfun lvar))))
+    ;; Store the value into the lvar.
+    (LLVMBuildStore builder val (llvm-ensure-lvar llfun lvar)))
   (values))
 
 (defun llvmconstify (type list)
@@ -260,7 +331,6 @@
        list))
 
 (defun llvm-convert-combination (llfun builder node)
-  (declare (ignore llfun))
   (let* ((lvar (sb-c::node-lvar node))
          (arg-count (length (sb-c::combination-args node)))
          (arg-count-llc (LLVMConstInt (LLVMInt32Type) arg-count 0))
@@ -270,22 +340,33 @@
           for n from 0
           do
           (let ((GEP (LLVMBuildGEP builder arg-mem (llvmconstify (LLVMInt32Type) (list n)) "")))
-            (LLVMBuildStore builder (sb-c::lvar-info arg) GEP)))
+            (LLVMBuildStore builder (LLVMBuildLoad builder (llvm-ensure-lvar llfun arg) "") GEP)))
 
     ;; BuildGEP is because we pass array as pointer to first element.
     (let* ((arg-mem-ptr (LLVMBuildGEP builder arg-mem (llvmconstify (LLVMInt32Type) (list 0)) ""))
            (call-into-lisp (LLVMGetNamedFunction *jit-module* "call_into_lisp"))
-           (callee (sb-c::lvar-info (sb-c::combination-fun node))))
+           (callee (LLVMBuildLoad builder (llvm-ensure-lvar llfun (sb-c::combination-fun node)) "")))
       (when (cffi:pointer-eq (cffi:null-pointer) call-into-lisp)
         (error "call-into-lisp not found!"))
-      (setf (sb-c::lvar-info lvar)
-            (LLVMBuildCall builder call-into-lisp (list callee arg-mem-ptr arg-count-llc) "call_into_lisp")))))
+      (LLVMBuildStore
+       builder
+       (LLVMBuildCall builder call-into-lisp (list callee arg-mem-ptr arg-count-llc) "call_into_lisp")
+       (llvm-ensure-lvar llfun lvar)))))
 
 (defun llvm-convert-return (llfun builder node)
-  (declare (ignore llfun))
-  (LLVMBuildRet builder (sb-c::lvar-info (sb-c::return-result node))))
+;  (print (sb-c::lvar-info (sb-c::return-result node)))
+  (LLVMBuildRet builder (LLVMBuildLoad builder (llvm-ensure-lvar llfun (sb-c::return-result node)) "")))
 
 
+(defun llvm-convert-if (llfun builder node)
+  (LLVMBuildCondBr builder
+                   (LLVMBuildICmp builder :LLVMIntEQ
+                                  (LLVMBuildLoad builder (llvm-ensure-lvar llfun (sb-c::if-test node)) "")
+                                  (LLVMBuildLoad builder (LLVMGetNamedGlobal *jit-module* "SBCL_nil")
+                                                                 "")
+                                  "nil?")
+                   (llvm-ensure-block llfun (sb-c::if-consequent node))
+                   (llvm-ensure-block llfun (sb-c::if-alternative node))))
 
 #|
 (defun print-nodes (fun block)
