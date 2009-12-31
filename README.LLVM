@@ -46,12 +46,27 @@ Here's my current plan of record for replacing rep-selection:
   this. :)
 
 
+List of issues I'm having with LLVM:
+* JIT doesn't support inline target-asm.
+* JIT doesn't support TLS (neither fresh nor existing in outside executable)
+* Appears that you cannot run inlining optimization on a single
+  function via a FunctionPassManager, only the entire module via
+  PassManager.
+
+
+Things in LLVM that look sketchy that I haven't actually hit yet:
+* Debug info support seems pretty poor currently. It looks likely that
+  that'll be fixed before it actually bothers me, though.
 
 Todo list:
-* Implement cif/branching.
+* Load-time evaluation (interning symbols, user-level LTV, constants, etc.)
 * Finish off the rest of the simple stuff so I can support most kinds
-  of lisp expressions (NODES: cast, cset; REF: special, global;
-  CONSTANTS: floats, complexes, bignum, character; OTHER: ??)
+  of lisp expressions
+  NODES: cast
+  REF: special, global
+  SET: special, global
+  CONSTANTS: floats, complexes, bignum, character, cons, structures, vectors...
+  OTHER: ??
 * Automatically generate calling-convention-adapting wrapper.
 * Create an LLVM calling convention that supports m-v-return (...and
   implement m-v-return). Could either use the existing SBCL
