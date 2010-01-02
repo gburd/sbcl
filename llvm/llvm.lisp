@@ -35,7 +35,7 @@
     (if (cffi:pointer-eq previous-global (cffi:null-pointer))
         (let ((global (LLVMAddGlobal mod type name)))
           (when value
-            (LLVMSetInitializer global (LLVMConstInt type value nil)))
+            (LLVMSetInitializer global (LLVMConstInt type value)))
           (when constant
             (LLVMSetGlobalConstant global t))
           (when thread-local
@@ -182,18 +182,18 @@ start:
 (defun raw-ptr-to-lispobj (ptr lowtag)
   (build add
    (build ptrtoint ptr (LispObjType))
-   (LLVMConstInt (LLVMInt64Type) lowtag nil)))
+   (LLVMConstInt (LLVMInt64Type) lowtag)))
 
 (defun raw-int-to-lispobj (ptr)
   (build call (LLVMGetNamedFunction *jit-module* "%raw-int-to-lispobj") (list ptr)))
 
 (defun fixnumize (val)
-  (LLVMConstInt (LispObjType) (* val 8) nil)) ;; FIXME: hardcoded 8...
+  (LLVMConstInt (LispObjType) (* val 8))) ;; FIXME: hardcoded 8...
 
 (defun LLVMBuildGEP* (builder ptr indices &optional (name ""))
   (let ((type (LLVMInt32Type)))
     (LLVMBuildGEP builder ptr
-                  (map 'list (lambda (x) (LLVMConstInt type x nil)) indices)
+                  (map 'list (lambda (x) (LLVMConstInt type x)) indices)
                   name)))
 
 (defun llvm-ensure-block (block)
@@ -367,7 +367,7 @@ start:
          (name-var (llvm-emit-global-string *jit-module* (symbol-name value)))
          (package-name-var (llvm-emit-global-string *jit-module* (package-name (symbol-package value)))))
     (LLVMSetLinkage global :LLVMInternalLinkage)
-    (LLVMSetInitializer global (LLVMConstInt (LispObjType) 0 nil))
+    (LLVMSetInitializer global (LLVMConstInt (LispObjType) 0))
     (with-load-time-builder ()
       (build store
              (build call (LLVMGetNamedFunction *jit-module* "intern")
@@ -482,7 +482,7 @@ start:
 (defun llvm-convert-combination (node)
   (let* ((lvar (sb-c::node-lvar node))
          (arg-count (length (sb-c::combination-args node)))
-         (arg-count-llc (LLVMConstInt (LLVMInt32Type) arg-count 0))
+         (arg-count-llc (LLVMConstInt (LLVMInt32Type) arg-count))
          (arg-mem (build arrayalloca (LispObjType)
                          arg-count-llc "CIL-array")))
     (loop for arg in (sb-c::combination-args node)
@@ -592,7 +592,7 @@ start:
   (assert (= (length args) 2))
   (with-pseudo-atomic ()
     (let* ((new-mem (build call (LLVMGetNamedFunction *jit-module* "alloc")
-                           (list (LLVMConstInt (LLVMInt64Type) 16 nil))))) ;; FIXME: 16 is number of bytes for a cons
+                           (list (LLVMConstInt (LLVMInt64Type) 16))))) ;; FIXME: 16 is number of bytes for a cons
       (build store (build load (llvm-ensure-lvar (first args)))
              (build GEP* new-mem (list sb-vm::cons-car-slot)))
       (build store (build load (llvm-ensure-lvar (second args)))
