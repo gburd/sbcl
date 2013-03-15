@@ -14,6 +14,19 @@
  * files for more information.
  */
 
+#include "sbcl.h"
+
+#ifndef LISP_FEATURE_WIN32
+#ifdef LISP_FEATURE_LINUX
+/* For madvise */
+#define _BSD_SOURCE
+#include <sys/mman.h>
+#undef _BSD_SOURCE
+#else
+#include <sys/mman.h>
+#endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +36,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "sbcl.h"
 #include "os.h"
 #include "runtime.h"
 #include "globals.h"
@@ -34,13 +46,13 @@
 
 #include "validate.h"
 #include "gc-internal.h"
+#include "runtime-options.h"
 
-/* lutex stuff */
-#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_LUTEX)
-#include "genesis/sap.h"
-#include "pthread-lutex.h"
+#include <errno.h>
+
+#ifdef LISP_FEATURE_SB_CORE_COMPRESSION
+# include <zlib.h>
 #endif
-
 
 unsigned char build_id[] =
 #include "../../output/build-id.tmp"
@@ -60,10 +72,10 @@ open_binary(char *filename, int mode)
 static struct runtime_options *
 read_runtime_options(int fd)
 {
-    size_t optarray[RUNTIME_OPTIONS_WORDS];
+    os_vm_size_t optarray[RUNTIME_OPTIONS_WORDS];
     struct runtime_options *options = NULL;
 
-    if (read(fd, optarray, RUNTIME_OPTIONS_WORDS * sizeof(size_t)) !=
+    if (read(fd, optarray, RUNTIME_OPTIONS_WORDS * sizeof(os_vm_size_t)) !=
         RUNTIME_OPTIONS_WORDS * sizeof(size_t)) {
         return NULL;
     }
@@ -90,7 +102,7 @@ maybe_initialize_runtime_options(int fd)
 
     lseek(fd, -end_offset, SEEK_END);
 
-    if (new_runtime_options = read_runtime_options(fd)) {
+    if ((new_runtime_options = read_runtime_options(fd))) {
         runtime_options = new_runtime_options;
     }
 }
@@ -115,6 +127,16 @@ search_for_embedded_core(char *filename)
 
     if ((fd = open_binary(filename, O_RDONLY)) < 0)
         goto lose;
+
+    if (read(fd, &header, (size_t)lispobj_size) < lispobj_size)
+        goto lose;
+    if (header == CORE_MAGIC) {
+        /* This file is a real core, not an embedded core.  Return 0 to
+         * indicate where the core starts, and do not look for runtime
+         * options in this case. */
+        return 0;
+    }
+
     if (lseek(fd, -lispobj_size, SEEK_END) < 0)
         goto lose;
     if (read(fd, &header, (size_t)lispobj_size) < lispobj_size)
@@ -184,30 +206,110 @@ os_vm_address_t copy_core_bytes(int fd, os_vm_offset_t offset,
 }
 #endif
 
+#ifdef LISP_FEATURE_SB_CORE_COMPRESSION
+# define ZLIB_BUFFER_SIZE (1u<<16)
+os_vm_address_t inflate_core_bytes(int fd, os_vm_offset_t offset,
+                                   os_vm_address_t addr, int len)
+{
+    z_stream stream;
+    unsigned char buf[ZLIB_BUFFER_SIZE];
+    int ret;
+
+    if (-1 == lseek(fd, offset, SEEK_SET)) {
+        lose("Unable to lseek() on corefile\n");
+    }
+
+    stream.zalloc = NULL;
+    stream.zfree = NULL;
+    stream.opaque = NULL;
+    stream.avail_in = 0;
+    stream.next_in = buf;
+
+    ret = inflateInit(&stream);
+    if (ret != Z_OK)
+        lose("zlib error %i\n", ret);
+
+    stream.next_out  = (void*)addr;
+    stream.avail_out = len;
+    do {
+        ssize_t count = read(fd, buf, sizeof(buf));
+        if (count < 0)
+            lose("unable to read core file (errno = %i)\n", errno);
+        stream.next_in = buf;
+        stream.avail_in = count;
+        if (count == 0) break;
+        ret = inflate(&stream, Z_NO_FLUSH);
+        switch (ret) {
+        case Z_STREAM_END:
+            break;
+        case Z_OK:
+            if (stream.avail_out == 0)
+                lose("Runaway gzipped core directory... aborting\n");
+            if (stream.avail_in > 0)
+                lose("zlib inflate returned without fully"
+                     "using up input buffer... aborting\n");
+            break;
+        default:
+            lose("zlib inflate error: %i\n", ret);
+            break;
+        }
+    } while (ret != Z_STREAM_END);
+
+    if (stream.avail_out > 0) {
+        if (stream.avail_out >= os_vm_page_size)
+            fprintf(stderr, "Warning: gzipped core directory significantly"
+                    "shorter than expected (%lu bytes)", (unsigned long)stream.avail_out);
+        /* Is this needed? */
+        memset(stream.next_out, 0, stream.avail_out);
+    }
+
+    inflateEnd(&stream);
+    return addr;
+}
+# undef ZLIB_BUFFER_SIZE
+#endif
+
+int merge_core_pages = -1;
+
 static void
 process_directory(int fd, lispobj *ptr, int count, os_vm_offset_t file_offset)
 {
     struct ndir_entry *entry;
+    int compressed;
 
     FSHOW((stderr, "/process_directory(..), count=%d\n", count));
 
     for (entry = (struct ndir_entry *) ptr; --count>= 0; ++entry) {
 
-        long id = entry->identifier;
-        long offset = os_vm_page_size * (1 + entry->data_page);
+        compressed = 0;
+        sword_t id = entry->identifier;
+        if (id <= (MAX_CORE_SPACE_ID | DEFLATED_CORE_SPACE_ID_FLAG)) {
+            if (id & DEFLATED_CORE_SPACE_ID_FLAG)
+                compressed = 1;
+            id &= ~(DEFLATED_CORE_SPACE_ID_FLAG);
+        }
+        sword_t offset = os_vm_page_size * (1 + entry->data_page);
         os_vm_address_t addr =
             (os_vm_address_t) (os_vm_page_size * entry->address);
         lispobj *free_pointer = (lispobj *) addr + entry->nwords;
-        unsigned long len = os_vm_page_size * entry->page_count;
+        uword_t len = os_vm_page_size * entry->page_count;
         if (len != 0) {
             os_vm_address_t real_addr;
             FSHOW((stderr, "/mapping %ld(0x%lx) bytes at 0x%lx\n",
-                   (long)len, (long)len, (unsigned long)addr));
-#ifdef LISP_FEATURE_HPUX
-            real_addr = copy_core_bytes(fd, offset + file_offset, addr, len);
+                   len, len, (uword_t)addr));
+            if (compressed) {
+#ifdef LISP_FEATURE_SB_CORE_COMPRESSION
+                real_addr = inflate_core_bytes(fd, offset + file_offset, addr, len);
 #else
-            real_addr = os_map(fd, offset + file_offset, addr, len);
+                lose("This runtime was not built with zlib-compressed core support... aborting\n");
 #endif
+            } else {
+#ifdef LISP_FEATURE_HPUX
+                real_addr = copy_core_bytes(fd, offset + file_offset, addr, len);
+#else
+                real_addr = os_map(fd, offset + file_offset, addr, len);
+#endif
+            }
             if (real_addr != addr) {
                 lose("file mapped in wrong place! "
                      "(0x%08x != 0x%08lx)\n",
@@ -216,8 +318,14 @@ process_directory(int fd, lispobj *ptr, int count, os_vm_offset_t file_offset)
             }
         }
 
-        FSHOW((stderr, "/space id = %ld, free pointer = 0x%lx\n",
-               id, (unsigned long)free_pointer));
+#ifdef MADV_MERGEABLE
+        if ((merge_core_pages == 1)
+            || ((merge_core_pages == -1) && compressed)) {
+                madvise(addr, len, MADV_MERGEABLE);
+        }
+#endif
+        FSHOW((stderr, "/space id = %ld, free pointer = 0x%p\n",
+               id, (uword_t)free_pointer));
 
         switch (id) {
         case DYNAMIC_CORE_SPACE_ID:
@@ -225,22 +333,22 @@ process_directory(int fd, lispobj *ptr, int count, os_vm_offset_t file_offset)
                 fprintf(stderr,
                         "dynamic space too small for core: %ldKiB required, %ldKiB available.\n",
                         len >> 10,
-                        (long)dynamic_space_size >> 10);
+                        (uword_t)dynamic_space_size >> 10);
                 exit(1);
             }
 #ifdef LISP_FEATURE_GENCGC
             if (addr != (os_vm_address_t)DYNAMIC_SPACE_START) {
-                fprintf(stderr, "in core: 0x%lx; in runtime: 0x%lx \n",
-                        (long)addr, (long)DYNAMIC_SPACE_START);
+                fprintf(stderr, "in core: 0x%p; in runtime: 0x%p \n",
+                        (uword_t)addr, (uword_t)DYNAMIC_SPACE_START);
                 lose("core/runtime address mismatch: DYNAMIC_SPACE_START\n");
             }
 #else
             if ((addr != (os_vm_address_t)DYNAMIC_0_SPACE_START) &&
                 (addr != (os_vm_address_t)DYNAMIC_1_SPACE_START)) {
-                fprintf(stderr, "in core: 0x%lx; in runtime: 0x%lx or 0x%lx\n",
-                        (long)addr,
-                        (long)DYNAMIC_0_SPACE_START,
-                        (long)DYNAMIC_1_SPACE_START);
+                fprintf(stderr, "in core: 0x%p; in runtime: 0x%p or 0x%p\n",
+                        (uword_t)addr,
+                        (uword_t)DYNAMIC_0_SPACE_START,
+                        (uword_t)DYNAMIC_1_SPACE_START);
                 lose("warning: core/runtime address mismatch: DYNAMIC_SPACE_START\n");
             }
 #endif
@@ -257,20 +365,20 @@ process_directory(int fd, lispobj *ptr, int count, os_vm_offset_t file_offset)
             break;
         case STATIC_CORE_SPACE_ID:
             if (addr != (os_vm_address_t)STATIC_SPACE_START) {
-                fprintf(stderr, "in core: 0x%lx - in runtime: 0x%lx\n",
-                        (long)addr, (long)STATIC_SPACE_START);
+                fprintf(stderr, "in core: 0x%p - in runtime: 0x%p\n",
+                        (uword_t)addr, (uword_t)STATIC_SPACE_START);
                 lose("core/runtime address mismatch: STATIC_SPACE_START\n");
             }
             break;
         case READ_ONLY_CORE_SPACE_ID:
             if (addr != (os_vm_address_t)READ_ONLY_SPACE_START) {
-                fprintf(stderr, "in core: 0x%lx - in runtime: 0x%lx\n",
-                        (long)addr, (long)READ_ONLY_SPACE_START);
+                fprintf(stderr, "in core: 0x%p - in runtime: 0x%p\n",
+                        (uword_t)addr, (uword_t)READ_ONLY_SPACE_START);
                 lose("core/runtime address mismatch: READ_ONLY_SPACE_START\n");
             }
             break;
         default:
-            lose("unknown space ID %ld addr 0x%lx\n", id, (long)addr);
+            lose("unknown space ID %ld addr 0x%p\n", id, addr);
         }
     }
 }
@@ -278,11 +386,13 @@ process_directory(int fd, lispobj *ptr, int count, os_vm_offset_t file_offset)
 lispobj
 load_core_file(char *file, os_vm_offset_t file_offset)
 {
-    lispobj *header, val, len, *ptr, remaining_len;
+    void *header;
+    word_t val, *ptr;
+    os_vm_size_t len, remaining_len;
     int fd = open_binary(file, O_RDONLY);
-    unsigned int count;
-
+    ssize_t count;
     lispobj initial_function = NIL;
+
     FSHOW((stderr, "/entering load_core_file(%s)\n", file));
     if (fd < 0) {
         fprintf(stderr, "could not open file \"%s\"\n", file);
@@ -291,7 +401,7 @@ load_core_file(char *file, os_vm_offset_t file_offset)
     }
 
     lseek(fd, file_offset, SEEK_SET);
-    header = calloc(os_vm_page_size / sizeof(u32), sizeof(u32));
+    header = calloc(os_vm_page_size, 1);
 
     count = read(fd, header, os_vm_page_size);
     if (count < os_vm_page_size) {
@@ -313,8 +423,8 @@ load_core_file(char *file, os_vm_offset_t file_offset)
         val = *ptr++;
         len = *ptr++;
         remaining_len = len - 2; /* (-2 to cancel the two ++ operations) */
-        FSHOW((stderr, "/val=0x%ld, remaining_len=0x%ld\n",
-               (long)val, (long)remaining_len));
+        FSHOW((stderr, "/val=0x%"WORD_FMTX", remaining_len=0x%"WORD_FMTX"\n",
+               val, remaining_len));
 
         switch (val) {
 
@@ -334,7 +444,7 @@ load_core_file(char *file, os_vm_offset_t file_offset)
         case BUILD_ID_CORE_ENTRY_TYPE_CODE:
             SHOW("BUILD_ID_CORE_ENTRY_TYPE_CODE case");
             {
-                unsigned int i;
+                os_vm_size_t i;
 
                 FSHOW((stderr, "build_id[]=\"%s\"\n", build_id));
                 FSHOW((stderr, "remaining_len = %d\n", remaining_len));
@@ -367,7 +477,7 @@ load_core_file(char *file, os_vm_offset_t file_offset)
                               ptr,
 #ifndef LISP_FEATURE_ALPHA
                               remaining_len / (sizeof(struct ndir_entry) /
-                                               sizeof(long)),
+                                               sizeof(lispobj)),
 #else
                               remaining_len / (sizeof(struct ndir_entry) /
                                                sizeof(u32)),
@@ -380,50 +490,15 @@ load_core_file(char *file, os_vm_offset_t file_offset)
             initial_function = (lispobj)*ptr;
             break;
 
-#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_LUTEX)
-        case LUTEX_TABLE_CORE_ENTRY_TYPE_CODE:
-            SHOW("LUTEX_TABLE_CORE_ENTRY_TYPE_CODE case");
-            {
-                size_t n_lutexes = *ptr;
-                size_t fdoffset = (*(ptr + 1) + 1) * (os_vm_page_size);
-                size_t data_length = n_lutexes * sizeof(struct sap *);
-                struct lutex **lutexes_to_resurrect = malloc(data_length);
-                long bytes_read;
-
-                lseek(fd, fdoffset + file_offset, SEEK_SET);
-
-                FSHOW((stderr, "attempting to read %ld lutexes from core\n", n_lutexes));
-                bytes_read = read(fd, lutexes_to_resurrect, data_length);
-
-                /* XXX */
-                if (bytes_read != data_length) {
-                    lose("Could not read the lutex table");
-                }
-                else {
-                    int i;
-
-                    for (i=0; i<n_lutexes; ++i) {
-                        struct lutex *lutex = lutexes_to_resurrect[i];
-
-                        FSHOW((stderr, "re-init'ing lutex @ %p\n", lutex));
-                        lutex_init((tagged_lutex_t) lutex);
-                    }
-
-                    free(lutexes_to_resurrect);
-                }
-                break;
-            }
-#endif
-
 #ifdef LISP_FEATURE_GENCGC
         case PAGE_TABLE_CORE_ENTRY_TYPE_CODE:
         {
-            size_t size = *ptr;
-            size_t fdoffset = (*(ptr+1) + 1) * (os_vm_page_size);
-            size_t offset = 0;
-            long bytes_read;
-            unsigned long data[4096];
-            unsigned long word;
+            os_vm_size_t size = *ptr;
+            os_vm_size_t fdoffset = (*(ptr+1) + 1) * (os_vm_page_size);
+            page_index_t offset = 0;
+            ssize_t bytes_read;
+            word_t data[4096];
+            word_t word;
             lseek(fd, fdoffset + file_offset, SEEK_SET);
             while ((bytes_read = read(fd, data, (size < 4096 ? size : 4096 )))
                     > 0)
@@ -431,7 +506,7 @@ load_core_file(char *file, os_vm_offset_t file_offset)
                 int i = 0;
                 size -= bytes_read;
                 while (bytes_read) {
-                    bytes_read -= sizeof(long);
+                    bytes_read -= sizeof(word_t);
                     /* Ignore all zeroes. The size of the page table
                      * core entry was rounded up to os_vm_page_size
                      * during the save, and might now have more
@@ -439,7 +514,7 @@ load_core_file(char *file, os_vm_offset_t file_offset)
                      *
                      * The low bits of each word are allocation flags.
                      */
-                    if (word=data[i]) {
+                    if ((word=data[i])) {
                         page_table[offset].region_start_offset = word & ~0x03;
                         page_table[offset].allocated = word & 0x03;
                     }
@@ -453,11 +528,11 @@ load_core_file(char *file, os_vm_offset_t file_offset)
         }
 #endif
         default:
-            lose("unknown core file entry: %ld\n", (long)val);
+            lose("unknown core file entry: 0x%"WORD_FMTX"\n", val);
         }
 
         ptr += remaining_len;
-        FSHOW((stderr, "/new ptr=%lx\n", (unsigned long)ptr));
+        FSHOW((stderr, "/new ptr=0x%"WORD_FMTX"\n", ptr));
     }
     SHOW("about to free(header)");
     free(header);

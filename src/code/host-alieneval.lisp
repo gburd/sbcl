@@ -160,7 +160,7 @@
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (defun auxiliary-type-definitions (env)
     (multiple-value-bind (result expanded-p)
-        (sb!xc:macroexpand '&auxiliary-type-definitions& env)
+        (%macroexpand '&auxiliary-type-definitions& env)
       (if expanded-p
           result
           ;; This is like having the global symbol-macro definition be
@@ -404,15 +404,27 @@
              (:make-load-form-fun sb!kernel:just-dump-it-normally))
   ;; The type of this alien.
   (type (missing-arg) :type alien-type)
-  ;; The form to evaluate to produce the SAP pointing to where in the heap
-  ;; it is.
-  (sap-form (missing-arg)))
+  ;; Its name.
+  (alien-name (missing-arg) :type simple-string)
+  ;; Data or code?
+  (datap (missing-arg) :type boolean))
 (def!method print-object ((info heap-alien-info) stream)
   (print-unreadable-object (info stream :type t)
-    (funcall (formatter "~S ~S")
+    (funcall (formatter "~S ~S~@[ (data)~]")
              stream
-             (heap-alien-info-sap-form info)
-             (unparse-alien-type (heap-alien-info-type info)))))
+             (heap-alien-info-alien-name info)
+             (unparse-alien-type (heap-alien-info-type info))
+             (heap-alien-info-datap info))))
+
+;;; The form to evaluate to produce the SAP pointing to where in the heap
+;;; it is.
+(defun heap-alien-info-sap-form (info)
+  `(foreign-symbol-sap ,(heap-alien-info-alien-name info)
+                       ,(heap-alien-info-datap info)))
+
+(defun heap-alien-info-sap (info)
+  (foreign-symbol-sap (heap-alien-info-alien-name info)
+                      (heap-alien-info-datap info)))
 
 ;;;; Interfaces to the different methods
 
@@ -468,10 +480,10 @@
 (def!macro maybe-with-pinned-objects (variables types &body body)
   (declare (ignorable variables types))
   (let ((pin-variables
-         ;; Only pin things on x86/x86-64, since on non-conservative
-         ;; gcs it'd imply disabling the GC. Which is something we
-         ;; don't want to do every time we're calling to C.
-         #!+(or x86 x86-64)
+         ;; Only pin things on GENCGC, since on CHENEYGC it'd imply
+         ;; disabling the GC.  Which is something we don't want to do
+         ;; every time we're calling to C.
+         #!+gencgc
          (loop for variable in variables
             for type in types
             when (invoke-alien-type-method :deport-pin-p type)
@@ -484,7 +496,7 @@
 
 (defun compute-deposit-lambda (type)
   (declare (type alien-type type))
-  `(lambda (sap offset ignore value)
+  `(lambda (value sap offset ignore)
      (declare (type system-area-pointer sap)
               (type unsigned-byte offset)
               (ignore ignore))
@@ -991,7 +1003,7 @@
 
 ;;; FIXME: This is really pretty horrible: we avoid creating new
 ;;; ALIEN-RECORD-TYPE objects when a live one is flitting around the
-;;; system already. This way forwrd-references sans fields get get
+;;; system already. This way forward-references sans fields get
 ;;; "updated" for free to contain the field info. Maybe rename
 ;;; MAKE-ALIEN-RECORD-TYPE to %MAKE-ALIEN-RECORD-TYPE and use
 ;;; ENSURE-ALIEN-RECORD-TYPE instead. --NS 20040729
@@ -1040,7 +1052,8 @@
         (overall-alignment 1)
         (parsed-fields nil))
     (dolist (field fields)
-      (destructuring-bind (var type &key alignment) field
+      (destructuring-bind (var type &key alignment bits offset) field
+        (declare (ignore bits))
         (let* ((field-type (parse-alien-type type env))
                (bits (alien-type-bits field-type))
                (parsed-field
@@ -1056,7 +1069,7 @@
           (setf overall-alignment (max overall-alignment alignment))
           (ecase kind
             (:struct
-             (let ((offset (align-offset total-bits alignment)))
+             (let ((offset (or offset (align-offset total-bits alignment))))
                (setf (alien-record-field-offset parsed-field) offset)
                (setf total-bits (+ offset bits))))
             (:union
@@ -1083,7 +1096,9 @@
   `(,(alien-record-field-name field)
      ,(%unparse-alien-type (alien-record-field-type field))
      ,@(when (alien-record-field-bits field)
-             (list (alien-record-field-bits field)))))
+             (list :bits (alien-record-field-bits field)))
+     ,@(when (alien-record-field-offset field)
+             (list :offset (alien-record-field-offset field)))))
 
 ;;; Test the record fields. Keep a hashtable table of already compared
 ;;; types to detect cycles.
@@ -1122,27 +1137,68 @@
 
 ;;;; the FUNCTION and VALUES alien types
 
+;;; Calling-convention spec, typically one of predefined keywords.
+;;; Add or remove as needed for target platform.  It makes sense to
+;;; support :cdecl everywhere.
+;;;
+;;; Null convention is supposed to be platform-specific most-universal
+;;; callout convention. For x86, SBCL calls foreign functions in a way
+;;; allowing them to be either stdcall or cdecl; null convention is
+;;; appropriate here, as it is for specifying callbacks that could be
+;;; accepted by foreign code both in cdecl and stdcall form.
+(def!type calling-convention () `(or null (member :stdcall :cdecl)))
+
+;;; Convention could be a values type class, stored at result-type.
+;;; However, it seems appropriate only for epilogue-related
+;;; conventions, those not influencing incoming arg passing.
+;;;
+;;; As of x86's :stdcall and :cdecl, supported by now, both are
+;;; epilogue-related, but future extensions (like :fastcall and
+;;; miscellaneous non-x86 stuff) might affect incoming argument
+;;; translation as well.
+
 (define-alien-type-class (fun :include mem-block)
   (result-type (missing-arg) :type alien-type)
   (arg-types (missing-arg) :type list)
-  (stub nil :type (or null function)))
+  (stub nil :type (or null function))
+  (convention nil :type calling-convention))
+
+;;; KLUDGE: non-intrusive, backward-compatible way to allow calling
+;;; convention specification for function types is unobvious.
+;;;
+;;; By now, `RESULT-TYPE' is allowed, but not required, to be a list
+;;; starting with a convention keyword; its second item is a real
+;;; result-type in this case. If convention is ever to become a part
+;;; of result-type, such a syntax can be retained.
 
 (define-alien-type-translator function (result-type &rest arg-types
                                                     &environment env)
-  (make-alien-fun-type
-   :result-type (let ((*values-type-okay* t))
-                  (parse-alien-type result-type env))
-   :arg-types (mapcar (lambda (arg-type) (parse-alien-type arg-type env))
-                      arg-types)))
+  (multiple-value-bind (bare-result-type calling-convention)
+      (typecase result-type
+        ((cons calling-convention *)
+           (values (second result-type) (first result-type)))
+        (t result-type))
+    (make-alien-fun-type
+     :convention calling-convention
+     :result-type (let ((*values-type-okay* t))
+                    (parse-alien-type bare-result-type env))
+     :arg-types (mapcar (lambda (arg-type) (parse-alien-type arg-type env))
+                        arg-types))))
 
 (define-alien-type-method (fun :unparse) (type)
-  `(function ,(%unparse-alien-type (alien-fun-type-result-type type))
+  `(function ,(let ((result-type
+                     (%unparse-alien-type (alien-fun-type-result-type type)))
+                    (convention (alien-fun-type-convention type)))
+                (if convention (list convention result-type)
+                    result-type))
              ,@(mapcar #'%unparse-alien-type
                        (alien-fun-type-arg-types type))))
 
 (define-alien-type-method (fun :type=) (type1 type2)
   (and (alien-type-= (alien-fun-type-result-type type1)
                      (alien-fun-type-result-type type2))
+       (eq (alien-fun-type-convention type1)
+           (alien-fun-type-convention type2))
        (= (length (alien-fun-type-arg-types type1))
           (length (alien-fun-type-arg-types type2)))
        (every #'alien-type-=
@@ -1202,7 +1258,7 @@
   #!+sb-doc
   "Return an Alien pointer to the data addressed by Expr, which must be a call
    to SLOT or DEREF, or a reference to an Alien variable."
-  (let ((form (sb!xc:macroexpand expr env)))
+  (let ((form (%macroexpand expr env)))
     (or (typecase form
           (cons
            (case (car form)

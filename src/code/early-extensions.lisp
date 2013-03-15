@@ -461,7 +461,7 @@
                              ,@forms)))))
         `(let ((,n-table ,table))
            ,(if locked
-                `(with-locked-hash-table (,n-table)
+                `(with-locked-system-table (,n-table)
                    ,iter-form)
                 iter-form))))))
 
@@ -520,14 +520,20 @@
 ;;;   the specified name. (:INIT-WRAPPER is set to COLD-INIT-FORMS
 ;;;   in type system definitions so that caches will be created
 ;;;   before top level forms run.)
+(defvar *cache-vector-symbols* nil)
+
+(defun drop-all-hash-caches ()
+  (dolist (name *cache-vector-symbols*)
+    (set name nil)))
+
 (defmacro define-hash-cache (name args &key hash-function hash-bits default
                                   (init-wrapper 'progn)
                                   (values 1))
-  (let* ((var-name (symbolicate "*" name "-CACHE-VECTOR*"))
+  (let* ((var-name (symbolicate "**" name "-CACHE-VECTOR**"))
          (probes-name (when *profile-hash-cache*
-                       (symbolicate "*" name "-CACHE-PROBES*")))
+                       (symbolicate "**" name "-CACHE-PROBES**")))
          (misses-name (when *profile-hash-cache*
-                      (symbolicate "*" name "-CACHE-MISSES*")))
+                      (symbolicate "**" name "-CACHE-MISSES**")))
          (nargs (length args))
          (size (ash 1 hash-bits))
          (default-values (if (and (consp default) (eq (car default) 'values))
@@ -577,23 +583,26 @@
          `(defun ,fun-name ,(arg-vars)
             ,@(when *profile-hash-cache*
                 `((incf ,probes-name)))
-            (let* ((,n-index (,hash-function ,@(arg-vars)))
-                   (,n-cache ,var-name)
-                   (,args-and-values (svref ,n-cache ,n-index)))
-              (cond ((and ,args-and-values
-                          ,@(tests))
-                     (values ,@(values-refs)))
-                    (t
+            (flet ((miss ()
                      ,@(when *profile-hash-cache*
                          `((incf ,misses-name)))
-                     ,default))))))
+                     (return-from ,fun-name ,default)))
+              (let* ((,n-index (,hash-function ,@(arg-vars)))
+                     (,n-cache (or ,var-name (miss)))
+                     (,args-and-values (svref ,n-cache ,n-index)))
+                (cond ((and (not (eql 0 ,args-and-values))
+                            ,@(tests))
+                       (values ,@(values-refs)))
+                      (t
+                       (miss))))))))
 
       (let ((fun-name (symbolicate name "-CACHE-ENTER")))
         (inlines fun-name)
         (forms
          `(defun ,fun-name (,@(arg-vars) ,@(values-names))
             (let ((,n-index (,hash-function ,@(arg-vars)))
-                  (,n-cache ,var-name)
+                  (,n-cache (or ,var-name
+                                (setq ,var-name (make-array ,size :initial-element 0))))
                   (,args-and-values (make-array ,args-and-values-size)))
               ,@(sets)
               (setf (svref ,n-cache ,n-index) ,args-and-values))
@@ -602,19 +611,19 @@
       (let ((fun-name (symbolicate name "-CACHE-CLEAR")))
         (forms
          `(defun ,fun-name ()
-            (fill ,var-name nil)))
-        (forms `(,fun-name)))
+            (setq ,var-name nil))))
 
-      (inits `(unless (boundp ',var-name)
-                (setq ,var-name (make-array ,size :initial-element nil))))
+      ;; Needed for cold init!
+      (inits `(setq ,var-name nil))
       #!+sb-show (inits `(setq *hash-caches-initialized-p* t))
 
       `(progn
-         (defvar ,var-name)
+         (pushnew ',var-name *cache-vector-symbols*)
+         (defglobal ,var-name nil)
          ,@(when *profile-hash-cache*
-             `((defvar ,probes-name)
-               (defvar ,misses-name)))
-         (declaim (type (simple-vector ,size) ,var-name))
+             `((defglobal ,probes-name 0)
+               (defglobal ,misses-name 0)))
+         (declaim (type (or null (simple-vector ,size)) ,var-name))
          #!-sb-fluid (declaim (inline ,@(inlines)))
          (,init-wrapper ,@(inits))
          ,@(forms)
@@ -768,57 +777,6 @@
               (char= #\* (aref name 0))
               (char= #\* (aref name (1- (length name))))))))
 
-;;; This function is to be called just before a change which would affect the
-;;; symbol value. We don't absolutely have to call this function before such
-;;; changes, since such changes to constants are given as undefined behavior,
-;;; it's nice to do so. To circumvent this you need code like this:
-;;;
-;;;   (defvar foo)
-;;;   (defun set-foo (x) (setq foo x))
-;;;   (defconstant foo 42)
-;;;   (set-foo 13)
-;;;   foo => 13, (constantp 'foo) => t
-;;;
-;;; ...in which case you frankly deserve to lose.
-(defun about-to-modify-symbol-value (symbol action &optional (new-value nil valuep) bind)
-  (declare (symbol symbol))
-  (flet ((describe-action ()
-           (ecase action
-             (set "set SYMBOL-VALUE of ~S")
-             (progv "bind ~S")
-             (compare-and-swap "compare-and-swap SYMBOL-VALUE of ~S")
-             (defconstant "define ~S as a constant")
-             (makunbound "make ~S unbound"))))
-    (let ((kind (info :variable :kind symbol)))
-      (multiple-value-bind (what continue)
-          (cond ((eq :constant kind)
-                 (cond ((eq symbol t)
-                        (values "Veritas aeterna. (can't ~@?)" nil))
-                       ((eq symbol nil)
-                        (values "Nihil ex nihil. (can't ~@?)" nil))
-                       ((keywordp symbol)
-                        (values "Can't ~@?." nil))
-                       (t
-                        (values "Constant modification: attempt to ~@?." t))))
-                ((and bind (eq :global kind))
-                 (values "Can't ~@? (global variable)." nil)))
-        (when what
-          (if continue
-              (cerror "Modify the constant." what (describe-action) symbol)
-              (error what (describe-action) symbol)))
-        (when valuep
-          ;; :VARIABLE :TYPE is in the db only if it is declared, so no need to
-          ;; check.
-          (let ((type (info :variable :type symbol)))
-            (unless (sb!kernel::%%typep new-value type nil)
-              (let ((spec (type-specifier type)))
-                (error 'simple-type-error
-                       :format-control "~@<Cannot ~@? to ~S, not of type ~S.~:@>"
-                       :format-arguments (list (describe-action) symbol new-value spec)
-                       :datum new-value
-                       :expected-type spec))))))))
-  (values))
-
 ;;; If COLD-FSET occurs not at top level, just treat it as an ordinary
 ;;; assignment instead of doing cold static linking. That way things like
 ;;;   (FLET ((FROB (X) ..))
@@ -868,7 +826,7 @@
           (let* ((name (first spec))
                  (exp-temp (gensym "ONCE-ONLY")))
             `(let ((,exp-temp ,(second spec))
-                   (,name (gensym ,(symbol-name name))))
+                   (,name (sb!xc:gensym ,(symbol-name name))))
                `(let ((,,name ,,exp-temp))
                   ,,(frob (rest specs) body))))))))
 
@@ -963,7 +921,7 @@
 ;;; If X is a symbol, see whether it is present in *FEATURES*. Also
 ;;; handle arbitrary combinations of atoms using NOT, AND, OR.
 (defun featurep (x)
-  (etypecase x
+  (typecase x
     (cons
      (case (car x)
        ((:not not)
@@ -977,7 +935,10 @@
        ((:or or) (some #'featurep (cdr x)))
        (t
         (error "unknown operator in feature expression: ~S." x))))
-    (symbol (not (null (memq x *features*))))))
+    (symbol (not (null (memq x *features*))))
+    (t
+      (error "invalid feature expression: ~S" x))))
+
 
 ;;;; utilities for two-VALUES predicates
 
@@ -1126,10 +1087,126 @@
       (translate-logical-pathname possibly-logical-pathname)
       possibly-logical-pathname))
 
-(defun deprecation-warning (bad-name &optional good-name)
-  (warn "using deprecated ~S~@[, should use ~S instead~]"
-        bad-name
-        good-name))
+;;;; Deprecating stuff
+
+(defun normalize-deprecation-replacements (replacements)
+  (if (or (not (listp replacements))
+          (eq 'setf (car replacements)))
+      (list replacements)
+      replacements))
+
+(defun deprecation-error (since name replacements)
+  (error 'deprecation-error
+          :name name
+          :replacements (normalize-deprecation-replacements replacements)
+          :since since))
+
+(defun deprecation-warning (state since name replacements
+                            &key (runtime-error (neq :early state)))
+  (warn (ecase state
+          (:early 'early-deprecation-warning)
+          (:late 'late-deprecation-warning)
+          (:final 'final-deprecation-warning))
+        :name name
+        :replacements (normalize-deprecation-replacements replacements)
+        :since since
+        :runtime-error runtime-error))
+
+(defun deprecated-function (since name replacements)
+  (lambda (&rest deprecated-function-args)
+    (declare (ignore deprecated-function-args))
+    (deprecation-error since name replacements)))
+
+(defun deprecation-compiler-macro (state since name replacements)
+  (lambda (form env)
+    (declare (ignore env))
+    (deprecation-warning state since name replacements)
+    form))
+
+;;; STATE is one of
+;;;
+;;;   :EARLY, for a compile-time style-warning.
+;;;   :LATE, for a compile-time full warning.
+;;;   :FINAL, for a compile-time full warning and runtime error.
+;;;
+;;; Suggested duration of each stage is one year, but some things can move faster,
+;;; and some widely used legacy APIs might need to move slower. Internals we don't
+;;; usually add deprecation notes for, but sometimes an internal API actually has
+;;; several external users, in which case we try to be nice about it.
+;;;
+;;; When you deprecate something, note it here till it is fully gone: makes it
+;;; easier to keep things progressing orderly. Also add the relevant section
+;;; (or update it when deprecation proceeds) in the manual, in
+;;; deprecated.texinfo.
+;;;
+;;; EARLY:
+;;; - SB-THREAD::GET-MUTEX, since 1.0.37.33 (04/2010)               -> Late: 01/2013
+;;;   ^- initially deprecated without compile-time warning, hence the schedule
+;;; - SB-THREAD::SPINLOCK (type), since 1.0.53.11 (08/2011)         -> Late: 08/2012
+;;; - SB-THREAD::MAKE-SPINLOCK, since 1.0.53.11 (08/2011)           -> Late: 08/2012
+;;; - SB-THREAD::WITH-SPINLOCK, since 1.0.53.11 (08/2011)           -> Late: 08/2012
+;;; - SB-THREAD::WITH-RECURSIVE-SPINLOCK, since 1.0.53.11 (08/2011) -> Late: 08/2012
+;;; - SB-THREAD::GET-SPINLOCK, since 1.0.53.11 (08/2011)            -> Late: 08/2012
+;;; - SB-THREAD::RELEASE-SPINLOCK, since 1.0.53.11 (08/2011)        -> Late: 08/2012
+;;; - SB-THREAD::SPINLOCK-VALUE, since 1.0.53.11 (08/2011)          -> Late: 08/2012
+;;; - SB-THREAD::SPINLOCK-NAME, since 1.0.53.11 (08/2011)           -> Late: 08/2012
+;;; - SETF SB-THREAD::SPINLOCK-NAME, since 1.0.53.11 (08/2011)      -> Late: 08/2012
+;;; - SB-C::MERGE-TAIL-CALLS (policy), since 1.0.53.74 (11/2011)    -> Late: 11/2012
+;;; - SB-EXT:QUIT, since 1.0.56.55 (05/2012)                        -> Late: 05/2013
+;;; - SB-UNIX:UNIX-EXIT, since 1.0.56.55 (05/2012)                  -> Late: 05/2013
+;;; - SB-DEBUG:*SHOW-ENTRY-POINT-DETAILS*, since 1.1.4.9 (02/2013)  -> Late: 02/2014
+;;;
+;;; LATE:
+;;; - SB-SYS:OUTPUT-RAW-BYTES, since 1.0.8.16 (06/2007)                 -> Final: anytime
+;;;   Note: make sure CLX doesn't use it anymore!
+;;; - SB-C::STACK-ALLOCATE-DYNAMIC-EXTENT (policy), since 1.0.19.7      -> Final: anytime
+;;; - SB-C::STACK-ALLOCATE-VECTOR (policy), since 1.0.19.7              -> Final: anytime
+;;; - SB-C::STACK-ALLOCATE-VALUE-CELLS (policy), since 1.0.19.7         -> Final: anytime
+;;; - SB-INTROSPECT:FUNCTION-ARGLIST, since 1.0.24.5 (01/2009)          -> Final: anytime
+;;; - SB-THREAD:JOIN-THREAD-ERROR-THREAD, since 1.0.29.17 (06/2009)     -> Final: 09/2012
+;;; - SB-THREAD:INTERRUPT-THREAD-ERROR-THREAD since 1.0.29.17 (06/2009) -> Final: 06/2012
+
+(defmacro define-deprecated-function (state since name replacements lambda-list &body body)
+  (let* ((replacements (normalize-deprecation-replacements replacements))
+         (doc
+          (let ((*package* (find-package :keyword))
+                (*print-pretty* nil))
+            (apply #'format nil
+                   "~S has been deprecated as of SBCL ~A.~
+                    ~#[~;~2%Use ~S instead.~;~2%~
+                            Use ~S or ~S instead.~:;~2%~
+                            Use~@{~#[~; or~] ~S~^,~} instead.~]"
+                    name since replacements))))
+    `(progn
+       ,(ecase state
+          ((:early :late)
+           `(progn
+              (defun ,name ,lambda-list
+                ,doc
+                ,@body)))
+          ((:final)
+           `(progn
+              (declaim (ftype (function * nil) ,name))
+              (setf (fdefinition ',name)
+                    (deprecated-function ',name ',replacements ,since))
+              (setf (documentation ',name 'function) ,doc))))
+       (setf (compiler-macro-function ',name)
+             (deprecation-compiler-macro ,state ,since ',name ',replacements)))))
+
+(defun check-deprecated-variable (name)
+  (let ((info (info :variable :deprecated name)))
+    (when info
+      (deprecation-warning (car info) (cdr info) name nil))))
+
+(defmacro define-deprecated-variable (state since name &key (value nil valuep) replacement)
+  `(progn
+     (setf (info :variable :deprecated ',name) (cons ,state ,since))
+     ,@(when (member state '(:early :late))
+         `((defvar ,name ,@(when valuep (list value))
+             ,(let ((*package* (find-package :keyword)))
+                (format nil
+                        "~@<~S has been deprecated as of SBCL ~A~@[, use ~S instead~].~:>"
+                        name since replacement)))))))
 
 ;;; Anaphoric macros
 (defmacro awhen (test &body body)
@@ -1240,12 +1317,16 @@
 ;;; Returns a list of members of LIST. Useful for dealing with circular lists.
 ;;; For a dotted list returns a secondary value of T -- in which case the
 ;;; primary return value does not include the dotted tail.
-(defun list-members (list)
+;;; If the maximum length is reached, return a secondary value of :MAYBE.
+(defun list-members (list &key max-length)
   (when list
     (do ((tail (cdr list) (cdr tail))
-         (members (list (car list)) (cons (car tail) members)))
-        ((or (not (consp tail)) (eq tail list))
-         (values members (not (listp tail)))))))
+         (members (list (car list)) (cons (car tail) members))
+         (count 0 (1+ count)))
+        ((or (not (consp tail)) (eq tail list)
+             (and max-length (>= count max-length)))
+         (values members (or (not (listp tail))
+                             (and (>= count max-length) :maybe)))))))
 
 ;;; Default evaluator mode (interpeter / compiler)
 
@@ -1297,3 +1378,44 @@ to :INTERPRET, an interpreter will be used.")
      (if (eql x 0.0l0)
          (make-unportable-float :long-float-negative-zero)
          0.0l0))))
+
+;;; Signalling an error when trying to print an error condition is
+;;; generally a PITA, so whatever the failure encountered when
+;;; wondering about FILE-POSITION within a condition printer, 'tis
+;;; better silently to give up than to try to complain.
+(defun file-position-or-nil-for-error (stream &optional (pos nil posp))
+  ;; Arguably FILE-POSITION shouldn't be signalling errors at all; but
+  ;; "NIL if this cannot be determined" in the ANSI spec doesn't seem
+  ;; absolutely unambiguously to prohibit errors when, e.g., STREAM
+  ;; has been closed so that FILE-POSITION is a nonsense question. So
+  ;; my (WHN) impression is that the conservative approach is to
+  ;; IGNORE-ERRORS. (I encountered this failure from within a homebrew
+  ;; defsystemish operation where the ERROR-STREAM had been CL:CLOSEd,
+  ;; I think by nonlocally exiting through a WITH-OPEN-FILE, by the
+  ;; time an error was reported.)
+  (if posp
+      (ignore-errors (file-position stream pos))
+      (ignore-errors (file-position stream))))
+
+(defun stream-error-position-info (stream &optional position)
+  (unless (interactive-stream-p stream)
+    (let ((now (file-position-or-nil-for-error stream))
+          (pos position))
+      (when (and (not pos) now (plusp now))
+        ;; FILE-POSITION is the next character -- error is at the previous one.
+        (setf pos (1- now)))
+      (let (lineno colno)
+        (when (and pos
+                   (< pos sb!xc:array-dimension-limit)
+                   (file-position stream :start))
+          (let ((string
+                  (make-string pos :element-type (stream-element-type stream))))
+            (when (= pos (read-sequence string stream))
+              ;; Lines count from 1, columns from 0. It's stupid and traditional.
+              (setq lineno (1+ (count #\Newline string))
+                    colno (- pos (or (position #\Newline string :from-end t) 0)))))
+          (file-position-or-nil-for-error stream now))
+        (remove-if-not #'second
+                       (list (list :line lineno)
+                             (list :column colno)
+                             (list :file-position pos)))))))

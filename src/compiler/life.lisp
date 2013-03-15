@@ -418,11 +418,31 @@
         (return))))
   (values))
 
+;;; Return true if TN represents a closed-over variable with an
+;;; "implicit" value-cell.
+(defun implicit-value-cell-tn-p (tn)
+  (let ((leaf (tn-leaf tn)))
+    (and (lambda-var-p leaf)
+         (lambda-var-indirect leaf)
+         (not (lambda-var-explicit-value-cell leaf)))))
+
+;;; If BLOCK ends with a TAIL LOCAL COMBINATION, the function called.
+;;; Otherwise, NIL.
+(defun block-tail-local-call-fun (block)
+  (let ((node (block-last block)))
+    (when (and (combination-p node)
+               (eq :local (combination-kind node))
+               (combination-tail-p node))
+      (ref-leaf (lvar-uses (combination-fun node))))))
+
 ;;; Iterate over all the blocks in ENV, setting up :LIVE conflicts for
 ;;; TN. We make the TN global if it isn't already. The TN must have at
 ;;; least one reference.
-(defun setup-environment-tn-conflicts (component tn env debug-p)
-  (declare (type component component) (type tn tn) (type physenv env))
+(defun setup-environment-tn-conflicts (component tn env debug-p &optional parent-envs)
+  (declare (type component component) (type tn tn) (type physenv env) (type list parent-envs))
+  (when (member env parent-envs)
+    ;; Prevent infinite recursion due to recursive tail calls.
+    (return-from setup-environment-tn-conflicts (values)))
   (when (and debug-p
              (not (tn-global-conflicts tn))
              (tn-local tn))
@@ -437,7 +457,15 @@
                         prev))))
         (do ((b last (ir2-block-prev b)))
             ((not (eq (ir2-block-block b) block)))
-          (setup-environment-tn-conflict tn b debug-p)))))
+          (setup-environment-tn-conflict tn b debug-p)))
+      ;; If BLOCK ends with a TAIL LOCAL COMBINATION and TN is an
+      ;; "implicit value cell" then setup conflicts for the callee
+      ;; function as well.
+      (let ((fun (and (implicit-value-cell-tn-p tn)
+                      (block-tail-local-call-fun block))))
+        (when fun
+          (setup-environment-tn-conflicts component tn (lambda-physenv fun) debug-p
+                                          (list* env parent-envs))))))
   (values))
 
 ;;; Iterate over all the environment TNs, adding always-live conflicts
@@ -499,7 +527,14 @@
 ;;; We leave the CURRENT-CONFLICT pointing to the conflict for BLOCK1.
 ;;; The CURRENT-CONFLICT must be initialized to the head of the
 ;;; GLOBAL-CONFLICTS for the TN between each flow analysis iteration.
-(defun propagate-live-tns (block1 block2)
+
+;;; FASTP is a KLUDGE: SBCL used to update the current-conflict only
+;;; for the read-only case, but switched at one point to always
+;;; updating it. This generally speeds up the compiler nicely, but
+;;; sometimes it causes an infinite loop in the updating machinery,
+;;; We cheat by switching of the fast path if it seems we're looping
+;;; longer then expected.
+(defun propagate-live-tns (block1 block2 fastp)
   (declare (type ir2-block block1 block2))
   (let ((live-in (ir2-block-live-in block1))
         (did-something nil))
@@ -528,10 +563,13 @@
                   (setf (svref (ir2-block-local-tns block1)
                                (global-conflicts-number current))
                         nil)
-                  (setf (global-conflicts-number current) nil))
+                  (setf (global-conflicts-number current) nil)
+                  (unless fastp
+                    (setf (tn-current-conflict tn) current)))
                  (t
                   (setf (sbit live-in (global-conflicts-number current)) 1)))
-               (setf (tn-current-conflict tn) current)
+               (when fastp
+                 (setf (tn-current-conflict tn) current))
                (return)))))
         (:write)))
     did-something))
@@ -539,7 +577,14 @@
 ;;; Do backward global flow analysis to find all TNs live at each
 ;;; block boundary.
 (defun lifetime-flow-analysis (component)
-  (loop
+  ;; KLUDGE: This is the second part of the FASTP kludge in
+  ;; propagate-live-tns: we pass fastp for ten first attempts,
+  ;; and then switch to the works-for-sure version.
+  ;;
+  ;; The upstream uses the fast version always, but sometimes
+  ;; that gets stuck in a loop...
+  (loop for i = 0 then (1+ i)
+        do
     (reset-current-conflict component)
     (let ((did-something nil))
       (do-blocks-backwards (block component)
@@ -551,13 +596,13 @@
 
           (dolist (b (block-succ block))
             (when (and (block-start b)
-                       (propagate-live-tns last (block-info b)))
+                       (propagate-live-tns last (block-info b) (< i 10)))
               (setq did-something t)))
 
           (do ((b (ir2-block-prev last) (ir2-block-prev b))
                (prev last b))
               ((not (eq (ir2-block-block b) block)))
-            (when (propagate-live-tns b prev)
+            (when (propagate-live-tns b prev (< i 10))
               (setq did-something t)))))
 
       (unless did-something (return))))

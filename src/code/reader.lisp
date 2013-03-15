@@ -250,17 +250,19 @@ standard Lisp readtable when NIL."
                           :test #'char= :key #'car)))
       (set-cat-entry to-char att to-readtable)
       (set-cmt-entry to-char mac to-readtable)
-      (when from-dpair
-        (cond
-          (to-dpair
-           (let ((table (cdr to-dpair)))
-             (clrhash table)
-             (shallow-replace/eql-hash-table table (cdr from-dpair))))
-          (t
-           (let ((pair (cons to-char (make-hash-table))))
-             (shallow-replace/eql-hash-table (cdr pair) (cdr from-dpair))
+      (cond ((and (not from-dpair) (not to-dpair)))
+            ((and (not from-dpair) to-dpair)
              (setf (dispatch-tables to-readtable)
-                   (push pair (dispatch-tables to-readtable)))))))))
+                   (remove to-dpair (dispatch-tables to-readtable))))
+            (to-dpair
+             (let ((table (cdr to-dpair)))
+               (clrhash table)
+               (shallow-replace/eql-hash-table table (cdr from-dpair))))
+            (t
+             (let ((pair (cons to-char (make-hash-table))))
+               (shallow-replace/eql-hash-table (cdr pair) (cdr from-dpair))
+               (setf (dispatch-tables to-readtable)
+                     (push pair (dispatch-tables to-readtable))))))))
   t)
 
 (defun set-macro-character (char function &optional
@@ -270,7 +272,8 @@ standard Lisp readtable when NIL."
   "Causes CHAR to be a macro character which invokes FUNCTION when seen
    by the reader. The NON-TERMINATINGP flag can be used to make the macro
    character non-terminating, i.e. embeddable in a symbol name."
-  (let ((designated-readtable (or rt-designator *standard-readtable*)))
+  (let ((designated-readtable (or rt-designator *standard-readtable*))
+        (function (%coerce-callable-to-fun function)))
     (assert-not-standard-readtable designated-readtable 'set-macro-character)
     (set-cat-entry char (if non-terminatingp
                             +char-attr-constituent+
@@ -292,8 +295,8 @@ standard Lisp readtable when NIL."
     (values fun-value
             ;; NON-TERMINATING-P return value:
             (if fun-value
-                (or (constituentp char)
-                    (not (terminating-macrop char)))
+                (or (constituentp char designated-readtable)
+                    (not (terminating-macrop char designated-readtable)))
                 ;; ANSI's definition of GET-MACRO-CHARACTER says this
                 ;; value is NIL when CHAR is not a macro character.
                 ;; I.e. this value means not just "non-terminating
@@ -901,9 +904,12 @@ standard Lisp readtable when NIL."
                (cond (all-lower (raise-em))
                      (all-upper (lower-em))))))))))))
 
+(defvar *reader-package* nil)
+
 (defun read-token (stream firstchar)
   #!+sb-doc
-  "This function is just an fsm that recognizes numbers and symbols."
+  "Default readmacro function. Handles numbers, symbols, and SBCL's
+extended <package-name>::<form-in-package> syntax."
   ;; Check explicitly whether FIRSTCHAR has an entry for
   ;; NON-TERMINATING in CHARACTER-ATTRIBUTE-TABLE and
   ;; READ-DOT-NUMBER-SYMBOL in CMT. Report an error if these are
@@ -1257,9 +1263,12 @@ standard Lisp readtable when NIL."
       (case (char-class char attribute-array attribute-hash-table)
         (#.+char-attr-delimiter+
          (unread-char char stream)
-         (simple-reader-error stream
-                              "illegal terminating character after a colon: ~S"
-                              char))
+         (if package-designator
+             (let* ((*reader-package* (%find-package-or-lose package-designator)))
+               (return (read stream t nil t)))
+             (simple-reader-error stream
+                                  "illegal terminating character after a double-colon: ~S"
+                                  char)))
         (#.+char-attr-single-escape+ (go SINGLE-ESCAPE))
         (#.+char-attr-multiple-escape+ (go MULT-ESCAPE))
         (#.+char-attr-package-delimiter+
@@ -1270,13 +1279,13 @@ standard Lisp readtable when NIL."
       RETURN-SYMBOL
       (casify-read-buffer escapes)
       (let ((found (if package-designator
-                       (find-package package-designator)
-                       (sane-package))))
-        (unless found
-          (error 'simple-reader-package-error :stream stream
-                 :format-arguments (list package-designator)
-                 :format-control "package ~S not found"))
-
+                       (or (find-package package-designator)
+                           (error 'simple-reader-package-error
+                                  :package package-designator
+                                  :stream stream
+                                  :format-control "Package ~A does not exist."
+                                  :format-arguments (list package-designator)))
+                       (or *reader-package* (sane-package)))))
         (if (or (zerop colons) (= colons 2) (eq found *keyword-package*))
             (return (intern* *read-buffer* *ouch-ptr* found))
             (multiple-value-bind (symbol test)
@@ -1284,7 +1293,9 @@ standard Lisp readtable when NIL."
               (when (eq test :external) (return symbol))
               (let ((name (read-buffer-to-string)))
                 (with-simple-restart (continue "Use symbol anyway.")
-                  (error 'simple-reader-package-error :stream stream
+                  (error 'simple-reader-package-error
+                         :package found
+                         :stream stream
                          :format-arguments (list name (package-name found))
                          :format-control
                          (if test
@@ -1398,6 +1409,24 @@ standard Lisp readtable when NIL."
                                  (the index (* num base))))))))
        (setq number (+ num (* number base-power)))))))
 
+(defun truncate-exponent (exponent number divisor)
+  "Truncate exponent if it's too large for a float"
+  ;; Work with base-2 logarithms to avoid conversions to floats,
+  ;; and convert to base-10 conservatively at the end.
+  ;; Use the least positive float, because denormalized exponent
+  ;; can be larger than normalized.
+  (let* ((max-exponent
+          #!-long-float
+          (+ sb!vm:double-float-digits sb!vm:double-float-bias))
+         (number-magnitude (integer-length number))
+         (divisor-magnitude (1- (integer-length divisor)))
+         (magnitude (- number-magnitude divisor-magnitude)))
+    (if (minusp exponent)
+        (max exponent (ceiling (- (+ max-exponent magnitude))
+                               #.(floor (log 10 2))))
+        (min exponent (floor (- max-exponent magnitude)
+                             #.(floor (log 10 2)))))))
+
 (defun make-float (stream)
   ;; Assume that the contents of *read-buffer* are a legal float, with nothing
   ;; else after it.
@@ -1458,6 +1487,7 @@ standard Lisp readtable when NIL."
                                   (#\F 'single-float)
                                   (#\D 'double-float)
                                   (#\L 'long-float)))
+                  (exponent (truncate-exponent exponent number divisor))
                   (result (make-float-aux (* (expt 10 exponent) number)
                                           divisor float-format stream)))
              (return-from make-float
@@ -1470,7 +1500,8 @@ standard Lisp readtable when NIL."
     (type-error (c)
       (error 'reader-impossible-number-error
              :error c :stream stream
-             :format-control "failed to build float"))))
+             :format-control "failed to build float from ~a"
+             :format-arguments (list (read-buffer-to-string))))))
 
 (defun make-ratio (stream)
   ;; Assume *READ-BUFFER* contains a legal ratio. Build the number from
@@ -1542,14 +1573,19 @@ standard Lisp readtable when NIL."
 
 ;;;; READ-FROM-STRING
 
-(defun read-from-string (string &optional (eof-error-p t) eof-value
-                                &key (start 0) end
-                                preserve-whitespace)
-  #!+sb-doc
-  "The characters of string are successively given to the lisp reader
-   and the lisp object built by the reader is returned. Macro chars
-   will take effect."
-  (declare (string string))
+(defun maybe-note-read-from-string-signature-issue (eof-error-p)
+  ;; The interface is so unintuitive that we explicitly check for the common
+  ;; error.
+  (when (member eof-error-p '(:start :end :preserve-whitespace))
+    (style-warn "~@<~S as EOF-ERROR-P argument to ~S: probable error. ~
+               Two optional arguments must be provided before the ~
+               first keyword argument.~:@>"
+                eof-error-p 'read-from-string)
+    t))
+
+(declaim (ftype (sfunction (string t t index (or null index) t) (values t index))
+                %read-from-string))
+(defun %read-from-string (string eof-error-p eof-value start end preserve-whitespace)
   (with-array-data ((string string :offset-var offset)
                     (start start)
                     (end end)
@@ -1559,6 +1595,55 @@ standard Lisp readtable when NIL."
                   (%read-preserving-whitespace stream eof-error-p eof-value nil)
                   (read stream eof-error-p eof-value))
               (- (string-input-stream-current stream) offset)))))
+
+(defun read-from-string (string &optional (eof-error-p t) eof-value
+                                &key (start 0) end preserve-whitespace)
+  #!+sb-doc
+  "The characters of string are successively given to the lisp reader
+   and the lisp object built by the reader is returned. Macro chars
+   will take effect."
+  (declare (string string))
+  (maybe-note-read-from-string-signature-issue eof-error-p)
+  (%read-from-string string eof-error-p eof-value start end preserve-whitespace))
+
+(define-compiler-macro read-from-string (&whole form string &rest args)
+  ;; Check this at compile-time, and rewrite it so we're silent at runtime.
+  (destructuring-bind (&optional (eof-error-p t) eof-value &rest keys)
+      args
+    (cond ((maybe-note-read-from-string-signature-issue eof-error-p)
+           `(read-from-string ,string t ,eof-value ,@keys))
+          (t
+           (let* ((start (gensym "START"))
+                  (end (gensym "END"))
+                  (preserve-whitespace (gensym "PRESERVE-WHITESPACE"))
+                  bind seen ignore)
+             (do ()
+                 ((not (cdr keys))
+                  ;; Odd number of keys, punt.
+                  (when keys (return-from read-from-string form)))
+               (let* ((key (pop keys))
+                      (value (pop keys))
+                      (var (case key
+                             (:start start)
+                             (:end end)
+                             (:preserve-whitespace preserve-whitespace)
+                             (otherwise
+                              (return-from read-from-string form)))))
+                 (when (member key seen)
+                   (setf var (gensym "IGNORE"))
+                   (push var ignore))
+                 (push key seen)
+                 (push (list var value) bind)))
+             (dolist (default (list (list start 0)
+                                    (list end nil)
+                                    (list preserve-whitespace nil)))
+               (unless (assoc (car default) bind)
+                 (push default bind)))
+             (once-only ((string string))
+               `(let ,(nreverse bind)
+                  ,@(when ignore `((declare (ignore ,@ignore))))
+                  (%read-from-string ,string ,eof-error-p ,eof-value
+                                     ,start ,end ,preserve-whitespace))))))))
 
 ;;;; PARSE-INTEGER
 

@@ -249,4 +249,49 @@
               (simple-type-error () 'error)))
       t)))
 
+(with-test (:name :bug-524707 :skipped-on '(not :sb-eval))
+  (let ((*evaluator-mode* :interpret)
+        (lambda-form '(lambda (x) (declare (fixnum x)) (1+ x))))
+    (let ((fun (eval lambda-form)))
+      (assert (equal lambda-form (function-lambda-expression fun))))))
+
+(with-test (:name (eval :source-context-in-compiler))
+  (let ((noise (with-output-to-string (*error-output*)
+                 (let ((*evaluator-mode* :compile))
+                   (eval `(defun source-context-test (x) y))))))
+    (with-input-from-string (s noise)
+      (assert (equal "; in: DEFUN SOURCE-CONTEXT-TEST" (read-line s))))))
+
+(with-test (:name (eval :empty-let-is-not-toplevel))
+  (let ((sb-ext:*evaluator-mode* :compile))
+    (eval `(let ()
+             (defmacro empty-let-is-not-toplevel-x () :macro)
+             (defun empty-let-is-not-toplevel-fun ()
+               (empty-let-is-not-toplevel-x))))
+    (eval `(defun empty-let-is-not-toplevel-x () :fun))
+    (assert (eq :fun (empty-let-is-not-toplevel-fun))))
+  ;; While at it, test that we get the late binding under
+  ;; interpreter mode.
+  #+sb-eval
+  (let ((sb-ext:*evaluator-mode* :interpret))
+    (eval `(let ()
+             (defmacro empty-let-is-not-toplevel-x () :macro)
+             (defun empty-let-is-not-toplevel-fun ()
+               (empty-let-is-not-toplevel-x))))
+    (assert (eq :macro (empty-let-is-not-toplevel-fun)))
+    (eval `(defun empty-let-is-not-toplevel-x () :fun))
+    (assert (eq :fun (empty-let-is-not-toplevel-fun)))))
+
+(with-test (:name (eval function-lambda-expression))
+  (assert (equal `(sb-int:named-lambda eval-fle-1 (x)
+                    (block eval-fle-1
+                      (+ x 1)))
+                 (function-lambda-expression
+                  (eval `(progn
+                           (defun eval-fle-1 (x) (+ x 1))
+                           #'eval-fle-1)))))
+  (assert (equal `(lambda (x y z) (+ x 1 y z))
+                 (function-lambda-expression
+                  (eval `(lambda (x y z) (+ x 1 y z)))))))
+
 ;;; success

@@ -11,6 +11,8 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+(in-package :cl-user)
+
 ;;; As reported by Paul Dietz from his ansi-test suite for gcl, REMOVE
 ;;; malfunctioned when given :START, :END and :FROM-END arguments.
 ;;; Make sure it doesn't happen again.
@@ -205,3 +207,166 @@
                       (b1 (make-array bsize :element-type '(unsigned-byte 8)))
                       (b2 (make-array l :element-type '(unsigned-byte 8))))
                  (replace b1 b2 :start2 0 :end2 l))))))
+
+(with-test (:name :bug-452008)
+  ;; FIND & POSITION on lists should check bounds and (in safe code) detect
+  ;; circular and dotted lists.
+  (macrolet ((test (type lambda)
+               `(let ((got (handler-case
+                               (funcall (compile nil ',lambda))
+                             (,type () :error)
+                             (:no-error (res)
+                               (list :no-error res)))))
+                  (let ((*print-circle* t))
+                    (format t "test: ~S~%" ',lambda))
+                  (unless (eq :error got)
+                    (error "wanted an error, got ~S for~%  ~S"
+                           (second got) ',lambda)))))
+    (test sb-kernel:bounding-indices-bad-error
+          (lambda ()
+            (find :foo '(1 2 3 :foo) :start 1 :end 5 :from-end t)))
+    (test sb-kernel:bounding-indices-bad-error
+          (lambda ()
+            (position :foo '(1 2 3 :foo) :start 1 :end 5 :from-end t)))
+    (test sb-kernel:bounding-indices-bad-error
+          (lambda ()
+            (find :foo '(1 2 3 :foo) :start 3 :end 0 :from-end t)))
+    (test sb-kernel:bounding-indices-bad-error
+          (lambda ()
+            (position :foo '(1 2 3 :foo) :start 3 :end 0 :from-end t)))
+    (test type-error
+          (lambda ()
+            (let ((list (list 1 2 3 :foo)))
+              (find :bar (nconc list list)))))
+    (test type-error
+          (lambda ()
+            (let ((list (list 1 2 3 :foo)))
+              (position :bar (nconc list list)))))))
+
+(with-test (:name :bug-554385)
+  ;; FIND-IF shouldn't look through the entire list.
+  (assert (= 2 (find-if #'evenp '(1 2 1 1 1 1 1 1 1 1 1 1 :foo))))
+  ;; Even though the end bounds are incorrect, the
+  ;; element is found before that's an issue.
+  (assert (eq :foo (find :foo '(1 2 3 :foo) :start 1 :end 5)))
+  (assert (= 3 (position :foo '(1 2 3 :foo) :start 1 :end 5))))
+
+(with-test (:name (:search :empty-seq))
+  (assert (eql 0
+               (funcall (compile nil
+                                 `(lambda (x)
+                                    (declare (optimize (speed 3)) (simple-vector x))
+                                    (search x #())))
+                        #())))
+  (assert (eql 0
+               (funcall (compile nil
+                                 `(lambda (x)
+                                    (declare (optimize (speed 3)) (simple-vector x))
+                                    (search x #(t t t))))
+                        #())))
+  (assert (eql 0
+               (funcall (compile nil
+                                 `(lambda (x)
+                                    (declare (optimize (speed 3)) (simple-vector x))
+                                    (search x #(t t t) :end1 0)))
+                        #(t t t))))
+  (assert (eql 0
+               (funcall (compile nil
+                                 `(lambda (x)
+                                    (declare (optimize (speed 3)) (simple-vector x))
+                                    (search x #(t t t) :key nil)))
+                        #())))
+  (assert (eql 0
+               (funcall (compile nil
+                                 `(lambda (x k)
+                                    (declare (optimize (speed 3)) (simple-vector x))
+                                    (search x #(t t t) :key k)))
+                        #() nil)))
+  (assert (eq :ok
+              (handler-case
+                  (funcall (compile nil
+                                    `(lambda (x)
+                                       (declare (optimize (speed 3)) (simple-vector x))
+                                       (search x #(t t t) :start2 1 :end2 0 :end1 0)))
+                           #(t t t))
+                (sb-kernel:bounding-indices-bad-error ()
+                  :ok))))
+  (assert (eql 1
+               (funcall (lambda ()
+                          (declare (optimize speed))
+                          (search #() #(1 1) :start2 1 :end2 1)))))
+  (assert (eql 2
+               (funcall (lambda ()
+                          (declare (optimize speed))
+                          (search #(1) #(1 1) :start1 1 :start2 2)))))
+  (assert (eql 2
+               (funcall (lambda ()
+                          (declare (optimize speed))
+                          (search #() #(1 1) :from-end t))))))
+
+(with-test (:name :sort-smoke-test)
+  (flet ((iota (n type &aux (i 0))
+           (map-into (make-sequence type n)
+                     (lambda ()
+                       (incf i))))
+         (shuffle (n type)
+           (let ((vector (let ((i 0))
+                           (map-into (make-array n)
+                                     (lambda ()
+                                       (incf i))))))
+             (dotimes (i n (coerce vector type))
+               (let ((j (+ i (random (- n i)))))
+                 (rotatef (aref vector i) (aref vector j))))))
+         (sortedp (x)
+           (let* ((nonce (list nil))
+                  (prev nonce))
+             (every (lambda (x)
+                      (prog1 (or (eql prev nonce)
+                                 (< prev x))
+                        (setf prev x)))
+                    x))))
+    (dolist (type '(simple-vector list))
+      (dolist (size '(7 8 9 13 1023 1024 1025 1536))
+        (loop for repeat below 5 do
+          (assert (sortedp
+                   (sort (funcall (case repeat
+                                    (0 #'iota)
+                                    (1 (lambda (n type)
+                                         (reverse (iota n type))))
+                                    (t #'shuffle))
+                                  size type)
+                         #'<))))))))
+
+(with-test (:name :stable-sort-smoke-test)
+  (flet ((iota (n type &aux (i 0))
+           (map-into (make-sequence type n)
+                     (lambda ()
+                       (cons 0 (incf i)))))
+         (shuffle (n type)
+           (let ((max (truncate (expt n 1/4)))
+                 (i   0))
+             (map-into (make-sequence type n)
+                       (lambda ()
+                         (cons (random max) (incf i))))))
+         (sortedp (x)
+           (let* ((nonce (list nil))
+                  (prev nonce))
+             (every (lambda (x)
+                      (prog1 (or (eql prev nonce)
+                                 (< (car prev) (car x))
+                                 (and (= (car prev) (car x))
+                                      (< (cdr prev) (cdr x))))
+                        (setf prev x)))
+                    x))))
+    (dolist (type '(simple-vector list))
+      (dolist (size '(0  1  2  3  4  5  6  7  8
+                      9 10 11 12 13 14 15 16 17
+                      1023 1024 1025 1536))
+        (loop for repeat below 5 do
+          (assert
+           (sortedp
+            (stable-sort (funcall (case repeat
+                                    (0 #'iota)
+                                    (t #'shuffle))
+                                  size type)
+                         #'< :key #'car))))))))

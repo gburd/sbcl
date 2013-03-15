@@ -73,7 +73,7 @@ invoked. In that case it will store into PLACE and start over."
   ;; variable to work around Python's blind spot in type derivation.
   ;; For more complex places getting the type derived should not
   ;; matter so much anyhow.
-  (let ((expanded (sb!xc:macroexpand place env)))
+  (let ((expanded (%macroexpand place env)))
     (if (symbolp expanded)
         `(do ()
              ((typep ,place ',type))
@@ -165,7 +165,8 @@ invoked. In that case it will store into PLACE and start over."
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
 
-(define-condition duplicate-case-key-warning (style-warning)
+;;; Make this a full warning during SBCL build.
+(define-condition duplicate-case-key-warning (#-sb-xc-host style-warning #+sb-xc-host warning)
   ((key :initarg :key
         :reader case-warning-key)
    (case-kind :initarg :case-kind
@@ -260,6 +261,17 @@ invoked. In that case it will store into PLACE and start over."
                          ,@forms)
                        clauses))
                 (t
+                 (when (and (eq name 'case)
+                            (cdr cases)
+                            (memq keyoid '(t otherwise)))
+                   (error 'simple-reference-error
+                          :format-control
+                          "~@<~IBad ~S clause:~:@_  ~S~:@_~S allowed as the key ~
+                           designator only in the final otherwise-clause, not in a ~
+                           normal-clause. Use (~S) instead, or move the clause the ~
+                           correct position.~:@>"
+                          :format-arguments (list 'case case keyoid keyoid)
+                          :references `((:ansi-cl :macro case))))
                  (push keyoid keys)
                  (check-clause (list keyoid))
                  (push `((,test ,keyform-value ',keyoid)

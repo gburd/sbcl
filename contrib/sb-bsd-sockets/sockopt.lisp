@@ -55,7 +55,8 @@ Code for options that not every system has should be conditionalised:
                   (if (= -1 (sockint::getsockopt (socket-file-descriptor socket)
                                                  ,find-level ,number
                                                  (sb-alien:addr buffer)
-                                                 (sb-alien:addr size)))
+                                                 #+win32 size
+                                                 #-win32 (sb-alien:addr size)))
                       (socket-error "getsockopt")
                       (,mangle-return buffer size)))
              `(error 'unsupported-operator
@@ -101,6 +102,13 @@ Code for options that not every system has should be conditionalised:
 (define-socket-option-int
   sockopt-priority sockint::sol-socket sockint::so-priority :linux
   "Available only on Linux.")
+
+(define-socket-option-int
+  sockopt-tcp-keepcnt :tcp sockint::tcp-keepcnt :linux "Available only on Linux.")
+(define-socket-option-int
+  sockopt-tcp-keepidle :tcp sockint::tcp-keepidle :linux "Available only on Linux.")
+(define-socket-option-int
+  sockopt-tcp-keepintvl :tcp sockint::tcp-keepintvl :linux "Available only on Linux.")
 
 ;;; boolean options are integers really
 

@@ -83,15 +83,20 @@
 ;;; support for DESCRIBE tests
 (defstruct to-be-described a b)
 (defclass forward-describe-class (forward-describe-ref) (a))
+(let ((sb-ext:*evaluator-mode* :compile))
+  (eval `(let (x) (defun closure-to-describe () (incf x)))))
 
 ;;; DESCRIBE should run without signalling an error.
-(describe (make-to-be-described))
-(describe 12)
-(describe "a string")
-(describe 'symbolism)
-(describe (find-package :cl))
-(describe '(a list))
-(describe #(a vector))
+(with-test (:name (describe :no-error))
+  (describe (make-to-be-described))
+  (describe 12)
+  (describe "a string")
+  (describe 'symbolism)
+  (describe (find-package :cl))
+  (describe '(a list))
+  (describe #(a vector))
+;; bug 824974
+  (describe 'closure-to-describe))
 
 ;;; The DESCRIBE-OBJECT methods for built-in CL stuff should do
 ;;; FRESH-LINE and TERPRI neatly.
@@ -229,17 +234,19 @@
 
 (with-test (:name (documentation closure))
   (assert (string= (documentation 'docfoo 'function) "bar"))
-  (assert (string= (documentation #'docfoo t) "bar"))
   (assert (string= (setf (documentation 'docfoo 'function) "baz") "baz"))
   (assert (string= (documentation 'docfoo 'function) "baz"))
-  (assert (string= (documentation #'docfoo t) "baz")))
+  (assert (string= (documentation #'docfoo t) "baz"))
+  (assert (string= (setf (documentation #'docfoo t) "zot") "zot"))
+  (assert (string= (documentation #'docfoo t) "zot"))
+  (assert (string= (documentation 'docfoo 'function) "zot"))
+  (assert (not (setf (documentation 'docfoo 'function) nil)))
+  (assert (not (documentation 'docfoo 'function))))
 
-#+sb-doc
-(with-test (:name (documentation built-in-macro))
+(with-test (:name (documentation built-in-macro) :skipped-on '(not :sb-doc))
   (assert (documentation 'trace 'function)))
 
-#+sb-doc
-(with-test (:name (documentation built-in-function))
+(with-test (:name (documentation built-in-function) :skipped-on '(not :sb-doc))
   (assert (documentation 'cons 'function)))
 
 (with-test (:name :describe-generic-function-with-assumed-type)
@@ -247,5 +254,61 @@
   (flet ((zoo () (gogo)))
     (defmethod gogo () nil)
     (describe 'gogo)))
+
+(defmacro bug-643958-test ()
+  "foo"
+  :ding!)
+
+(with-test (:name :bug-643958)
+  (assert (equal "foo" (documentation 'bug-643958-test 'function)))
+  (setf (documentation 'bug-643958-test 'function) "bar")
+  (assert (equal "bar" (documentation 'bug-643958-test 'function))))
+
+(defclass cannot-print-this ()
+  ())
+(defmethod print-object ((oops cannot-print-this) stream)
+  (error "No go!"))
+(with-test (:name :describe-suppresses-print-errors)
+  (handler-bind ((error #'continue))
+    (with-output-to-string (s)
+      (describe (make-instance 'cannot-print-this) s))))
+(with-test (:name :backtrace-suppresses-print-errors)
+  (handler-bind ((error #'continue))
+    (with-output-to-string (s)
+      (labels ((foo (n x)
+                 (when (plusp n)
+                   (foo (1- n) x))
+                 (when (zerop n)
+                   (sb-debug:backtrace 100 s))))
+        (foo 100 (make-instance 'cannot-print-this))))))
+(with-test (:name :backtrace-and-circles)
+  (handler-bind ((error #'continue))
+    (with-output-to-string (s)
+      (labels ((foo (n x)
+                 (when (plusp n)
+                   (foo (1- n) x))
+                 (when (zerop n)
+                   (sb-debug:backtrace 100 s))))
+        (foo 100 (let ((list (list t)))
+                   (nconc list list)))))))
+
+(with-test (:name :endianness-in-features)
+  (assert
+   (or (member :big-endian *features*)
+       (member :little-endian *features*))))
+
+(with-test (:name :function-documentation-mismatch)
+  (defun test ()
+    "X"
+    nil)
+  (setf (symbol-function 'test2) #'test)
+  (setf (documentation 'test 'function) "Y")
+  (assert (equal (documentation #'test t)
+                 (documentation 'test 'function)))
+  (setf (documentation 'test2 'function) "Z")
+  (assert (not
+           (equal (documentation 'test 'function)
+                  (documentation 'test2 'function)))))
+
 
 ;;;; success

@@ -13,26 +13,6 @@
 
 (in-package "SB!KERNEL")
 
-;;;; miscellaneous support utilities
-
-;;; Signalling an error when trying to print an error condition is
-;;; generally a PITA, so whatever the failure encountered when
-;;; wondering about FILE-POSITION within a condition printer, 'tis
-;;; better silently to give up than to try to complain.
-(defun file-position-or-nil-for-error (stream &optional (pos nil posp))
-  ;; Arguably FILE-POSITION shouldn't be signalling errors at all; but
-  ;; "NIL if this cannot be determined" in the ANSI spec doesn't seem
-  ;; absolutely unambiguously to prohibit errors when, e.g., STREAM
-  ;; has been closed so that FILE-POSITION is a nonsense question. So
-  ;; my (WHN) impression is that the conservative approach is to
-  ;; IGNORE-ERRORS. (I encountered this failure from within a homebrew
-  ;; defsystemish operation where the ERROR-STREAM had been CL:CLOSEd,
-  ;; I think by nonlocally exiting through a WITH-OPEN-FILE, by the
-  ;; time an error was reported.)
-  (if posp
-      (ignore-errors (file-position stream pos))
-      (ignore-errors (file-position stream))))
-
 ;;;; the CONDITION class
 
 (/show0 "condition.lisp 20")
@@ -171,7 +151,12 @@
 ;;; The current code doesn't seem to quite match that.
 (def!method print-object ((x condition) stream)
   (if *print-escape*
-      (print-unreadable-object (x stream :type t :identity t))
+      (if (and (typep x 'simple-condition) (slot-value x 'format-control))
+          (print-unreadable-object (x stream :type t :identity t)
+            (write (simple-condition-format-control x)
+                   :stream stream
+                   :lines 1))
+          (print-unreadable-object (x stream :type t :identity t)))
       ;; KLUDGE: A comment from CMU CL here said
       ;;   7/13/98 BUG? CPL is not sorted and results here depend on order of
       ;;   superclasses in define-condition call!
@@ -259,7 +244,8 @@
                   (condition-classoid type)
                   (class
                    ;; Punt to CLOS.
-                   (return-from make-condition (apply #'make-instance type args)))
+                   (return-from make-condition
+                     (apply #'make-instance type args)))
                   (classoid
                    (error 'simple-type-error
                           :datum type
@@ -270,7 +256,8 @@
                    (error 'simple-type-error
                           :datum type
                           :expected-type 'condition-class
-                          :format-control "Bad type argument:~%  ~S"
+                          :format-control
+                          "~s doesn't designate a condition class."
                           :format-arguments (list type)))))
          (res (make-condition-object args)))
     (setf (%instance-layout res) (classoid-layout class))
@@ -393,8 +380,12 @@
 
 (defvar *define-condition-hooks* nil)
 
+(defun %set-condition-report (name report)
+  (setf (condition-classoid-report (find-classoid name))
+        report))
+
 (defun %define-condition (name parent-types layout slots documentation
-                          report default-initargs all-readers all-writers
+                          default-initargs all-readers all-writers
                           source-location)
   (with-single-package-locked-error
       (:symbol name "defining ~A as a condition")
@@ -404,7 +395,6 @@
             source-location))
     (let ((class (find-classoid name)))
       (setf (condition-classoid-slots class) slots)
-      (setf (condition-classoid-report class) report)
       (setf (condition-classoid-default-initargs class) default-initargs)
       (setf (fdocumentation name 'type) documentation)
 
@@ -543,10 +533,10 @@
              (setq report
                    (if (stringp arg)
                        `#'(lambda (condition stream)
-                          (declare (ignore condition))
-                          (write-string ,arg stream))
+                            (declare (ignore condition))
+                            (write-string ,arg stream))
                        `#'(lambda (condition stream)
-                          (funcall #',arg condition stream))))))
+                            (funcall #',arg condition stream))))))
           (:default-initargs
            (do ((initargs (rest option) (cddr initargs)))
                ((endp initargs))
@@ -570,11 +560,16 @@
                               ',layout
                               (list ,@(slots))
                               ,documentation
-                              ,report
                               (list ,@default-initargs)
                               ',(all-readers)
                               ',(all-writers)
-                              (sb!c:source-location)))))))
+                              (sb!c:source-location))
+           ;; This needs to be after %DEFINE-CONDITION in case :REPORT
+           ;; is a lambda referring to condition slot accessors:
+           ;; they're not proclaimed as functions before it has run if
+           ;; we're under EVAL or loaded as source.
+           (%set-condition-report ',name ,report)
+           ',name)))))
 
 ;;;; various CONDITIONs specified by ANSI
 
@@ -586,18 +581,21 @@
 (define-condition style-warning (warning) ())
 
 (defun simple-condition-printer (condition stream)
-  (apply #'format
-         stream
-         (simple-condition-format-control condition)
-         (simple-condition-format-arguments condition)))
+  (let ((control (simple-condition-format-control condition)))
+    (if control
+        (apply #'format stream
+               control
+               (simple-condition-format-arguments condition))
+        (error "No format-control for ~S" condition))))
 
 (define-condition simple-condition ()
   ((format-control :reader simple-condition-format-control
                    :initarg :format-control
+                   :initform nil
                    :type format-control)
    (format-arguments :reader simple-condition-format-arguments
                      :initarg :format-arguments
-                     :initform '()
+                     :initform nil
                      :type list))
   (:report simple-condition-printer))
 
@@ -617,9 +615,31 @@
              (type-error-datum condition)
              (type-error-expected-type condition)))))
 
+(def!method print-object ((condition type-error) stream)
+  (if *print-escape*
+      (flet ((maybe-string (thing)
+               (ignore-errors
+                 (write-to-string thing :lines 1 :readably nil :array nil :pretty t))))
+        (let ((type (maybe-string (type-error-expected-type condition)))
+              (datum (maybe-string (type-error-datum condition))))
+          (if (and type datum)
+              (print-unreadable-object (condition stream :type t)
+                (format stream "~@<expected-type: ~A ~_datum: ~A~:@>" type datum))
+              (call-next-method))))
+      (call-next-method)))
+
 ;;; not specified by ANSI, but too useful not to have around.
 (define-condition simple-style-warning (simple-condition style-warning) ())
 (define-condition simple-type-error (simple-condition type-error) ())
+
+;; Can't have a function called SIMPLE-TYPE-ERROR or TYPE-ERROR...
+(declaim (ftype (sfunction (t t t &rest t) nil) bad-type))
+(defun bad-type (datum type control &rest arguments)
+  (error 'simple-type-error
+         :datum datum
+         :expected-type type
+         :format-control control
+         :format-arguments arguments))
 
 (define-condition program-error (error) ())
 (define-condition parse-error   (error) ())
@@ -668,7 +688,7 @@
   (:report
    (lambda (condition stream)
      (format stream
-             "The function ~S is undefined."
+             "The function ~/sb-impl::print-symbol-with-prefix/ is undefined."
              (cell-error-name condition)))))
 
 (define-condition special-form-function (undefined-function) ()
@@ -733,45 +753,17 @@
 ;;;
 ;;; When SIMPLE, we expect and use SIMPLE-CONDITION-ish FORMAT-CONTROL
 ;;; and FORMAT-ARGS slots.
-(defun %report-reader-error (condition stream &key simple)
-  (let* ((error-stream (stream-error-stream condition))
-         (pos (file-position-or-nil-for-error error-stream)))
-    (let (lineno colno)
-      (when (and pos
-                 (< pos sb!xc:array-dimension-limit)
-                 ;; KLUDGE: lseek() (which is what FILE-POSITION
-                 ;; reduces to on file-streams) is undefined on
-                 ;; "some devices", which in practice means that it
-                 ;; can claim to succeed on /dev/stdin on Darwin
-                 ;; and Solaris.  This is obviously bad news,
-                 ;; because the READ-SEQUENCE below will then
-                 ;; block, not complete, and the report will never
-                 ;; be printed.  As a workaround, we exclude
-                 ;; interactive streams from this attempt to report
-                 ;; positions.  -- CSR, 2003-08-21
-                 (not (interactive-stream-p error-stream))
-                 (file-position error-stream :start))
-        (let ((string
-               (make-string pos
-                            :element-type (stream-element-type
-                                           error-stream))))
-          (when (= pos (read-sequence string error-stream))
-            (setq lineno (1+ (count #\Newline string))
-                  colno (- pos
-                           (or (position #\Newline string :from-end t) -1)
-                           1))))
-        (file-position-or-nil-for-error error-stream pos))
-      (pprint-logical-block (stream nil)
-        (format stream
-                "~S ~@[at ~W ~]~
-                    ~@[(line ~W~]~@[, column ~W) ~]~
-                    on ~S"
-                (class-name (class-of condition))
-                pos lineno colno error-stream)
-        (when simple
-          (format stream ":~2I~_~?"
-                  (simple-condition-format-control condition)
-                  (simple-condition-format-arguments condition)))))))
+(defun %report-reader-error (condition stream &key simple position)
+  (let ((error-stream (stream-error-stream condition)))
+    (pprint-logical-block (stream nil)
+      (if simple
+          (apply #'format stream
+                 (simple-condition-format-control condition)
+                 (simple-condition-format-arguments condition))
+          (prin1 (class-name (class-of condition)) stream))
+      (format stream "~2I~@[~_~_~:{~:(~A~): ~S~:^, ~:_~}~]~_~_Stream: ~S"
+              (stream-error-position-info error-stream position)
+              error-stream))))
 
 ;;;; special SBCL extension conditions
 
@@ -897,6 +889,10 @@
 (define-condition simple-reference-warning (reference-condition simple-warning)
   ())
 
+(define-condition arguments-out-of-domain-error
+    (arithmetic-error reference-condition)
+  ())
+
 (define-condition duplicate-definition (reference-condition warning)
   ((name :initarg :name :reader duplicate-definition-name))
   (:report (lambda (c s)
@@ -915,6 +911,12 @@
                                        '(:ansi-cl :section (3 2 2 3)))))
 
 (define-condition package-at-variance (reference-condition simple-warning)
+  ()
+  (:default-initargs :references (list '(:ansi-cl :macro defpackage)
+                                       '(:sbcl :variable *on-package-variance*))))
+
+(define-condition package-at-variance-error (reference-condition simple-condition
+                                             package-error)
   ()
   (:default-initargs :references (list '(:ansi-cl :macro defpackage))))
 
@@ -943,6 +945,9 @@
 (define-condition type-warning (reference-condition simple-warning)
   ()
   (:default-initargs :references (list '(:sbcl :node "Handling of Types"))))
+(define-condition type-style-warning (reference-condition simple-style-warning)
+  ()
+  (:default-initargs :references (list '(:sbcl :node "Handling of Types"))))
 
 (define-condition local-argument-mismatch (reference-condition simple-warning)
   ()
@@ -963,8 +968,9 @@
   ((name :initarg :name :reader implicit-generic-function-name))
   (:report
    (lambda (condition stream)
-     (format stream "~@<Implicitly creating new generic function ~S.~:@>"
-             (implicit-generic-function-name condition)))))
+     (let ((*package* (find-package :keyword)))
+       (format stream "~@<Implicitly creating new generic function ~S.~:@>"
+               (implicit-generic-function-name condition))))))
 
 (define-condition extension-failure (reference-condition simple-error)
   ())
@@ -977,22 +983,26 @@
 #!+sb-package-locks
 (progn
 
-(define-condition package-lock-violation (reference-condition package-error)
-  ((format-control :initform nil :initarg :format-control
-                   :reader package-error-format-control)
-   (format-arguments :initform nil :initarg :format-arguments
-                     :reader package-error-format-arguments))
+(define-condition package-lock-violation (package-error
+                                          reference-condition
+                                          simple-condition)
+  ((current-package :initform *package*
+                    :reader package-lock-violation-in-package))
   (:report
    (lambda (condition stream)
-     (let ((control (package-error-format-control condition)))
+     (let ((control (simple-condition-format-control condition))
+           (error-package (package-name (package-error-package condition)))
+           (current-package (package-name (package-lock-violation-in-package condition))))
        (if control
            (apply #'format stream
-                  (format nil "~~@<Lock on package ~A violated when ~A.~~:@>"
-                          (package-name (package-error-package condition))
-                          control)
-                  (package-error-format-arguments condition))
-           (format stream "~@<Lock on package ~A violated.~:@>"
-                   (package-name (package-error-package condition)))))))
+                  (format nil "~~@<Lock on package ~A violated when ~A while in package ~A.~~:@>"
+                          error-package
+                          control
+                          current-package)
+                  (simple-condition-format-arguments condition))
+           (format stream "~@<Lock on package ~A violated while in package ~A.~:@>"
+                   error-package
+                   current-package)))))
   ;; no :default-initargs -- reference-stuff provided by the
   ;; signalling form in target-package.lisp
   #!+sb-doc
@@ -1046,15 +1056,6 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
 ;;; OAOOM warning: see cross-condition.lisp
 (define-condition encapsulated-condition (condition)
   ((condition :initarg :condition :reader encapsulated-condition)))
-
-(define-condition values-type-error (type-error)
-  ()
-  (:report
-   (lambda (condition stream)
-     (format stream
-             "~@<The values set ~2I~:_[~{~S~^ ~}] ~I~_is not of type ~2I~_~S.~:>"
-             (type-error-datum condition)
-             (type-error-expected-type condition)))))
 
 ;;; KLUDGE: a condition for floating point errors when we can't or
 ;;; won't figure out what type they are. (In FreeBSD and OpenBSD we
@@ -1172,7 +1173,7 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
 
 (define-condition simple-package-error (simple-condition package-error) ())
 
-(define-condition simple-reader-package-error (simple-reader-error) ())
+(define-condition simple-reader-package-error (simple-reader-error package-error) ())
 
 (define-condition reader-eof-error (end-of-file)
   ((context :reader reader-eof-error-context :initarg :context))
@@ -1226,7 +1227,7 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
    (lambda (condition stream)
      (declare (type stream stream))
      (format stream
-             "I/O timeout ~(~A~)ing ~S."
+             "I/O timeout while doing ~(~A~) on ~S."
              (io-timeout-direction condition)
              (stream-error-stream condition)))))
 
@@ -1314,40 +1315,41 @@ handled by any other handler, it will be muffled.")
 ;; redefinitions, but other redefinitions could be done later
 ;; (e.g. methods).
 (define-condition redefinition-warning (style-warning)
-  ())
+  ((name
+    :initarg :name
+    :reader redefinition-warning-name)
+   (new-location
+    :initarg :new-location
+    :reader redefinition-warning-new-location)))
 
 (define-condition function-redefinition-warning (redefinition-warning)
-  ((name :initarg :name :reader function-redefinition-warning-name)
-   (old :initarg :old :reader function-redefinition-warning-old-fdefinition)
-   ;; For DEFGENERIC and perhaps others, the redefinition
-   ;; destructively modifies the original, rather than storing a new
-   ;; object, so there's no NEW here, but only in subclasses.
-   ))
+  ((new-function
+    :initarg :new-function
+    :reader function-redefinition-warning-new-function)))
 
 (define-condition redefinition-with-defun (function-redefinition-warning)
-  ((new :initarg :new :reader redefinition-with-defun-new-fdefinition)
-   ;; KLUDGE: it would be nice to fix the unreasonably late
-   ;; back-patching of DEBUG-SOURCEs in the DEBUG-INFO during
-   ;; fasloading and just use the new fdefinition, but for the moment
-   ;; we'll compare the SOURCE-LOCATION created during DEFUN with the
-   ;; previous DEBUG-SOURCE.
-   (new-location :initarg :new-location
-              :reader redefinition-with-defun-new-location))
+  ()
   (:report (lambda (warning stream)
-             (format stream "redefining ~S in DEFUN"
-                     (function-redefinition-warning-name warning)))))
+             (format stream "redefining ~/sb-impl::print-symbol-with-prefix/ ~
+                             in DEFUN"
+                     (redefinition-warning-name warning)))))
 
-(define-condition redefinition-with-defgeneric (function-redefinition-warning)
-  ((new-location :initarg :new-location
-                 :reader redefinition-with-defgeneric-new-location))
+(define-condition redefinition-with-defmacro (function-redefinition-warning)
+  ()
   (:report (lambda (warning stream)
-             (format stream "redefining ~S in DEFGENERIC"
-                     (function-redefinition-warning-name warning)))))
+             (format stream "redefining ~/sb-impl::print-symbol-with-prefix/ ~
+                             in DEFMACRO"
+                     (redefinition-warning-name warning)))))
+
+(define-condition redefinition-with-defgeneric (redefinition-warning)
+  ()
+  (:report (lambda (warning stream)
+             (format stream "redefining ~/sb-impl::print-symbol-with-prefix/ ~
+                             in DEFGENERIC"
+                     (redefinition-warning-name warning)))))
 
 (define-condition redefinition-with-defmethod (redefinition-warning)
-  ((gf :initarg :generic-function
-       :reader redefinition-with-defmethod-generic-function)
-   (qualifiers :initarg :qualifiers
+  ((qualifiers :initarg :qualifiers
                :reader redefinition-with-defmethod-qualifiers)
    (specializers :initarg :specializers
                  :reader redefinition-with-defmethod-specializers)
@@ -1357,135 +1359,103 @@ handled by any other handler, it will be muffled.")
                :reader redefinition-with-defmethod-old-method))
   (:report (lambda (warning stream)
              (format stream "redefining ~S~{ ~S~} ~S in DEFMETHOD"
-                     (redefinition-with-defmethod-generic-function warning)
+                     (redefinition-warning-name warning)
                      (redefinition-with-defmethod-qualifiers warning)
                      (redefinition-with-defmethod-specializers warning)))))
 
-;; FIXME: see the FIXMEs in defmacro.lisp, then maybe instantiate this.
-(define-condition redefinition-with-defmacro (function-redefinition-warning)
-  ())
+;;;; Deciding which redefinitions are "interesting".
 
-;; Here are a few predicates for what people might find interesting
-;; about redefinitions.
+(defun function-file-namestring (function)
+  #!+sb-eval
+  (when (typep function 'sb!eval:interpreted-function)
+    (return-from function-file-namestring
+      (sb!c:definition-source-location-namestring
+          (sb!eval:interpreted-function-source-location function))))
+  (let* ((fun (sb!kernel:%fun-fun function))
+         (code (sb!kernel:fun-code-header fun))
+         (debug-info (sb!kernel:%code-debug-info code))
+         (debug-source (when debug-info
+                         (sb!c::debug-info-source debug-info)))
+         (namestring (when debug-source
+                       (sb!c::debug-source-namestring debug-source))))
+    namestring))
 
-;; DEFUN can replace a generic function with an ordinary function.
-;; (Attempting to replace an ordinary function with a generic one
-;; causes an error, though.)
-(defun redefinition-replaces-generic-function-p (warning)
-  (and (typep warning 'redefinition-with-defun)
-       (typep (function-redefinition-warning-old-fdefinition warning)
-              'generic-function)))
+(defun interesting-function-redefinition-warning-p (warning old)
+  (let ((new (function-redefinition-warning-new-function warning))
+        (source-location (redefinition-warning-new-location warning)))
+    (or
+     ;; Compiled->Interpreted is interesting.
+     (and (typep old 'compiled-function)
+          (typep new '(not compiled-function)))
+     ;; FIN->Regular is interesting.
+     (and (typep old 'funcallable-instance)
+          (typep new '(not funcallable-instance)))
+     ;; Different file or unknown location is interesting.
+     (let* ((old-namestring (function-file-namestring old))
+            (new-namestring
+             (or (function-file-namestring new)
+                 (when source-location
+                   (sb!c::definition-source-location-namestring source-location)))))
+       (and (or (not old-namestring)
+                (not new-namestring)
+                (not (string= old-namestring new-namestring))))))))
 
-(defun redefinition-replaces-compiled-function-with-interpreted-p (warning)
-  (and (typep warning 'redefinition-with-defun)
-       (compiled-function-p
-        (function-redefinition-warning-old-fdefinition warning))
-       (not (compiled-function-p
-             (redefinition-with-defun-new-fdefinition warning)))))
-
-;; Most people seem to agree that re-running a DEFUN in a file is
-;; completely uninteresting.
 (defun uninteresting-ordinary-function-redefinition-p (warning)
-  ;; OAOO violation: this duplicates code in SB-INTROSPECT.
-  ;; Additionally, there are some functions that aren't
-  ;; funcallable-instances for which finding the source location is
-  ;; complicated (e.g. DEFSTRUCT-defined predicates and accessors),
-  ;; but I don't think they're defined with %DEFUN, so the warning
-  ;; isn't raised.
-  (flet ((fdefinition-file-namestring (fdefn)
-           #!+sb-eval
-           (when (typep fdefn 'sb!eval:interpreted-function)
-             (return-from fdefinition-file-namestring
-               (sb!c:definition-source-location-namestring
-                   (sb!eval:interpreted-function-source-location fdefn))))
-           ;; All the following accesses are guarded with conditionals
-           ;; because it's not clear whether any of the slots we're
-           ;; chasing down are guaranteed to be filled in.
-           (let* ((fdefn
-                   ;; KLUDGE: although this looks like it only works
-                   ;; for %SIMPLE-FUNs, in fact there's a pun such
-                   ;; that %SIMPLE-FUN-SELF returns the simple-fun
-                   ;; object for closures and
-                   ;; funcallable-instances. -- CSR, circa 2005
-                   (sb!kernel:%simple-fun-self fdefn))
-                  (code (if fdefn (sb!kernel:fun-code-header fdefn)))
-                  (debug-info (if code (sb!kernel:%code-debug-info code)))
-                  (debug-source (if debug-info
-                                    (sb!c::debug-info-source debug-info)))
-                  (namestring (if debug-source
-                                  (sb!c::debug-source-namestring debug-source))))
-             namestring)))
-    (and
-     ;; There's garbage in various places when the first DEFUN runs in
-     ;; cold-init.
-     sb!kernel::*cold-init-complete-p*
-     (typep warning 'redefinition-with-defun)
-     (let ((old-fdefn
-            (function-redefinition-warning-old-fdefinition warning))
-           (new-fdefn
-            (redefinition-with-defun-new-fdefinition warning)))
-       ;; Replacing a compiled function with a compiled function is
-       ;; clearly uninteresting, and we'll say arbitrarily that
-       ;; replacing an interpreted function with an interpreted
-       ;; function is uninteresting, too, but leave out the
-       ;; compiled-to-interpreted case.
-       (when (or (typep
-                  old-fdefn
-                  '(or #!+sb-eval sb!eval:interpreted-function))
-                 (and (typep old-fdefn
-                             '(and compiled-function
-                               (not funcallable-instance)))
-                      ;; Since this is a REDEFINITION-WITH-DEFUN,
-                      ;; NEW-FDEFN can't be a FUNCALLABLE-INSTANCE.
-                      (typep new-fdefn 'compiled-function)))
-         (let* ((old-namestring (fdefinition-file-namestring old-fdefn))
-                (new-namestring
-                 (or (fdefinition-file-namestring new-fdefn)
-                     (let ((srcloc
-                            (redefinition-with-defun-new-location warning)))
-                       (if srcloc
-                            (sb!c::definition-source-location-namestring
-                                srcloc))))))
-           (and old-namestring
-                new-namestring
-                (equal old-namestring new-namestring))))))))
+  (and
+   ;; There's garbage in various places when the first DEFUN runs in
+   ;; cold-init.
+   sb!kernel::*cold-init-complete-p*
+   (typep warning 'redefinition-with-defun)
+   ;; Shared logic.
+   (let ((name (redefinition-warning-name warning)))
+     (not (interesting-function-redefinition-warning-p
+           warning (or (fdefinition name) (macro-function name)))))))
+
+(defun uninteresting-macro-redefinition-p (warning)
+  (and
+   (typep warning 'redefinition-with-defmacro)
+   ;; Shared logic.
+   (let ((name (redefinition-warning-name warning)))
+     (not (interesting-function-redefinition-warning-p
+           warning (or (macro-function name) (fdefinition name)))))))
 
 (defun uninteresting-generic-function-redefinition-p (warning)
-  (and (typep warning 'redefinition-with-defgeneric)
-       (let* ((old-fdefn
-               (function-redefinition-warning-old-fdefinition warning))
-              (old-location
-               (if (typep old-fdefn 'generic-function)
-                   (sb!pcl::definition-source old-fdefn)))
-              (old-namestring
-               (if old-location
-                   (sb!c:definition-source-location-namestring old-location)))
-              (new-location
-               (redefinition-with-defgeneric-new-location warning))
-              (new-namestring
-               (if new-location
-                   (sb!c:definition-source-location-namestring new-location))))
-         (and old-namestring
-              new-namestring
-              (equal old-namestring new-namestring)))))
+  (and
+   (typep warning 'redefinition-with-defgeneric)
+   ;; Can't use the shared logic above, since GF's don't get a "new"
+   ;; definition -- rather the FIN-FUNCTION is set.
+   (let* ((name (redefinition-warning-name warning))
+          (old (fdefinition name))
+          (old-location (when (typep old 'generic-function)
+                          (sb!pcl::definition-source old)))
+          (old-namestring (when old-location
+                            (sb!c:definition-source-location-namestring old-location)))
+          (new-location (redefinition-warning-new-location warning))
+          (new-namestring (when new-location
+                           (sb!c:definition-source-location-namestring new-location))))
+     (and old-namestring
+          new-namestring
+          (string= old-namestring new-namestring)))))
 
 (defun uninteresting-method-redefinition-p (warning)
-  (and (typep warning 'redefinition-with-defmethod)
-       (let* ((old-method (redefinition-with-defmethod-old-method warning))
-              (old-location (sb!pcl::definition-source old-method))
-              (old-namestring (if old-location
-                                  (sb!c:definition-source-location-namestring
-                                      old-location)))
-              (new-location (redefinition-with-defmethod-new-location warning))
-              (new-namestring (if new-location
-                                  (sb!c:definition-source-location-namestring
-                                      new-location))))
+  (and
+   (typep warning 'redefinition-with-defmethod)
+   ;; Can't use the shared logic above, since GF's don't get a "new"
+   ;; definition -- rather the FIN-FUNCTION is set.
+   (let* ((old-method (redefinition-with-defmethod-old-method warning))
+          (old-location (sb!pcl::definition-source old-method))
+          (old-namestring (when old-location
+                            (sb!c:definition-source-location-namestring old-location)))
+          (new-location (redefinition-warning-new-location warning))
+          (new-namestring (when new-location
+                            (sb!c:definition-source-location-namestring new-location))))
          (and new-namestring
               old-namestring
-              (equal new-namestring old-namestring)))))
+              (string= new-namestring old-namestring)))))
 
 (deftype uninteresting-redefinition ()
   '(or (satisfies uninteresting-ordinary-function-redefinition-p)
+       (satisfies uninteresting-macro-redefinition-p)
        (satisfies uninteresting-generic-function-redefinition-p)
        (satisfies uninteresting-method-redefinition-p)))
 
@@ -1605,6 +1575,67 @@ the usual naming convention (names like *FOO*) for special variables"
                      (proclamation-mismatch-name warning)
                      (proclamation-mismatch-old warning)))))
 
+;;;; deprecation conditions
+
+(define-condition deprecation-condition ()
+  ((name :initarg :name :reader deprecated-name)
+   (replacements :initarg :replacements :reader deprecated-name-replacements)
+   (since :initarg :since :reader deprecated-since)
+   (runtime-error :initarg :runtime-error :reader deprecated-name-runtime-error)))
+
+(def!method print-object ((condition deprecation-condition) stream)
+  (let ((*package* (find-package :keyword)))
+    (if *print-escape*
+        (print-unreadable-object (condition stream :type t)
+          (apply #'format
+                 stream "~S is deprecated.~
+                         ~#[~; Use ~S instead.~; ~
+                               Use ~S or ~S instead.~:; ~
+                               Use~@{~#[~; or~] ~S~^,~} instead.~]"
+                  (deprecated-name condition)
+                  (deprecated-name-replacements condition)))
+        (apply #'format
+               stream "~@<~S has been deprecated as of SBCL ~A.~
+                       ~#[~; Use ~S instead.~; ~
+                             Use ~S or ~S instead.~:; ~
+                             Use~@{~#[~; or~] ~S~^,~:_~} instead.~]~:@>"
+                (deprecated-name condition)
+                (deprecated-since condition)
+                (deprecated-name-replacements condition)))))
+
+(define-condition early-deprecation-warning (style-warning deprecation-condition)
+  ())
+
+(def!method print-object :after ((warning early-deprecation-warning) stream)
+  (unless *print-escape*
+    (let ((*package* (find-package :keyword)))
+      (format stream "~%~@<~:@_In future SBCL versions ~S will signal a full warning ~
+                      at compile-time.~:@>"
+              (deprecated-name warning)))))
+
+(define-condition late-deprecation-warning (warning deprecation-condition)
+  ())
+
+(def!method print-object :after ((warning late-deprecation-warning) stream)
+  (unless *print-escape*
+    (when (deprecated-name-runtime-error warning)
+      (let ((*package* (find-package :keyword)))
+        (format stream "~%~@<~:@_In future SBCL versions ~S will signal a runtime error.~:@>"
+                (deprecated-name warning))))))
+
+(define-condition final-deprecation-warning (warning deprecation-condition)
+  ())
+
+(def!method print-object :after ((warning final-deprecation-warning) stream)
+  (unless *print-escape*
+    (when (deprecated-name-runtime-error warning)
+      (let ((*package* (find-package :keyword)))
+        (format stream "~%~@<~:@_An error will be signaled at runtime for ~S.~:@>"
+                (deprecated-name warning))))))
+
+(define-condition deprecation-error (error deprecation-condition)
+  ())
+
 ;;;; restart definitions
 
 (define-condition abort-failure (control-error) ()
@@ -1640,11 +1671,14 @@ the usual naming convention (names like *FOO*) for special variables"
   (define-nil-returning-restart continue ()
     "Transfer control to a restart named CONTINUE, or return NIL if none exists.")
   (define-nil-returning-restart store-value (value)
-    "Transfer control and VALUE to a restart named STORE-VALUE, or return NIL if
-   none exists.")
+    "Transfer control and VALUE to a restart named STORE-VALUE, or
+return NIL if none exists.")
   (define-nil-returning-restart use-value (value)
-    "Transfer control and VALUE to a restart named USE-VALUE, or return NIL if
-   none exists."))
+    "Transfer control and VALUE to a restart named USE-VALUE, or
+return NIL if none exists.")
+  (define-nil-returning-restart print-unreadably ()
+    "Transfer control to a restart named SB-EXT:PRINT-UNREADABLY, or
+return NIL if none exists."))
 
 ;;; single-stepping restarts
 
@@ -1667,5 +1701,14 @@ not exists.")
 condition, stepping into the current form. Signals a CONTROL-ERROR is
 the restart does not exist."))
 
-(/show0 "condition.lisp end of file")
+;;; Compiler macro magic
 
+(define-condition compiler-macro-keyword-problem ()
+  ((argument :initarg :argument :reader compiler-macro-keyword-argument))
+  (:report (lambda (condition stream)
+             (format stream "~@<Argument ~S in keyword position is not ~
+                             a self-evaluating symbol, preventing compiler-macro ~
+                             expansion.~@:>"
+                     (compiler-macro-keyword-argument condition)))))
+
+(/show0 "condition.lisp end of file")

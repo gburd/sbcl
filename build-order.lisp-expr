@@ -204,6 +204,7 @@
  ;; This needs DEFINE-ALIEN-ROUTINE from target-alieneval.
  ("src/code/misc-aliens" :not-host)
 
+ ("src/compiler/generic/vm-array")
  ("src/code/array"         :not-host)
  ("src/code/early-float"   :not-host)
  ("src/code/target-sxhash" :not-host) ; needs most-fooative-foo-float constants
@@ -359,7 +360,6 @@
  ;; in class.lisp.
  ("src/code/condition" :not-host)
 
- ("src/compiler/generic/vm-array")
  ("src/compiler/generic/primtype")
 
  ;; the implementation of the compiler-affecting part of forms like
@@ -367,16 +367,12 @@
  ;; defining types
  ("src/compiler/parse-lambda-list")
 
- ;; The following two files trigger function/macro redefinition
- ;; warnings in clisp during make-host-2; as a workaround, we ignore
- ;; the failure values from COMPILE-FILE under clisp.
-
  ;; for DEFSTRUCT ALIEN-TYPE, needed by host-type.lisp
- ("src/code/host-alieneval" #+clisp :ignore-failure-p)
+ ("src/code/host-alieneval")
 
  ;; can't be done until definition of e.g. DEFINE-ALIEN-TYPE-CLASS in
  ;; host-alieneval.lisp
- ("src/code/host-c-call" #+clisp :ignore-failure-p)
+ ("src/code/host-c-call")
 
  ;; SB!XC:DEFTYPE is needed in order to compile late-type
  ;; in the host Common Lisp, and in order to run, it needs
@@ -470,6 +466,9 @@
 
  ;; This has ASSEMBLY-UNIT-related stuff needed by core.lisp.
  ("src/compiler/early-assem")
+
+ ;; This has the BARRIER stuff that the threading support needs.
+ ("src/code/barrier")
 
  ;; core.lisp contains DEFSTRUCT CORE-OBJECT, and "compiler/main.lisp"
  ;; does lots of (TYPEP FOO 'CORE-OBJECT), so it's nice to compile this
@@ -574,7 +573,7 @@
   ;; x compilation, for now we blithely ignore them and press on to more
   ;; x pressing problems. Someday, though, it would be nice to figure out
   ;; x what the problem is and fix it.
-  #!+(or ppc sparc) :ignore-failure-p)
+  #!+(or ppc) :ignore-failure-p)
  ("src/code/cross-modular"  :not-target)
  ("src/compiler/target/subprim")
 
@@ -657,6 +656,8 @@
  ("src/code/target-sap"        :not-host) ; uses SAP-INT type
  ("src/code/target-package"    :not-host) ; needs "code/package"
  ("src/code/target-random"     :not-host) ; needs "code/random"
+ ("src/code/bignum-random"     :not-host) ; needs "code/random" and
+                                          ;   "code/bignum"
  ("src/code/target-hash-table" :not-host) ; needs "code/hash-table"
  ("src/code/reader"            :not-host) ; needs "code/readtable"
  ("src/code/target-stream"     :not-host) ; needs WHITESPACEP from "code/reader"
@@ -707,7 +708,9 @@
  #!+sb-unicode
  ("src/code/external-formats/enc-jpn" :not-host)
  #!+sb-unicode
- ("src/code/external-formats/ucs-2" :not-host)
+ ("src/code/external-formats/enc-ucs" :not-host)
+ #!+sb-unicode
+ ("src/code/external-formats/enc-utf" :not-host)
 
  ;; The code here can't be compiled until CONDITION and
  ;; DEFINE-CONDITION are defined and SB!DEBUG:*STACK-TOP-HINT* is
@@ -748,6 +751,8 @@
  ("src/code/macros")
  ("src/code/loop")
  ("src/code/late-setf")
+ ("src/code/cas")
+ ("src/code/late-cas")
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; other target-code-building stuff which can't be processed until

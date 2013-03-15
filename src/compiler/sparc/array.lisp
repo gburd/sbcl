@@ -20,14 +20,14 @@
   (:arg-types tagged-num tagged-num)
   (:temporary (:scs (descriptor-reg) :to (:result 0) :target result) header)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
+  (:temporary (:scs (non-descriptor-reg)) gencgc-temp)
   (:results (result :scs (descriptor-reg)))
   (:generator 0
     (pseudo-atomic ()
-      (inst or header alloc-tn other-pointer-lowtag)
       (inst add ndescr rank (+ (* (1+ array-dimensions-offset) n-word-bytes)
                                lowtag-mask))
       (inst andn ndescr lowtag-mask)
-      (inst add alloc-tn ndescr)
+      (allocation header ndescr other-pointer-lowtag :temp-tn gencgc-temp)
       (inst add ndescr rank (fixnumize (1- array-dimensions-offset)))
       (inst sll ndescr ndescr n-widetag-bits)
       (inst or ndescr ndescr type)
@@ -126,9 +126,9 @@
   (def-data-vector-frobs simple-array-unsigned-byte-32 word-index
     unsigned-num unsigned-reg)
 
-  (def-data-vector-frobs simple-array-unsigned-byte-29 word-index
+  (def-data-vector-frobs simple-array-unsigned-fixnum word-index
     positive-fixnum any-reg)
-  (def-data-vector-frobs simple-array-signed-byte-30 word-index
+  (def-data-vector-frobs simple-array-fixnum word-index
     tagged-num any-reg)
   (def-data-vector-frobs simple-array-signed-byte-32 word-index
     signed-num signed-reg))

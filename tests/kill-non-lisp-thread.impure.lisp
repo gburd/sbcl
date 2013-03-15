@@ -11,8 +11,8 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#-sb-thread
-(sb-ext:quit :unix-status 104)
+#+(or :win32 (not :sb-thread))
+(sb-ext:exit :code 104)
 
 (use-package :sb-alien)
 
@@ -21,7 +21,7 @@
          (output
           (with-output-to-string (s)
             (setf proc (run-program program arguments
-                                    :search (not (eql #\. (char program 0)))
+                                    :environment (test-util::test-env)
                                     :output s)))))
     (unless (zerop (process-exit-code proc))
       (error "Bad exit code: ~S~%Output:~% ~S"
@@ -29,13 +29,9 @@
              output))
     output))
 
-(run "cc" "-O3"
-     "-I" "../src/runtime/"
-     "kill-non-lisp-thread.c"
-     #+(and (or linux freebsd) (or x86-64 ppc mips)) "-fPIC"
-     #+(and x86-64 darwin) "-arch" #+(and x86-64 darwin) "x86_64"
-     #+darwin "-bundle" #-darwin "-shared"
-     "-o" "kill-non-lisp-thread.so")
+(run "/bin/sh" "run-compiler.sh" "-sbcl-pic" "-sbcl-shared"
+     "-O3" "-I" "../src/runtime/"
+     "kill-non-lisp-thread.c" "-o" "kill-non-lisp-thread.so")
 
 (load-shared-object (truename "kill-non-lisp-thread.so"))
 
@@ -46,6 +42,12 @@
     (push (lambda ()
             (setq receivedp t))
           (sb-thread::thread-interruptions sb-thread:*current-thread*))
+    #+sb-thruption
+    ;; On sb-thruption builds, the usual resignalling of SIGPIPE will
+    ;; work without problems, but the signal handler won't ordinarily
+    ;; think that there's anything to be done.  Since we're poking at
+    ;; INTERRUPT-THREAD internals anyway, let's help it along.
+    (setf sb-unix::*thruption-pending* t)
     (kill-non-lisp-thread)
     (sleep 1)
     (assert receivedp)))

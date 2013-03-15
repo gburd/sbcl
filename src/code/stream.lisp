@@ -133,12 +133,9 @@
   (setf (ansi-stream-sout stream) #'closed-flame)
   (setf (ansi-stream-misc stream) #'closed-flame))
 
-;;;; file position and file length
+;;;; for file position and file length
 (defun external-format-char-size (external-format)
-  (let ((ef-entry (get-external-format external-format)))
-    (if (variable-width-external-format-p ef-entry)
-        (bytes-for-char-fun ef-entry)
-        (funcall (bytes-for-char-fun ef-entry) #\x))))
+  (ef-char-size (get-external-format external-format)))
 
 ;;; Call the MISC method with the :FILE-POSITION operation.
 #!-sb-fluid (declaim (inline ansi-stream-file-position))
@@ -444,10 +441,8 @@
   ;; a-s-read-sequence and needs a lambda list that's congruent with
   ;; that of a-s-read-char
   (declare (ignore recursive-p))
-  (prepare-for-fast-read-byte stream
-    (prog1
-        (fast-read-byte eof-error-p eof-value t)
-      (done-with-fast-read-byte))))
+  (with-fast-read-byte (t stream eof-error-p eof-value)
+    (fast-read-byte)))
 
 (defun read-byte (stream &optional (eof-error-p t) eof-value)
   (if (ansi-stream-p stream)
@@ -692,7 +687,7 @@
 
 (defun clear-output (&optional (stream *standard-output*))
   (with-out-stream stream (ansi-stream-misc :clear-output)
-                   (stream-force-output))
+                   (stream-clear-output))
   nil)
 
 (defun write-byte (integer stream)
@@ -1304,7 +1299,7 @@
   ;; end of the stream.
   (index-cache 0 :type index)
   ;; Requested element type
-  (element-type 'character))
+  (element-type 'character :type type-specifier))
 
 #!+sb-doc
 (setf (fdocumentation 'make-string-output-stream 'function)
@@ -1463,6 +1458,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
 
 (defun string-out-misc (stream operation &optional arg1 arg2)
   (declare (ignore arg2))
+  (declare (optimize speed))
   (case operation
     (:charpos
      ;; Keeping this first is a silly micro-optimization: FRESH-LINE
@@ -1472,8 +1468,10 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
             (buffer (string-output-stream-buffer stream))
             (prev (string-output-stream-prev stream))
             (base 0))
+        (declare (type (or null (simple-array character (*))) buffer))
       :next
-      (let ((pos (position #\newline buffer :from-end t :end pointer)))
+      (let ((pos (when buffer
+                   (position #\newline buffer :from-end t :end pointer))))
         (when (or pos (not buffer))
           ;; If newline is at index I, and pointer at index I+N, charpos
           ;; is N-1. If there is no newline, and pointer is at index N,
@@ -1571,9 +1569,14 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
 
 ;;; FIXME: need to support (VECTOR NIL), ideally without destroying all hope
 ;;; of efficiency.
+(declaim (inline vector-with-fill-pointer))
+(defun vector-with-fill-pointer-p (x)
+  (and (vectorp x)
+       (array-has-fill-pointer-p x)))
+
 (deftype string-with-fill-pointer ()
-  '(and (or (vector character) (vector base-char))
-        (satisfies array-has-fill-pointer-p)))
+  `(and (or (vector character) (vector base-char))
+        (satisfies vector-with-fill-pointer-p)))
 
 (defstruct (fill-pointer-output-stream
             (:include ansi-stream

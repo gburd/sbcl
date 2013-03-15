@@ -46,66 +46,113 @@
   (frob %random-single-float single-float)
   (frob %random-double-float double-float))
 
-;;; Mersenne Twister RNG
-;;;
-;;; FIXME: It's unpleasant to have RANDOM functionality scattered
-;;; through the code this way. It would be nice to move this into the
-;;; same file as the other RANDOM definitions.
+;;; Return an expression to generate an integer of N-BITS many random
+;;; bits, using the minimal number of random chunks possible.
+(defun generate-random-expr-for-power-of-2 (n-bits state)
+  (declare (type (integer 1 #.sb!vm:n-word-bits) n-bits))
+  (multiple-value-bind (n-chunk-bits chunk-expr)
+      (cond ((<= n-bits n-random-chunk-bits)
+             (values n-random-chunk-bits `(random-chunk ,state)))
+            ((<= n-bits (* 2 n-random-chunk-bits))
+             (values (* 2 n-random-chunk-bits) `(big-random-chunk ,state)))
+            (t
+             (error "Unexpectedly small N-RANDOM-CHUNK-BITS")))
+    (if (< n-bits n-chunk-bits)
+        `(logand ,(1- (ash 1 n-bits)) ,chunk-expr)
+        chunk-expr)))
+
+;;; This transform for compile-time constant word-sized integers
+;;; generates an accept-reject loop to achieve equidistribution of the
+;;; returned values. Several optimizations are done: If NUM is a power
+;;; of two no loop is needed. If the random chunk size is half the word
+;;; size only one chunk is used where sufficient. For values of NUM
+;;; where it is possible and results in faster code, the rejection
+;;; probability is reduced by accepting all values below the largest
+;;; multiple of the limit that fits into one or two chunks and and doing
+;;; a division to get the random value into the desired range.
 (deftransform random ((num &optional state)
-                      ((integer 1 #.(expt 2 sb!vm::n-word-bits)) &optional *))
-  ;; FIXME: I almost conditionalized this as #!+sb-doc. Find some way
-  ;; of automatically finding #!+sb-doc in proximity to DEFTRANSFORM
-  ;; to let me scan for places that I made this mistake and didn't
-  ;; catch myself.
-  "use inline (UNSIGNED-BYTE 32) operations"
-  (let ((type (lvar-type num))
-        (limit (expt 2 sb!vm::n-word-bits))
-        (random-chunk (ecase sb!vm::n-word-bits
-                        (32 'random-chunk)
-                        (64 'sb!kernel::big-random-chunk))))
-    (if (numeric-type-p type)
-        (let ((num-high (numeric-type-high (lvar-type num))))
-          (aver num-high)
-          (cond ((constant-lvar-p num)
-                 ;; Check the worst case sum absolute error for the
-                 ;; random number expectations.
-                 (let ((rem (rem limit num-high)))
-                   (unless (< (/ (* 2 rem (- num-high rem))
-                                 num-high limit)
-                              (expt 2 (- sb!kernel::random-integer-extra-bits)))
-                     (give-up-ir1-transform
-                      "The random number expectations are inaccurate."))
-                   (if (= num-high limit)
-                       `(,random-chunk (or state *random-state*))
-                       #!-(or x86 x86-64)
-                       `(rem (,random-chunk (or state *random-state*)) num)
-                       #!+(or x86 x86-64)
-                       ;; Use multiplication, which is faster.
-                       `(values (sb!bignum::%multiply
-                                 (,random-chunk (or state *random-state*))
-                                 num)))))
-                ((> num-high random-fixnum-max)
-                 (give-up-ir1-transform
-                  "The range is too large to ensure an accurate result."))
-                #!+(or x86 x86-64)
-                ((< num-high limit)
-                 `(values (sb!bignum::%multiply
-                           (,random-chunk (or state *random-state*))
-                           num)))
-                (t
-                 `(rem (,random-chunk (or state *random-state*)) num))))
-        ;; KLUDGE: a relatively conservative treatment, but better
-        ;; than a bug (reported by PFD sbcl-devel towards the end of
-        ;; 2004-11.
-        '(rem (random-chunk (or state *random-state*)) num))))
+                      ((constant-arg (integer 1 #.(expt 2 sb!vm:n-word-bits)))
+                       &optional *)
+                      *
+                      :policy (and (> speed compilation-speed)
+                                   (> speed space)))
+  "optimize to inlined RANDOM-CHUNK operations"
+  (let ((num (lvar-value num)))
+    (if (= num 1)
+        0
+        (flet ((chunk-n-bits-and-expr (n-bits)
+                 (cond ((<= n-bits n-random-chunk-bits)
+                        (values n-random-chunk-bits
+                                '(random-chunk (or state *random-state*))))
+                       ((<= n-bits (* 2 n-random-chunk-bits))
+                        (values (* 2 n-random-chunk-bits)
+                                '(big-random-chunk (or state *random-state*))))
+                       (t
+                        (error "Unexpectedly small N-RANDOM-CHUNK-BITS")))))
+          (if (zerop (logand num (1- num)))
+              ;; NUM is a power of 2.
+              (let ((n-bits (integer-length (1- num))))
+                (multiple-value-bind (n-chunk-bits chunk-expr)
+                    (chunk-n-bits-and-expr n-bits)
+                  (if (< n-bits n-chunk-bits)
+                      `(logand ,(1- (ash 1 n-bits)) ,chunk-expr)
+                      chunk-expr)))
+              ;; Generate an accept-reject loop.
+              (let ((n-bits (integer-length num)))
+                (multiple-value-bind (n-chunk-bits chunk-expr)
+                    (chunk-n-bits-and-expr n-bits)
+                  (if (or (> (* num 3) (expt 2 n-chunk-bits))
+                          (logbitp (- n-bits 2) num))
+                      ;; Division can't help as the quotient is below 3,
+                      ;; or is too costly as the rejection probability
+                      ;; without it is already small (namely at most 1/4
+                      ;; with the given test, which is experimentally a
+                      ;; reasonable threshold and cheap to test for).
+                      `(loop
+                         (let ((bits ,(generate-random-expr-for-power-of-2
+                                       n-bits '(or state *random-state*))))
+                           (when (< bits num)
+                             (return bits))))
+                      (let ((d (truncate (expt 2 n-chunk-bits) num)))
+                        `(loop
+                           (let ((bits ,chunk-expr))
+                             (when (< bits ,(* num d))
+                               (return (values (truncate bits ,d)))))))))))))))
+
 
 ;;;; float accessors
 
 (defknown make-single-float ((signed-byte 32)) single-float
-  (movable foldable flushable))
+  (movable flushable))
 
 (defknown make-double-float ((signed-byte 32) (unsigned-byte 32)) double-float
-  (movable foldable flushable))
+  (movable flushable))
+
+#-sb-xc-host
+(deftransform make-single-float ((bits)
+                                 ((signed-byte 32)))
+  "Conditional constant folding"
+  (unless (constant-lvar-p bits)
+    (give-up-ir1-transform))
+  (let* ((bits  (lvar-value bits))
+         (float (make-single-float bits)))
+    (when (float-nan-p float)
+      (give-up-ir1-transform))
+    float))
+
+#-sb-xc-host
+(deftransform make-double-float ((hi lo)
+                                 ((signed-byte 32) (unsigned-byte 32)))
+  "Conditional constant folding"
+  (unless (and (constant-lvar-p hi)
+               (constant-lvar-p lo))
+    (give-up-ir1-transform))
+  (let* ((hi    (lvar-value hi))
+         (lo    (lvar-value lo))
+         (float (make-double-float hi lo)))
+    (when (float-nan-p float)
+      (give-up-ir1-transform))
+    float))
 
 (defknown single-float-bits (single-float) (signed-byte 32)
   (movable foldable flushable))
@@ -279,12 +326,14 @@
                                        (if (< x ,most-negative)
                                            ,most-negative
                                            (coerce x ',type)))
-                                     (numeric-type-low num)))
+                                     (numeric-type-low num)
+                                     nil))
                      (hi (bound-func (lambda (x)
                                        (if (< ,most-positive x )
                                            ,most-positive
                                            (coerce x ',type)))
-                                     (numeric-type-high num))))
+                                     (numeric-type-high num)
+                                     nil)))
                 (specifier-type `(,',type ,(or lo '*) ,(or hi '*)))))
 
             (defoptimizer (,fun derive-type) ((num))
@@ -305,8 +354,11 @@
   ;; problem, but in the context of evaluated and compiled (+ <int> <single>)
   ;; giving different result if we fail to check for this.
   (or (not (csubtypep x (specifier-type 'integer)))
+      #!+x86
       (csubtypep x (specifier-type `(integer ,most-negative-exactly-single-float-fixnum
-                                             ,most-positive-exactly-single-float-fixnum)))))
+                                             ,most-positive-exactly-single-float-fixnum)))
+      #!-x86
+      (csubtypep x (specifier-type 'fixnum))))
 
 ;;; Do some stuff to recognize when the loser is doing mixed float and
 ;;; rational arithmetic, or different float types, and fix it up. If
@@ -343,21 +395,26 @@
                   (if (minusp y)
                       '(%negate x)
                       'x)))))
-  (def * single-float 1.0 -1.0)
-  (def * double-float 1.0d0 -1.0d0))
+  (def single-float 1.0 -1.0)
+  (def double-float 1.0d0 -1.0d0))
 
 ;;; Return the reciprocal of X if it can be represented exactly, NIL otherwise.
 (defun maybe-exact-reciprocal (x)
   (unless (zerop x)
-    (multiple-value-bind (significand exponent sign)
-        ;; Signals an error for NaNs and infinities.
-        (handler-case (integer-decode-float x)
-          (error () (return-from maybe-exact-reciprocal nil)))
-      (let ((expected (/ sign significand (expt 2 exponent))))
-        (let ((reciprocal (/ 1 x)))
-          (multiple-value-bind (significand exponent sign) (integer-decode-float reciprocal)
-            (when (eql expected (* sign significand (expt 2 exponent)))
-              reciprocal)))))))
+    (handler-case
+        (multiple-value-bind (significand exponent sign)
+            (integer-decode-float x)
+          ;; only powers of 2 can be inverted exactly
+          (unless (zerop (logand significand (1- significand)))
+            (return-from maybe-exact-reciprocal nil))
+          (let ((expected   (/ sign significand (expt 2 exponent)))
+                (reciprocal (/ x)))
+            (multiple-value-bind (significand exponent sign)
+                (integer-decode-float reciprocal)
+              ;; Denorms can't be inverted safely.
+              (and (eql expected (* sign significand (expt 2 exponent)))
+                   reciprocal))))
+      (error () (return-from maybe-exact-reciprocal nil)))))
 
 ;;; Replace constant division by multiplication with exact reciprocal,
 ;;; if one exists.
@@ -377,7 +434,7 @@
   (def single-float)
   (def double-float))
 
-;;; Optimize addition and subsctraction of zero
+;;; Optimize addition and subtraction of zero
 (macrolet ((def (op type &rest args)
              `(deftransform ,op ((x y) (,type (constant-arg (member ,@args))) *
                                  ;; Beware the SNaN!
@@ -532,27 +589,27 @@
                 (deftransform ,name ((x) (single-float) *)
                   #!+x86 (cond ((csubtypep (lvar-type x)
                                            (specifier-type '(single-float
-                                                             (#.(- (expt 2f0 64)))
-                                                             (#.(expt 2f0 64)))))
+                                                             (#.(- (expt 2f0 63)))
+                                                             (#.(expt 2f0 63)))))
                                 `(coerce (,',prim-quick (coerce x 'double-float))
                                   'single-float))
                                (t
                                 (compiler-notify
                                  "unable to avoid inline argument range check~@
-                                  because the argument range (~S) was not within 2^64"
+                                  because the argument range (~S) was not within 2^63"
                                  (type-specifier (lvar-type x)))
                                 `(coerce (,',prim (coerce x 'double-float)) 'single-float)))
                   #!-x86 `(coerce (,',prim (coerce x 'double-float)) 'single-float))
                (deftransform ,name ((x) (double-float) *)
                  #!+x86 (cond ((csubtypep (lvar-type x)
                                           (specifier-type '(double-float
-                                                            (#.(- (expt 2d0 64)))
-                                                            (#.(expt 2d0 64)))))
+                                                            (#.(- (expt 2d0 63)))
+                                                            (#.(expt 2d0 63)))))
                                `(,',prim-quick x))
                               (t
                                (compiler-notify
                                 "unable to avoid inline argument range check~@
-                                 because the argument range (~S) was not within 2^64"
+                                 because the argument range (~S) was not within 2^63"
                                 (type-specifier (lvar-type x)))
                                `(,',prim x)))
                  #!-x86 `(,',prim x)))))
@@ -657,7 +714,7 @@
   ;; LONG-FLOAT doesn't actually buy us anything.  FIXME.
   (setf *read-default-float-format*
         #!+long-float 'long-float #!-long-float 'double-float))
-;;; Test whether the numeric-type ARG is within in domain specified by
+;;; Test whether the numeric-type ARG is within the domain specified by
 ;;; DOMAIN-LOW and DOMAIN-HIGH, consider negative and positive zero to
 ;;; be distinct.
 #-sb-xc-host  ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
@@ -736,9 +793,9 @@
                  ;; Process the intersection.
                  (let* ((low (interval-low intersection))
                         (high (interval-high intersection))
-                        (res-lo (or (bound-func fun (if increasingp low high))
+                        (res-lo (or (bound-func fun (if increasingp low high) nil)
                                     default-low))
-                        (res-hi (or (bound-func fun (if increasingp high low))
+                        (res-hi (or (bound-func fun (if increasingp high low) nil)
                                     default-high))
                         (format (case (numeric-type-class arg)
                                   ((integer rational) 'single-float)
@@ -917,11 +974,9 @@
                    (int-hi (if hi
                                (ceiling (type-bound-number hi))
                                '*))
-                   (f-lo (if lo
-                             (bound-func #'float lo)
+                   (f-lo (or (bound-func #'float lo nil)
                              '*))
-                   (f-hi (if hi
-                             (bound-func #'float hi)
+                   (f-hi (or (bound-func #'float hi nil)
                              '*)))
               (specifier-type `(or (rational ,int-lo ,int-hi)
                                 (single-float ,f-lo, f-hi)))))
@@ -951,11 +1006,9 @@
                    (int-hi (if hi
                                (ceiling (type-bound-number hi))
                                '*))
-                   (f-lo (if lo
-                             (bound-func #'float lo)
+                   (f-lo (or (bound-func #'float lo nil)
                              '*))
-                   (f-hi (if hi
-                             (bound-func #'float hi)
+                   (f-hi (or (bound-func #'float hi nil)
                              '*)))
               (specifier-type `(or (rational ,int-lo ,int-hi)
                                 (single-float ,f-lo, f-hi)))))
@@ -1017,7 +1070,7 @@
          ;; But a positive real to any power is well-defined.
          (merged-interval-expt x y))
         ((and (csubtypep x (specifier-type 'rational))
-              (csubtypep x (specifier-type 'rational)))
+              (csubtypep y (specifier-type 'rational)))
          ;; A rational to the power of a rational could be a rational
          ;; or a possibly-complex single float
          (specifier-type '(or rational single-float (complex single-float))))
@@ -1398,8 +1451,8 @@
               ;; exactly the same way as the functions themselves do
               ;; it.
               (if (csubtypep arg domain)
-                  (let ((res-lo (bound-func fun (numeric-type-low arg)))
-                        (res-hi (bound-func fun (numeric-type-high arg))))
+                  (let ((res-lo (bound-func fun (numeric-type-low arg) nil))
+                        (res-hi (bound-func fun (numeric-type-high arg) nil)))
                     (unless increasingp
                       (rotatef res-lo res-hi))
                     (make-numeric-type
@@ -1517,16 +1570,19 @@
                                         (,type
                                          &optional (or ,type ,@other-float-arg-types integer))
                                         * :result result)
-                  (let ((result-type (lvar-derived-type result)))
+                  (let* ((result-type (and result
+                                           (lvar-derived-type result)))
+                         (compute-all (and (values-type-p result-type)
+                                           (not (type-single-value-p result-type)))))
                     (if (or (not y)
                             (and (constant-lvar-p y) (= 1 (lvar-value y))))
-                        (if (values-type-p result-type)
+                        (if compute-all
                             `(let ((res (,',unary x)))
                                (values res (- x (,',coerce res))))
                             `(let ((res (,',unary x)))
                                ;; Dummy secondary value!
                                (values res x)))
-                        (if (values-type-p result-type)
+                        (if compute-all
                             `(let* ((f (,',coerce y))
                                     (res (,',unary (/ x f))))
                                (values res (- x (* f (,',coerce res)))))

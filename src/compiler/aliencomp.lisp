@@ -63,9 +63,9 @@
   (flushable movable))
 (defknown deport-alloc (alien alien-type) t
   (flushable movable))
-(defknown extract-alien-value (system-area-pointer unsigned-byte alien-type) t
+(defknown %alien-value (system-area-pointer unsigned-byte alien-type) t
   (flushable))
-(defknown deposit-alien-value (system-area-pointer unsigned-byte alien-type t) t
+(defknown (setf %alien-value) (t system-area-pointer unsigned-byte alien-type) t
   ())
 
 (defknown alien-funcall (alien-value &rest *) *
@@ -120,9 +120,9 @@
 (deftransform slot ((alien slot) * * :important t)
   (multiple-value-bind (slot-offset slot-type)
       (find-slot-offset-and-type alien slot)
-    `(extract-alien-value (alien-sap alien)
-                          ,slot-offset
-                          ',slot-type)))
+    `(%alien-value (alien-sap alien)
+                   ,slot-offset
+                   ',slot-type)))
 
 #+nil ;; ### But what about coercions?
 (defoptimizer (%set-slot derive-type) ((alien slot value))
@@ -139,10 +139,10 @@
 (deftransform %set-slot ((alien slot value) * * :important t)
   (multiple-value-bind (slot-offset slot-type)
       (find-slot-offset-and-type alien slot)
-    `(deposit-alien-value (alien-sap alien)
-                          ,slot-offset
-                          ',slot-type
-                          value)))
+    `(setf (%alien-value (alien-sap alien)
+                         ,slot-offset
+                         ',slot-type)
+           value)))
 
 (defoptimizer (%slot-addr derive-type) ((alien slot))
   (block nil
@@ -244,9 +244,9 @@
   (multiple-value-bind (indices-args offset-expr element-type)
       (compute-deref-guts alien indices)
     `(lambda (alien ,@indices-args)
-       (extract-alien-value (alien-sap alien)
-                            ,offset-expr
-                            ',element-type))))
+       (%alien-value (alien-sap alien)
+                     ,offset-expr
+                     ',element-type))))
 
 #+nil ;; ### Again, the value might be coerced.
 (defoptimizer (%set-deref derive-type) ((alien value &rest noise))
@@ -264,10 +264,10 @@
   (multiple-value-bind (indices-args offset-expr element-type)
       (compute-deref-guts alien indices)
     `(lambda (alien value ,@indices-args)
-       (deposit-alien-value (alien-sap alien)
-                            ,offset-expr
-                            ',element-type
-                            value))))
+       (setf (%alien-value (alien-sap alien)
+                           ,offset-expr
+                           ',element-type)
+             value))))
 
 (defoptimizer (%deref-addr derive-type) ((alien &rest noise))
   (declare (ignore noise))
@@ -304,9 +304,9 @@
         (return (make-alien-type-type type))))
     *wild-type*))
 
-(deftransform %heap-alien ((info) * * :important t)
+(deftransform %heap-alien ((info) ((constant-arg heap-alien-info)) * :important t)
   (multiple-value-bind (sap type) (heap-alien-sap-and-type info)
-    `(extract-alien-value ,sap 0 ',type)))
+    `(%alien-value ,sap 0 ',type)))
 
 #+nil ;; ### Again, deposit value might change the type.
 (defoptimizer (%set-heap-alien derive-type) ((info value))
@@ -321,7 +321,7 @@
 
 (deftransform %set-heap-alien ((info value) (heap-alien-info *) * :important t)
   (multiple-value-bind (sap type) (heap-alien-sap-and-type info)
-    `(deposit-alien-value ,sap 0 ',type value)))
+    `(setf (%alien-value ,sap 0 ',type) value)))
 
 (defoptimizer (%heap-alien-addr derive-type) ((info))
   (block nil
@@ -339,9 +339,12 @@
 
 ;;;; support for local (stack or register) aliens
 
-(deftransform make-local-alien ((info) * * :important t)
+(defun alien-info-constant-or-abort (info)
   (unless (constant-lvar-p info)
-    (abort-ir1-transform "Local alien info isn't constant?"))
+    (abort-ir1-transform "Local alien info isn't constant?")))
+
+(deftransform make-local-alien ((info) * * :important t)
+  (alien-info-constant-or-abort info)
   (let* ((info (lvar-value info))
          (alien-type (local-alien-info-type info))
          (bits (alien-type-bits alien-type)))
@@ -373,10 +376,7 @@
                   (unparse-alien-type alien-type))))))))
 
 (deftransform note-local-alien-type ((info var) * * :important t)
-  ;; FIXME: This test and error occur about a zillion times. They
-  ;; could be factored into a function.
-  (unless (constant-lvar-p info)
-    (abort-ir1-transform "Local alien info isn't constant?"))
+  (alien-info-constant-or-abort info)
   (let ((info (lvar-value info)))
     (/noshow "in DEFTRANSFORM NOTE-LOCAL-ALIEN-TYPE" info)
     (/noshow (local-alien-info-force-to-memory-p info))
@@ -391,29 +391,26 @@
   nil)
 
 (deftransform local-alien ((info var) * * :important t)
-  (unless (constant-lvar-p info)
-    (abort-ir1-transform "Local alien info isn't constant?"))
+  (alien-info-constant-or-abort info)
   (let* ((info (lvar-value info))
          (alien-type (local-alien-info-type info)))
     (/noshow "in DEFTRANSFORM LOCAL-ALIEN" info alien-type)
     (/noshow (local-alien-info-force-to-memory-p info))
     (if (local-alien-info-force-to-memory-p info)
-        `(extract-alien-value var 0 ',alien-type)
+        `(%alien-value var 0 ',alien-type)
         `(naturalize var ',alien-type))))
 
 (deftransform %local-alien-forced-to-memory-p ((info) * * :important t)
-  (unless (constant-lvar-p info)
-    (abort-ir1-transform "Local alien info isn't constant?"))
+  (alien-info-constant-or-abort info)
   (let ((info (lvar-value info)))
     (local-alien-info-force-to-memory-p info)))
 
 (deftransform %set-local-alien ((info var value) * * :important t)
-  (unless (constant-lvar-p info)
-    (abort-ir1-transform "Local alien info isn't constant?"))
+  (alien-info-constant-or-abort info)
   (let* ((info (lvar-value info))
          (alien-type (local-alien-info-type info)))
     (if (local-alien-info-force-to-memory-p info)
-        `(deposit-alien-value var 0 ',alien-type value)
+        `(setf (%alien-value var 0 ',alien-type) value)
         '(error "This should be eliminated as dead code."))))
 
 (defoptimizer (%local-alien-addr derive-type) ((info var))
@@ -424,8 +421,7 @@
       *wild-type*))
 
 (deftransform %local-alien-addr ((info var) * * :important t)
-  (unless (constant-lvar-p info)
-    (abort-ir1-transform "Local alien info isn't constant?"))
+  (alien-info-constant-or-abort info)
   (let* ((info (lvar-value info))
          (alien-type (local-alien-info-type info)))
     (/noshow "in DEFTRANSFORM %LOCAL-ALIEN-ADDR, creating %SAP-ALIEN")
@@ -434,8 +430,7 @@
         (error "This shouldn't happen."))))
 
 (deftransform dispose-local-alien ((info var) * * :important t)
-  (unless (constant-lvar-p info)
-    (abort-ir1-transform "Local alien info isn't constant?"))
+  (alien-info-constant-or-abort info)
   (let* ((info (lvar-value info))
          (alien-type (local-alien-info-type info)))
     (if (local-alien-info-force-to-memory-p info)
@@ -513,9 +508,9 @@
     (%computed-lambda #'compute-deport-lambda type))
   (deftransform deport-alloc ((alien type) * * :important t)
     (%computed-lambda #'compute-deport-alloc-lambda type))
-  (deftransform extract-alien-value ((sap offset type) * * :important t)
+  (deftransform %alien-value ((sap offset type) * * :important t)
     (%computed-lambda #'compute-extract-lambda type))
-  (deftransform deposit-alien-value ((sap offset type value) * * :important t)
+  (deftransform (setf %alien-value) ((value sap offset type) * * :important t)
     (%computed-lambda #'compute-deposit-lambda type)))
 
 ;;;; a hack to clean up divisions
@@ -702,10 +697,11 @@
             ;; to it later regardless of how the foreign stack looks
             ;; like.
             #!+:c-stack-is-control-stack
-            (when (policy node (<= speed debug))
+            (when (policy node (= 3 alien-funcall-saves-fp-and-pc))
               (setf body `(invoke-with-saved-fp-and-pc (lambda () ,body))))
             (/noshow "returning from DEFTRANSFORM ALIEN-FUNCALL" (params) body)
             `(lambda (function ,@(params))
+               (declare (optimize (let-conversion 3)))
                ,body)))))))
 
 (defoptimizer (%alien-funcall derive-type) ((function type &rest args))

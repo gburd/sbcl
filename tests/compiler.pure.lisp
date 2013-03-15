@@ -2082,6 +2082,31 @@
       (compiler-note () (throw :note nil)))
     (error "Unreachable code undetected.")))
 
+(with-test (:name (:compiler :constraint-propagation :float-bounds-3
+                   :LP-894498))
+  (catch :note
+    (handler-case
+        (compile nil '(lambda (x)
+                        (declare (type (single-float 0.0) x))
+                        (when (> x 0.0)
+                          (when (zerop x)
+                            (error "This is unreachable.")))))
+      (compiler-note () (throw :note nil)))
+    (error "Unreachable code undetected.")))
+
+(with-test (:name (:compiler :constraint-propagation :float-bounds-4
+                   :LP-894498))
+  (catch :note
+    (handler-case
+        (compile nil '(lambda (x y)
+                        (declare (type (single-float 0.0) x)
+                                 (type (single-float (0.0)) y))
+                        (when (> x y)
+                          (when (zerop x)
+                            (error "This is unreachable.")))))
+      (compiler-note () (throw :note nil)))
+    (error "Unreachable code undetected.")))
+
 (with-test (:name (:compiler :constraint-propagation :var-eql-to-var-1))
   (catch :note
     (handler-case
@@ -2231,15 +2256,16 @@
                (logand most-positive-fixnum (* x most-positive-fixnum))))
 
 ;;; bug 256.b
-(assert (let (warned-p)
+(with-test (:name :propagate-type-through-error-and-binding)
+  (assert (let (warned-p)
             (handler-bind ((warning (lambda (w) (setf warned-p t))))
               (compile nil
-                         '(lambda (x)
-                           (list (let ((y (the real x)))
-                                   (unless (floatp y) (error ""))
-                                   y)
-                                 (integer-length x)))))
-            warned-p))
+                       '(lambda (x)
+                         (list (let ((y (the real x)))
+                                 (unless (floatp y) (error ""))
+                                 y)
+                          (integer-length x)))))
+            warned-p)))
 
 ;; Dead / in safe code
 (with-test (:name :safe-dead-/)
@@ -2676,10 +2702,40 @@
     (assert (eq 'list type))
     (assert derivedp)))
 
+(with-test (:name :rest-list-type-derivation2)
+  (multiple-value-bind (type derivedp)
+      (funcall (funcall (compile nil `(lambda ()
+                                        (lambda (&rest args)
+                                          (ctu:compiler-derived-type args))))))
+    (assert (eq 'list type))
+    (assert derivedp)))
+
+(with-test (:name :rest-list-type-derivation3)
+  (multiple-value-bind (type derivedp)
+      (funcall (funcall (compile nil `(lambda ()
+                                        (lambda (&optional x &rest args)
+                                          (unless x (error "oops"))
+                                          (ctu:compiler-derived-type args)))))
+               t)
+    (assert (eq 'list type))
+    (assert derivedp)))
+
+(with-test (:name :rest-list-type-derivation4)
+  (multiple-value-bind (type derivedp)
+      (funcall (funcall (compile nil `(lambda ()
+                                        (lambda (&optional x &rest args)
+                                          (declare (type (or null integer) x))
+                                          (when x (setf args x))
+                                          (ctu:compiler-derived-type args)))))
+               42)
+    (assert (equal '(or cons null integer) type))
+    (assert derivedp)))
+
 (with-test (:name :base-char-typep-elimination)
-  (assert (eq (funcall (lambda (ch)
-                         (declare (type base-char ch) (optimize (speed 3) (safety 0)))
-                         (typep ch 'base-char))
+  (assert (eq (funcall (compile nil
+                                `(lambda (ch)
+                                   (declare (type base-char ch) (optimize (speed 3) (safety 0)))
+                                   (typep ch 'base-char)))
                        t)
               t)))
 
@@ -2729,7 +2785,7 @@
                           (eval '(,lambda ,@args))))))))
   (sb-vm::with-float-traps-masked
       (:divide-by-zero :overflow :inexact :invalid)
-    (let ((sb-ext:*evaluator-mode* :interpret))
+    (let (#+sb-eval (sb-ext:*evaluator-mode* :interpret))
       (declare (sb-ext:muffle-conditions style-warning))
       (test-comparison eql t t nil)
       (test-comparison eql t t t)
@@ -3040,20 +3096,6 @@
             (assert (eql x (funcall fun i)))
             (assert (eql (- x) (funcall fun i))))))))
 
-(with-test (:name (load-time-value :type-derivation))
-  (flet ((test (type form value-cell-p)
-           (let ((derived (funcall (compile
-                                    nil
-                                    `(lambda ()
-                                       (ctu:compiler-derived-type
-                                        (load-time-value ,form)))))))
-             (unless (equal type derived)
-              (error "wanted ~S, got ~S" type derived)))))
-    (let ((* 10))
-      (test '(integer 11 11) '(+ * 1) nil))
-    (let ((* "fooo"))
-      (test '(integer 4 4) '(length *) t))))
-
 (with-test (:name :float-division-using-exact-reciprocal)
   (flet ((test (lambda-form arg res &key (check-insts t))
            (let* ((fun (compile nil lambda-form))
@@ -3253,14 +3295,27 @@
                            (truncate x))))
         (d (compile nil `(lambda (x)
                            (declare (double-float x))
-                           (truncate x)))))
+                           (truncate x))))
+        (s-inlined (compile nil '(lambda (x)
+                                  (declare (type (single-float 0.0s0 1.0s0) x))
+                                  (truncate x))))
+        (d-inlined (compile nil '(lambda (x)
+                                  (declare (type (double-float 0.0d0 1.0d0) x))
+                                  (truncate x)))))
     ;; Check that there is no generic arithmetic
     (assert (not (search "GENERIC"
                          (with-output-to-string (out)
                            (disassemble s :stream out)))))
     (assert (not (search "GENERIC"
                          (with-output-to-string (out)
-                           (disassemble d :stream out)))))))
+                           (disassemble d :stream out)))))
+    ;; Check that we actually inlined the call when we were supposed to.
+    (assert (not (search "UNARY-TRUNCATE"
+                         (with-output-to-string (out)
+                           (disassemble s-inlined :stream out)))))
+    (assert (not (search "UNARY-TRUNCATE"
+                         (with-output-to-string (out)
+                           (disassemble d-inlined :stream out)))))))
 
 (with-test (:name :make-array-unnamed-dimension-leaf)
   (let ((fun (compile nil `(lambda (stuff)
@@ -3383,3 +3438,943 @@
       (:no-error (&rest values)
         (declare (ignore values))
         (error "no error")))))
+
+(with-test (:name :unary-round-type-derivation)
+  (let* ((src '(lambda (zone)
+                (multiple-value-bind (h m) (truncate (abs zone) 1.0)
+                  (declare (ignore h))
+                  (round (* 60.0 m)))))
+         (fun (compile nil src)))
+    (assert (= (funcall fun 0.5) 30))))
+
+(with-test (:name :bug-525949)
+  (let* ((src '(lambda ()
+                (labels ((always-one () 1)
+                         (f (z)
+                           (let ((n (funcall z)))
+                             (declare (fixnum n))
+                             (the double-float (expt n 1.0d0)))))
+                  (f #'always-one))))
+         (warningp nil)
+         (fun (handler-bind ((warning (lambda (c)
+                                        (setf warningp t) (muffle-warning c))))
+                (compile nil src))))
+    (assert (not warningp))
+    (assert (= 1.0d0 (funcall fun)))))
+
+(with-test (:name :%array-data-vector-type-derivation)
+  (let* ((f (compile nil
+                     `(lambda (ary)
+                        (declare (type (simple-array (unsigned-byte 32) (3 3)) ary))
+                        (setf (aref ary 0 0) 0))))
+         (text (with-output-to-string (s)
+                 (disassemble f :stream s))))
+    (assert (not (search "OBJECT-NOT-SIMPLE-ARRAY-UNSIGNED-BYTE-32-ERROR" text)))))
+
+(with-test (:name :array-storage-vector-type-derivation)
+  (let ((f (compile nil
+                    `(lambda (ary)
+                       (declare (type (simple-array (unsigned-byte 32) (3 3)) ary))
+                       (ctu:compiler-derived-type (array-storage-vector ary))))))
+    (assert (equal '(simple-array (unsigned-byte 32) (9))
+                   (funcall f (make-array '(3 3) :element-type '(unsigned-byte 32)))))))
+
+(with-test (:name :bug-523612)
+  (let ((fun
+         (compile nil
+                  `(lambda (&key toff)
+                     (make-array 3 :element-type 'double-float
+                                 :initial-contents
+                                 (if toff (list toff 0d0 0d0) (list 0d0 0d0 0d0)))))))
+    (assert (equalp (vector 0.0d0 0.0d0 0.0d0) (funcall fun :toff nil)))
+    (assert (equalp (vector 2.3d0 0.0d0 0.0d0) (funcall fun :toff 2.3d0)))))
+
+(with-test (:name :bug-309788)
+  (let ((fun
+         (compile nil
+                  `(lambda (x)
+                     (declare (optimize speed))
+                     (let ((env nil))
+                       (typep x 'fixnum env))))))
+    (assert (not (ctu:find-named-callees fun)))))
+
+(with-test (:name :bug-309124)
+  (let ((fun
+         (compile nil
+                  `(lambda (x)
+                     (declare (integer x))
+                     (declare (optimize speed))
+                     (cond ((typep x 'fixnum)
+                            "hala")
+                           ((typep x 'fixnum)
+                            "buba")
+                           ((typep x 'bignum)
+                            "hip")
+                           (t
+                            "zuz"))))))
+    (assert (equal (list "hala" "hip")
+                   (sort (ctu:find-code-constants fun :type 'string)
+                         #'string<)))))
+
+(with-test (:name :bug-316078)
+  (let ((fun
+         (compile nil
+                  `(lambda (x)
+                     (declare (type (and simple-bit-vector (satisfies bar)) x)
+                              (optimize speed))
+                     (elt x 5)))))
+    (assert (not (ctu:find-named-callees fun)))
+    (assert (= 1 (funcall fun #*000001)))
+    (assert (= 0 (funcall fun #*000010)))))
+
+(with-test (:name :mult-by-one-in-float-acc-zero)
+  (assert (eql 1.0 (funcall (compile nil `(lambda (x)
+                                            (declare (optimize (sb-c::float-accuracy 0)))
+                                            (* x 1.0)))
+                            1)))
+  (assert (eql -1.0 (funcall (compile nil `(lambda (x)
+                                             (declare (optimize (sb-c::float-accuracy 0)))
+                                             (* x -1.0)))
+                             1)))
+  (assert (eql 1.0d0 (funcall (compile nil `(lambda (x)
+                                              (declare (optimize (sb-c::float-accuracy 0)))
+                                              (* x 1.0d0)))
+                              1)))
+  (assert (eql -1.0d0 (funcall (compile nil `(lambda (x)
+                                               (declare (optimize (sb-c::float-accuracy 0)))
+                                               (* x -1.0d0)))
+                               1))))
+
+(with-test (:name :dotimes-non-integer-counter-value)
+  (assert (raises-error? (dotimes (i 8.6)) type-error)))
+
+(with-test (:name :bug-454681)
+  ;; This used to break due to reference to a dead lambda-var during
+  ;; inline expansion.
+  (assert (compile nil
+                   `(lambda ()
+                      (multiple-value-bind (iterator+977 getter+978)
+                          (does-not-exist-but-does-not-matter)
+                        (flet ((iterator+976 ()
+                                 (funcall iterator+977)))
+                          (declare (inline iterator+976))
+                          (let ((iterator+976 #'iterator+976))
+                            (funcall iterator+976))))))))
+
+(with-test (:name :complex-float-local-fun-args)
+  ;; As of 1.0.27.14, the lambda below failed to compile due to the
+  ;; compiler attempting to pass unboxed complex floats to Z and the
+  ;; MOVE-ARG method not expecting the register being used as a
+  ;; temporary frame pointer.  Reported by sykopomp in #lispgames,
+  ;; reduced test case provided by _3b`.
+  (compile nil '(lambda (a)
+                  (labels ((z (b c)
+                              (declare ((complex double-float) b c))
+                              (* b (z b c))))
+                          (loop for i below 10 do
+                                (setf a (z a a)))))))
+
+(with-test (:name :bug-309130)
+  (assert (eq :warning
+              (handler-case
+                  (compile nil `(lambda () (svref (make-array 8 :adjustable t) 1)))
+                ((and warning (not style-warning)) ()
+                  :warning))))
+  (assert (eq :warning
+              (handler-case
+                  (compile nil `(lambda (x)
+                                  (declare (optimize (debug 0)))
+                                  (declare (type vector x))
+                                  (list (fill-pointer x) (svref x 1))))
+                ((and warning (not style-warning)) ()
+                  :warning))))
+  (assert (eq :warning
+              (handler-case
+                  (compile nil `(lambda (x)
+                                  (list (vector-push (svref x 0) x))))
+                ((and warning (not style-warning)) ()
+                  :warning))))
+  (assert (eq :warning
+              (handler-case
+                  (compile nil `(lambda (x)
+                                  (list (vector-push-extend (svref x 0) x))))
+                ((and warning (not style-warning)) ()
+                  :warning)))))
+
+(with-test (:name :bug-646796)
+  (assert 42
+          (funcall
+           (compile nil
+                    `(lambda ()
+                       (load-time-value (the (values fixnum) 42)))))))
+
+(with-test (:name :bug-654289)
+  ;; Test that compile-times don't explode when quoted constants
+  ;; get big.
+  (labels ((time-n (n)
+             (gc :full t) ; Let's not confuse the issue with GC
+             (let* ((tree (make-tree (expt 10 n) nil))
+                    (t0 (get-internal-run-time))
+                    (f (compile nil `(lambda (x) (eq x (quote ,tree)))))
+                    (t1 (get-internal-run-time)))
+               (assert (funcall f tree))
+               (- t1 t0)))
+           (make-tree (n acc)
+             (cond ((zerop n) acc)
+                   (t (make-tree (1- n) (cons acc acc))))))
+    (let* ((times (loop for i from 0 upto 4
+                        collect (time-n i)))
+           (max-small (reduce #'max times :end 3))
+           (max-big (reduce #'max times :start 3)))
+      ;; This way is hopefully fairly CPU-performance insensitive.
+      (unless (> (+ (truncate internal-time-units-per-second 10)
+                    (* 2 max-small))
+                 max-big)
+        (error "Bad scaling or test? ~S" times)))))
+
+(with-test (:name :bug-309063)
+  (let ((fun (compile nil `(lambda (x)
+                             (declare (type (integer 0 0) x))
+                             (ash x 100)))))
+    (assert (zerop (funcall fun 0)))))
+
+(with-test (:name :bug-655872)
+  (let ((f (compile nil `(lambda (x)
+                           (declare (optimize (safety 3)))
+                           (aref (locally (declare (optimize (safety 0)))
+                                   (coerce x '(simple-vector 128)))
+                                 60))))
+        (long (make-array 100 :element-type 'fixnum)))
+    (dotimes (i 100)
+      (setf (aref long i) i))
+    ;; 1. COERCE doesn't check the length in unsafe code.
+    (assert (eql 60 (funcall f long)))
+    ;; 2. The compiler doesn't trust the length from COERCE
+    (assert (eq :caught
+                (handler-case
+                    (funcall f (list 1 2 3))
+                  (sb-int:invalid-array-index-error (e)
+                    (assert (eql 60 (type-error-datum e)))
+                    (assert (equal '(integer 0 (3)) (type-error-expected-type e)))
+                    :caught))))))
+
+(with-test (:name :bug-655203-regression)
+  (let ((fun (compile nil
+                      `(LAMBDA (VARIABLE)
+                         (LET ((CONTINUATION
+                                (LAMBDA
+                                    (&OPTIONAL DUMMY &REST OTHER)
+                                  (DECLARE (IGNORE OTHER))
+                                  (PRIN1 DUMMY)
+                                  (PRIN1 VARIABLE))))
+                           (FUNCALL CONTINUATION (LIST 1 2)))))))
+    ;; This used to signal a bogus type-error.
+    (assert (equal (with-output-to-string (*standard-output*)
+                     (funcall fun t))
+                   "(1 2)T"))))
+
+(with-test (:name :constant-concatenate-compile-time)
+  (flet ((make-lambda (n)
+           `(lambda (x)
+              (declare (optimize (speed 3) (space 0)))
+              (concatenate 'string x ,(make-string n)))))
+    (let* ((l0 (make-lambda 1))
+           (l1 (make-lambda 10))
+           (l2 (make-lambda 100))
+           (l3 (make-lambda 1000))
+           (t0 (get-internal-run-time))
+           (f0 (compile nil l0))
+           (t1 (get-internal-run-time))
+           (f1 (compile nil l1))
+           (t2 (get-internal-run-time))
+           (f2 (compile nil l2))
+           (t3 (get-internal-run-time))
+           (f3 (compile nil l3))
+           (t4 (get-internal-run-time))
+           (d0 (- t1 t0))
+           (d1 (- t2 t1))
+           (d2 (- t3 t2))
+           (d3 (- t4 t3))
+           (short-avg (/ (+ d0 d1 d2) 3)))
+      (assert (and f1 f2 f3))
+      (assert (< d3 (* 10 short-avg))))))
+
+(with-test (:name :bug-384892)
+  (assert (equal
+           '(function (fixnum fixnum &key (:k1 (member nil t)))
+             (values (member t) &optional))
+           (sb-kernel:%simple-fun-type
+            (compile nil `(lambda (x y &key k1)
+                            (declare (fixnum x y))
+                            (declare (boolean k1))
+                            (declare (ignore x y k1))
+                            t))))))
+
+(with-test (:name :bug-309448)
+  ;; Like all tests trying to verify that something doesn't blow up
+  ;; compile-times this is bound to be a bit brittle, but at least
+  ;; here we try to establish a decent baseline.
+  (flet ((time-it (lambda want)
+           (gc :full t) ; let's keep GCs coming from other code out...
+           (let* ((start (get-internal-run-time))
+                  (fun (dotimes (internal-time-resolution-too-low-workaround
+                                  #+win32 10
+                                  #-win32 0
+                                  (compile nil lambda))
+                         (compile nil lambda)))
+                  (end (get-internal-run-time))
+                  (got (funcall fun)))
+             (unless (eql want got)
+               (error "wanted ~S, got ~S" want got))
+             (- end start))))
+    (let ((time-1/simple
+           ;; This is mostly identical as the next one, but doesn't create
+           ;; hairy unions of numeric types.
+           (time-it `(lambda ()
+                       (labels ((bar (baz bim)
+                                  (let ((n (+ baz bim)))
+                                 (* n (+ n 1) bim))))
+                      (let ((a (bar 1 1))
+                            (b (bar 1 1))
+                            (c (bar 1 1)))
+                        (- (+ a b) c))))
+                    6))
+          (time-1/hairy
+           (time-it `(lambda ()
+                       (labels ((bar (baz bim)
+                                  (let ((n (+ baz bim)))
+                                 (* n (+ n 1) bim))))
+                      (let ((a (bar 1 1))
+                            (b (bar 1 5))
+                            (c (bar 1 15)))
+                        (- (+ a b) c))))
+                    -3864)))
+      (assert (>= (* 10 (1+ time-1/simple)) time-1/hairy)))
+    (let ((time-2/simple
+           ;; This is mostly identical as the next one, but doesn't create
+           ;; hairy unions of numeric types.
+           (time-it `(lambda ()
+                       (labels ((sum-d (n)
+                                  (let ((m (truncate 999 n)))
+                                    (/ (* n m (1+ m)) 2))))
+                         (- (+ (sum-d 3)
+                               (sum-d 3))
+                            (sum-d 3))))
+                    166833))
+          (time-2/hairy
+           (time-it `(lambda ()
+                       (labels ((sum-d (n)
+                                  (let ((m (truncate 999 n)))
+                                    (/ (* n m (1+ m)) 2))))
+                         (- (+ (sum-d 3)
+                               (sum-d 5))
+                            (sum-d 15))))
+                    233168)))
+      (assert (>= (* 10 (1+ time-2/simple)) time-2/hairy)))))
+
+(with-test (:name :regression-1.0.44.34)
+  (compile nil '(lambda (z &rest args)
+                 (declare (dynamic-extent args))
+                 (flet ((foo (w v) (list v w)))
+                   (setq z 0)
+                   (flet ((foo ()
+                            (foo z args)))
+                     (declare (sb-int:truly-dynamic-extent #'foo))
+                     (call #'foo nil))))))
+
+(with-test (:name :bug-713626)
+  (let ((f (eval '(constantly 42))))
+    (handler-bind ((warning #'error))
+      (assert (= 42 (funcall (compile nil `(lambda () (funcall ,f 1 2 3)))))))))
+
+(with-test (:name :known-fun-allows-other-keys)
+  (handler-bind ((warning #'error))
+    (funcall (compile nil '(lambda () (directory "." :allow-other-keys t))))
+    (funcall (compile nil `(lambda () (directory "." :bar t :allow-other-keys t))))))
+
+(with-test (:name :bug-551227)
+  ;; This function causes constraint analysis to perform a
+  ;; ref-substitution that alters the A referred to in (G A) at in the
+  ;; consequent of the IF to refer to be NUMBER, from the
+  ;; LET-converted inline-expansion of MOD.  This leads to attempting
+  ;; to CLOSE-OVER a variable that simply isn't in scope when it is
+  ;; referenced.
+  (compile nil '(lambda (a)
+                  (if (let ((s a))
+                        (block :block
+                          (map nil
+                               (lambda (e)
+                                 (return-from :block
+                                   (f (mod a e))))
+                               s)))
+                      (g a)))))
+
+(with-test (:name :funcall-lambda-inlined)
+  (assert (not
+           (ctu:find-code-constants
+            (compile nil
+                     `(lambda (x y)
+                        (+ x (funcall (lambda (z) z) y))))
+            :type 'function))))
+
+(with-test (:name :bug-720382)
+  (let ((w 0))
+    (let ((f
+           (handler-bind (((and warning (not style-warning))
+                           (lambda (c) (incf w))))
+             (compile nil `(lambda (b) ((lambda () b) 1))))))
+      (assert (= w 1))
+      (assert (eq :error
+                  (handler-case (funcall f 0)
+                    (error () :error)))))))
+
+(with-test (:name :multiple-args-to-function)
+  (let ((form `(flet ((foo (&optional (x 13)) x))
+                 (funcall (function foo 42))))
+        #+sb-eval (*evaluator-mode* :interpret))
+    #+sb-eval
+    (assert (eq :error
+                (handler-case (eval form)
+                  (error () :error))))
+    (multiple-value-bind (fun warn fail)
+        (compile nil `(lambda () ,form))
+      (assert (and warn fail))
+          (assert (eq :error
+                      (handler-case (funcall fun)
+                        (error () :error)))))))
+
+;;; This doesn't test LVAR-FUN-IS directly, but captures it
+;;; pretty accurately anyways.
+(with-test (:name :lvar-fun-is)
+  (dolist (fun (list
+                (lambda (x) (member x x :test #'eq))
+                (lambda (x) (member x x :test 'eq))
+                (lambda (x) (member x x :test #.#'eq))))
+    (assert (equal (list #'sb-kernel:%member-eq)
+                   (ctu:find-named-callees fun))))
+  (dolist (fun (list
+                (lambda (x)
+                  (declare (notinline eq))
+                  (member x x :test #'eq))
+                (lambda (x)
+                  (declare (notinline eq))
+                  (member x x :test 'eq))
+                (lambda (x)
+                  (declare (notinline eq))
+                  (member x x :test #.#'eq))))
+    (assert (member #'sb-kernel:%member-test
+                    (ctu:find-named-callees fun)))))
+
+(with-test (:name :delete-to-delq-opt)
+  (dolist (fun (list (lambda (x y)
+                       (declare (list y))
+                       (delete x y :test #'eq))
+                     (lambda (x y)
+                       (declare (fixnum x) (list y))
+                       (delete x y))
+                     (lambda (x y)
+                       (declare (symbol x) (list y))
+                       (delete x y :test #'eql))))
+    (assert (equal (list #'sb-int:delq)
+                   (ctu:find-named-callees fun)))))
+
+(with-test (:name :bug-767959)
+  ;; This used to signal an error.
+  (compile nil `(lambda ()
+                  (declare (optimize sb-c:store-coverage-data))
+                  (assoc
+                   nil
+                   '((:ordinary . ordinary-lambda-list))))))
+
+(with-test (:name :member-on-long-constant-list)
+  ;; This used to blow stack with a sufficiently long list.
+  (let ((cycle (list t)))
+    (nconc cycle cycle)
+    (compile nil `(lambda (x)
+                    (member x ',cycle)))))
+
+(with-test (:name :bug-722734)
+  (assert (raises-error?
+            (funcall (compile
+                      nil
+                      '(lambda ()
+                        (eql (make-array 6)
+                         (list unbound-variable-1 unbound-variable-2))))))))
+
+(with-test (:name :bug-771673)
+  (assert (equal `(the foo bar) (macroexpand `(truly-the foo bar))))
+  ;; Make sure the compiler doesn't use THE, and check that setf-expansions
+  ;; work.
+  (let ((f (compile nil `(lambda (x y)
+                           (setf (truly-the fixnum (car x)) y)))))
+    (let* ((cell (cons t t)))
+      (funcall f cell :ok)
+      (assert (equal '(:ok . t) cell)))))
+
+(with-test (:name (:bug-793771 +))
+  (let ((f (compile nil `(lambda (x y)
+                            (declare (type (single-float 2.0) x)
+                                     (type (single-float (0.0)) y))
+                           (+ x y)))))
+    (assert (equal `(function ((single-float 2.0) (single-float (0.0)))
+                              (values (single-float 2.0) &optional))
+                   (sb-kernel:%simple-fun-type f)))))
+
+(with-test (:name (:bug-793771 -))
+  (let ((f (compile nil `(lambda (x y)
+                            (declare (type (single-float * 2.0) x)
+                                     (type (single-float (0.0)) y))
+                           (- x y)))))
+    (assert (equal `(function ((single-float * 2.0) (single-float (0.0)))
+                              (values (single-float * 2.0) &optional))
+                   (sb-kernel:%simple-fun-type f)))))
+
+(with-test (:name (:bug-793771 *))
+  (let ((f (compile nil `(lambda (x)
+                            (declare (type (single-float (0.0)) x))
+                           (* x 0.1)))))
+    (assert (equal `(function ((single-float (0.0)))
+                              (values (or (member 0.0) (single-float (0.0))) &optional))
+                   (sb-kernel:%simple-fun-type f)))))
+
+(with-test (:name (:bug-793771 /))
+  (let ((f (compile nil `(lambda (x)
+                            (declare (type (single-float (0.0)) x))
+                           (/ x 3.0)))))
+    (assert (equal `(function ((single-float (0.0)))
+                              (values (or (member 0.0) (single-float (0.0))) &optional))
+                   (sb-kernel:%simple-fun-type f)))))
+
+(with-test (:name (:bug-486812 single-float))
+  (compile nil `(lambda ()
+                  (sb-kernel:make-single-float -1))))
+
+(with-test (:name (:bug-486812 double-float))
+  (compile nil `(lambda ()
+                  (sb-kernel:make-double-float -1 0))))
+
+(with-test (:name :bug-729765)
+  (compile nil `(lambda (a b)
+                  (declare ((integer 1 1) a)
+                           ((integer 0 1) b)
+                           (optimize debug))
+                  (lambda () (< b a)))))
+
+;; Actually tests the assembly of RIP-relative operands to comparison
+;; functions (one of the few x86 instructions that have extra bytes
+;; *after* the mem operand's effective address, resulting in a wrong
+;; offset).
+(with-test (:name :cmpps)
+  (let ((foo (compile nil `(lambda (x)
+                             (= #C(2.0 3.0) (the (complex single-float) x))))))
+    (assert (funcall foo #C(2.0 3.0)))
+    (assert (not (funcall foo #C(1.0 2.0))))))
+
+(with-test (:name :cmppd)
+  (let ((foo (compile nil `(lambda (x)
+                             (= #C(2d0 3d0) (the (complex double-float) x))))))
+    (assert (funcall foo #C(2d0 3d0)))
+    (assert (not (funcall foo #C(1d0 2d0))))))
+
+(with-test (:name :lvar-externally-checkable-type-nil)
+  ;; Used to signal a BUG during compilation.
+  (let ((fun (compile nil `(lambda (a) (parse-integer "12321321" (the (member :start) a) 1)))))
+    (multiple-value-bind (i p) (funcall fun :start)
+      (assert (= 2321321 i))
+      (assert (= 8 p)))
+    (multiple-value-bind (i e) (ignore-errors (funcall fun :end))
+      (assert (not i))
+      (assert (typep e 'type-error)))))
+
+(with-test (:name :simple-type-error-in-bound-propagation-a)
+  (compile nil `(lambda (i)
+                  (declare (unsigned-byte i))
+                  (expt 10 (expt 7 (- 2 i))))))
+
+(with-test (:name :simple-type-error-in-bound-propagation-b)
+  (assert (equal `(FUNCTION (UNSIGNED-BYTE)
+                            (VALUES (SINGLE-FLOAT -1F0 1F0) &OPTIONAL))
+                 (sb-kernel:%simple-fun-type
+                  (compile nil `(lambda (i)
+                                  (declare (unsigned-byte i))
+                                  (cos (expt 10 (+ 4096 i)))))))))
+
+(with-test (:name :fixed-%more-arg-values)
+  (let ((fun (compile nil `(lambda (&rest rest)
+                             (declare (optimize (safety 0)))
+                             (apply #'cons rest)))))
+    (assert (equal '(car . cdr) (funcall fun 'car 'cdr)))))
+
+(with-test (:name :bug-826970)
+  (let ((fun (compile nil `(lambda (a b c)
+                             (declare (type (member -2 1) b))
+                             (array-in-bounds-p a 4 b c)))))
+    (assert (funcall fun (make-array '(5 2 2)) 1 1))))
+
+(with-test (:name :bug-826971)
+  (let* ((foo "foo")
+         (fun (compile nil `(lambda (p1 p2)
+                              (schar (the (eql ,foo) p1) p2)))))
+    (assert (eql #\f (funcall fun foo 0)))))
+
+(with-test (:name :bug-738464)
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda ()
+                      (flet ((foo () 42))
+                        (declare (ftype non-function-type foo))
+                        (foo))))
+    (assert (eql 42 (funcall fun)))
+    (assert (and warn (not fail)))))
+
+(with-test (:name :bug-832005)
+  (let ((fun (compile nil `(lambda (x)
+                             (declare (type (complex single-float) x))
+                             (+ #C(0.0 1.0) x)))))
+    (assert (= (funcall fun #C(1.0 2.0))
+               #C(1.0 3.0)))))
+
+;; A refactoring  1.0.12.18 caused lossy computation of primitive
+;; types for member types.
+(with-test (:name :member-type-primitive-type)
+  (let ((fun (compile nil `(lambda (p1 p2 p3)
+                             (if p1
+                                 (the (member #c(1.2d0 1d0)) p2)
+                                 (the (eql #c(1.0 1.0)) p3))))))
+    (assert (eql (funcall fun 1 #c(1.2d0 1d0) #c(1.0 1.0))
+                 #c(1.2d0 1.0d0)))))
+
+;; Fall-through jump elimination made control flow fall through to trampolines.
+;; Reported by Eric Marsden on sbcl-devel@ 2011.10.26, with a test case
+;; reproduced below (triggered a corruption warning and a memory fault).
+(with-test (:name :bug-883500)
+  (funcall (compile nil `(lambda (a)
+                           (declare (type (integer -50 50) a))
+                           (declare (optimize (speed 0)))
+                           (mod (mod a (min -5 a)) 5)))
+           1))
+
+;; Test for literals too large for the ISA (e.g. (SIGNED-BYTE 13) on SPARC).
+#+sb-unicode
+(with-test (:name :bug-883519)
+  (compile nil `(lambda (x)
+                  (declare (type character x))
+                  (eql x #\U0010FFFF))))
+
+;; Wide fixnum platforms had buggy address computation in atomic-incf/aref
+(with-test (:name :bug-887220)
+  (let ((incfer (compile
+                 nil
+                 `(lambda (vector index)
+                    (declare (type (simple-array sb-ext:word (4))
+                                   vector)
+                             (type (mod 4) index))
+                    (sb-ext:atomic-incf (aref vector index) 1)
+                    vector))))
+    (assert (equalp (funcall incfer
+                             (make-array 4 :element-type 'sb-ext:word
+                                           :initial-element 0)
+                             1)
+                    #(0 1 0 0)))))
+
+(with-test (:name :catch-interferes-with-debug-names)
+  (let ((fun (funcall
+              (compile nil
+                       `(lambda ()
+                          (catch 'out
+                              (flet ((foo ()
+                                       (throw 'out (lambda () t))))
+                                (foo))))))))
+    (assert (equal '(lambda () :in foo) (sb-kernel:%fun-name fun)))))
+
+(with-test (:name :interval-div-signed-zero)
+  (let ((fun (compile nil
+                      `(Lambda (a)
+                         (declare (type (member 0 -272413371076) a))
+                         (ffloor (the number a) -63243.127451934015d0)))))
+    (multiple-value-bind (q r) (funcall fun 0)
+      (assert (eql -0d0 q))
+      (assert (eql 0d0 r)))))
+
+(with-test (:name :non-constant-keyword-typecheck)
+  (let ((fun (compile nil
+                      `(lambda (p1 p3 p4)
+                         (declare (type keyword p3))
+                         (tree-equal p1 (cons 1 2) (the (member :test) p3) p4)))))
+    (assert (funcall fun (cons 1.0 2.0) :test '=))))
+
+(with-test (:name :truncate-wild-values)
+  (multiple-value-bind (q r)
+      (handler-bind ((warning #'error))
+        (let ((sb-c::*check-consistency* t))
+          (funcall (compile nil
+                            `(lambda (a)
+                               (declare (type (member 1d0 2d0) a))
+                               (block return-value-tag
+                                 (funcall
+                                  (the function
+                                       (catch 'debug-catch-tag
+                                         (return-from return-value-tag
+                                           (progn (truncate a)))))))))
+                   2d0)))
+    (assert (eql 2 q))
+    (assert (eql 0d0 r))))
+
+(with-test (:name :boxed-fp-constant-for-full-call)
+  (let ((fun (compile nil
+                      `(lambda (x)
+                         (declare (double-float x))
+                         (unknown-fun 1.0d0 (+ 1.0d0 x))))))
+    (assert (equal '(1.0d0) (ctu:find-code-constants fun :type 'double-float)))))
+
+(with-test (:name :only-one-boxed-constant-for-multiple-uses)
+  (let* ((big (1+ most-positive-fixnum))
+         (fun (compile nil
+                       `(lambda (x)
+                          (unknown-fun ,big (+ ,big x))))))
+    (assert (= 1 (length (ctu:find-code-constants fun :type `(eql ,big)))))))
+
+(with-test (:name :fixnum+float-coerces-fixnum
+            :skipped-on :x86)
+  (let ((fun (compile nil
+                      `(lambda (x y)
+                         (declare (fixnum x)
+                                  (single-float y))
+                         (+ x y)))))
+    (assert (not (ctu:find-named-callees fun)))
+    (assert (not (search "GENERIC"
+                         (with-output-to-string (s)
+                           (disassemble fun :stream s)))))))
+
+(with-test (:name :bug-803508)
+  (compile nil `(lambda ()
+                  (print
+                   (lambda (bar)
+                     (declare (dynamic-extent bar))
+                     (foo bar))))))
+
+(with-test (:name :bug-803508-b)
+  (compile nil `(lambda ()
+                  (list
+                   (lambda (bar)
+                     (declare (dynamic-extent bar))
+                     (foo bar))))))
+
+(with-test (:name :bug-803508-c)
+  (compile nil `(lambda ()
+                  (list
+                   (lambda (bar &optional quux)
+                     (declare (dynamic-extent bar quux))
+                     (foo bar quux))))))
+
+(with-test (:name :cprop-with-constant-but-assigned-to-closure-variable)
+  (compile nil `(lambda (b c d)
+                  (declare (type (integer -20545789 207590862) c))
+                  (declare (type (integer -1 -1) d))
+                  (let ((i (unwind-protect 32 (shiftf d -1))))
+                    (or (if (= d c)  2 (= 3 b)) 4)))))
+
+(with-test (:name :bug-913232)
+  (compile nil `(lambda (x)
+                  (declare (optimize speed)
+                           (type (or (and (or (integer -100 -50)
+                                              (integer 100 200)) (satisfies foo))
+                                     (and (or (integer 0 10) (integer 20 30)) a)) x))
+                  x))
+  (compile nil `(lambda (x)
+                  (declare (optimize speed)
+                           (type (and fixnum a) x))
+                  x)))
+
+(with-test (:name :bug-959687)
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda (x)
+                      (case x
+                        (t
+                         :its-a-t)
+                        (otherwise
+                         :somethign-else))))
+    (assert (and warn fail))
+    (assert (not (ignore-errors (funcall fun t)))))
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda (x)
+                      (case x
+                        (otherwise
+                         :its-an-otherwise)
+                        (t
+                         :somethign-else))))
+    (assert (and warn fail))
+    (assert (not (ignore-errors (funcall fun t))))))
+
+(with-test (:name :bug-924276)
+  (assert (eq :style-warning
+              (handler-case
+                  (compile nil `(lambda (a)
+                                  (cons a (symbol-macrolet ((b 1))
+                                            (declare (ignorable a))
+                                            :c))))
+                (style-warning ()
+                  :style-warning)))))
+
+(with-test (:name :bug-974406)
+  (let ((fun32 (compile nil `(lambda (x)
+                               (declare (optimize speed (safety 0)))
+                               (declare (type (integer 53 86) x))
+                               (logand (+ x 1032791128) 11007078467))))
+        (fun64 (compile nil `(lambda (x)
+                               (declare (optimize speed (safety 0)))
+                               (declare (type (integer 53 86) x))
+                               (logand (+ x 1152921504606846975)
+                                       38046409652025950207)))))
+    (assert (= (funcall fun32 61) 268574721))
+    (assert (= (funcall fun64 61) 60)))
+  (let (result)
+    (do ((width 5 (1+ width)))
+        ((= width 130))
+      (dotimes (extra 4)
+        (let ((fun (compile nil `(lambda (x)
+                                   (declare (optimize speed (safety 0)))
+                                   (declare (type (integer 1 16) x))
+                                   (logand
+                                    (+ x ,(1- (ash 1 width)))
+                                    ,(logior (ash 1 (+ width 1 extra))
+                                             (1- (ash 1 width))))))))
+          (unless (= (funcall fun 16) (logand 15 (1- (ash 1 width))))
+            (push (cons width extra) result)))))
+    (assert (null result))))
+
+;; On x86-64 MOVE-IMMEDIATE of fixnum values into memory either directly
+;; uses a MOV into memory or goes through a temporary register if the
+;; value is larger than a certain number of bits. Check that it respects
+;; the limits of immediate arguments to the MOV instruction (if not, the
+;; assembler will fail an assertion) and doesn't have sign-extension
+;; problems. (The test passes fixnum constants through the MOVE VOP
+;; which calls MOVE-IMMEDIATE.)
+(with-test (:name :constant-fixnum-move)
+  (let ((f (compile nil `(lambda (g)
+                           (funcall g
+                                    ;; The first three args are
+                                    ;; uninteresting as they are
+                                    ;; passed in registers.
+                                    1 2 3
+                                    ,@(loop for i from 27 to 32
+                                            collect (expt 2 i)))))))
+    (assert (every #'plusp (funcall f #'list)))))
+
+(with-test (:name (:malformed-ignore :lp-1000239))
+  (raises-error?
+   (eval '(lambda () (declare (ignore (function . a)))))
+   sb-int:compiled-program-error)
+  (raises-error?
+   (eval '(lambda () (declare (ignore (function a b)))))
+   sb-int:compiled-program-error)
+  (raises-error?
+   (eval '(lambda () (declare (ignore (function)))))
+   sb-int:compiled-program-error)
+  (raises-error?
+   (eval '(lambda () (declare (ignore (a)))))
+   sb-int:compiled-program-error)
+  (raises-error?
+   (eval '(lambda () (declare (ignorable (a b)))))
+   sb-int:compiled-program-error))
+
+(with-test (:name :malformed-type-declaraions)
+  (compile nil '(lambda (a) (declare (type (integer 1 2 . 3) a)))))
+
+(with-test (:name :compiled-program-error-escaped-source)
+  (assert
+   (handler-case
+       (funcall (compile nil `(lambda () (lambda ("foo")))))
+     (sb-int:compiled-program-error (e)
+       (let ((source (read-from-string (sb-kernel::program-error-source e))))
+         (equal source '#'(lambda ("foo"))))))))
+
+(with-test (:name :escape-analysis-for-nlxs)
+  (flet ((test (check lambda &rest args)
+           (let* ((cell-note nil)
+                  (fun (handler-bind ((compiler-note
+                                        (lambda (note)
+                                          (when (search
+                                                 "Allocating a value-cell at runtime for"
+                                                 (princ-to-string note))
+                                            (setf cell-note t)))))
+                          (compile nil lambda))))
+             (assert (eql check cell-note))
+             (if check
+                 (assert
+                  (eq :ok
+                      (handler-case
+                          (dolist (arg args nil)
+                            (setf fun (funcall fun arg)))
+                        (sb-int:simple-control-error (e)
+                          (when (equal
+                                 (simple-condition-format-control e)
+                                 "attempt to RETURN-FROM a block or GO to a tag that no longer exists")
+                            :ok)))))
+                 (ctu:assert-no-consing (apply fun args))))))
+    (test nil `(lambda (x)
+                 (declare (optimize speed))
+                 (block out
+                   (flet ((ex () (return-from out 'out!)))
+                     (typecase x
+                       (cons (or (car x) (ex)))
+                       (t (ex)))))) :foo)
+    (test t   `(lambda (x)
+                 (declare (optimize speed))
+                 (funcall
+                  (block nasty
+                    (flet ((oops () (return-from nasty t)))
+                      #'oops)))) t)
+    (test t   `(lambda (r)
+                 (declare (optimize speed))
+                 (block out
+                   (flet ((ex () (return-from out r)))
+                     (lambda (x)
+                       (typecase x
+                         (cons (or (car x) (ex)))
+                         (t (ex))))))) t t)
+    (test t   `(lambda (x)
+                 (declare (optimize speed))
+                 (flet ((eh (x)
+                          (flet ((meh () (return-from eh 'meh)))
+                            (lambda ()
+                              (typecase x
+                                (cons (or (car x) (meh)))
+                                (t (meh)))))))
+                   (funcall (eh x)))) t t)))
+
+(with-test (:name (:bug-1050768 :symptom))
+  ;; Used to signal an error.
+  (compile nil
+           `(lambda (string position)
+              (char string position)
+              (array-in-bounds-p string (1+ position)))))
+
+(with-test (:name (:bug-1050768 :cause))
+  (let ((types `((string string)
+                 ((or (simple-array character 24) (vector t 24))
+                  (or (simple-array character 24) (vector t))))))
+    (dolist (pair types)
+      (destructuring-bind (orig conservative) pair
+        (assert sb-c::(type= (specifier-type cl-user::conservative)
+                             (conservative-type (specifier-type cl-user::orig))))))))
+
+(with-test (:name (:smodular64 :wrong-width))
+  (let ((fun (compile nil
+                      '(lambda (x)
+                         (declare (type (signed-byte 64) x))
+                         (sb-c::mask-signed-field 64 (- x 7033717698976965573))))))
+    (assert (= (funcall fun 10038) -7033717698976955535))))
+
+(with-test (:name (:smodular32 :wrong-width))
+  (let ((fun (compile nil '(lambda (x)
+                             (declare (type (signed-byte 31) x))
+                             (sb-c::mask-signed-field 31 (- x 1055131947))))))
+    (assert (= (funcall fun 10038) -1055121909))))
+
+(with-test (:name :first-open-coded)
+  (let ((fun (compile nil `(lambda (x) (first x)))))
+    (assert (not (ctu:find-named-callees fun)))))
+
+(with-test (:name :second-open-coded)
+  (let ((fun (compile nil `(lambda (x) (second x)))))
+    (assert (not (ctu:find-named-callees fun)))))

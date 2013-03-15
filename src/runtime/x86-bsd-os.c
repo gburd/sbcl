@@ -1,4 +1,5 @@
 #include <signal.h>
+#include <stdio.h>
 #include "sbcl.h"
 #include "runtime.h"
 #include "thread.h"
@@ -20,9 +21,12 @@
 #endif
 
 #if defined(LISP_FEATURE_OPENBSD)
-#include <machine/frame.h>
 #include <machine/npx.h>
 #include <stddef.h>
+#include "openbsd-sigcontext.h"
+#ifdef OS_OPENBSD_FPSTATE_IN_SIGFRAME
+# include <machine/frame.h>
+#endif
 #endif
 
 /* KLUDGE: There is strong family resemblance in the signal context
@@ -153,11 +157,24 @@ void set_data_desc_addr(struct segment_descriptor* desc, void* addr)
 
 #endif
 
+#ifdef LISP_FEATURE_SB_THREAD
+void
+arch_os_load_ldt(struct thread *thread)
+{
+    int sel = LSEL(thread->tls_cookie, SEL_UPL);
+    unsigned int fs = rfs();
+
+    /* Load FS only if it's necessary.  Modifying a selector
+     * causes privilege checking and it takes long time. */
+    if (fs != sel)
+        load_fs(sel);
+}
+#endif
+
 int arch_os_thread_init(struct thread *thread) {
 
 #ifdef LISP_FEATURE_SB_THREAD
     int n;
-    int sel;
 
     struct segment_descriptor ldt_entry = { 0, 0, SDT_MEMRW, SEL_UPL, 1,
                                             0, 0, 1, 0, 0 };
@@ -171,15 +188,18 @@ int arch_os_thread_init(struct thread *thread) {
         lose("unexpected i386_set_ldt(..) failure\n");
     }
     FSHOW_SIGNAL((stderr, "/ TLS: Allocated LDT %x\n", n));
-    sel =  LSEL(n, SEL_UPL);
-    load_fs(sel);
-
     thread->tls_cookie=n;
+    arch_os_load_ldt(thread);
+
 #ifdef LISP_FEATURE_GCC_TLS
     current_thread = thread;
 #else
     pthread_setspecific(specials,thread);
 #endif
+#endif
+
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+    thread->selfptr = thread;
 #endif
 
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
@@ -248,11 +268,14 @@ os_restore_fp_control(os_context_t *context)
 void
 os_restore_fp_control(os_context_t *context)
 {
-    struct sigframe *frame;
-    union savefpu *fpu;
+#ifdef OS_OPENBSD_FPSTATE_IN_SIGFRAME
+    struct sigframe *frame = (struct sigframe *)((char*)context -
+        offsetof(struct sigframe, sf_sc));
+    union savefpu *fpu = frame->sf_fpstate;
+#elif defined(OS_OPENBSD_FPSTATE_IN_SIGCONTEXT)
+    union savefpu *fpu = context->sc_fpstate;
+#endif
 
-    frame = (struct sigframe *)((char*)context - offsetof(struct sigframe, sf_sc));
-    fpu = frame->sf_fpstate;
     if (openbsd_use_fxsave)
         __asm__ __volatile__ ("fldcw %0" : : "m" (fpu->sv_xmm.sv_env.en_cw));
     else

@@ -231,6 +231,9 @@
 (defvar *read-only*)
 (defconstant read-only-core-space-id 3)
 
+(defconstant max-core-space-id 3)
+(defconstant deflated-core-space-id-flag 4)
+
 (defconstant descriptor-low-bits 16
   "the number of bits in the low half of the descriptor")
 (defconstant target-space-alignment (ash 1 descriptor-low-bits)
@@ -276,6 +279,16 @@
 
 ;;;; representation of descriptors
 
+(defun is-fixnum-lowtag (lowtag)
+  (zerop (logand lowtag sb!vm:fixnum-tag-mask)))
+
+(defun is-other-immediate-lowtag (lowtag)
+  ;; The other-immediate lowtags are similar to the fixnum lowtags, in
+  ;; that they have an "effective length" that is shorter than is used
+  ;; for the pointer lowtags.  Unlike the fixnum lowtags, however, the
+  ;; other-immediate lowtags are always effectively two bits wide.
+  (= (logand lowtag 3) sb!vm:other-immediate-0-lowtag))
+
 (defstruct (descriptor
             (:constructor make-descriptor
                           (high low &optional gspace word-offset))
@@ -297,8 +310,7 @@
 (def!method print-object ((des descriptor) stream)
   (let ((lowtag (descriptor-lowtag des)))
     (print-unreadable-object (des stream :type t)
-      (cond ((or (= lowtag sb!vm:even-fixnum-lowtag)
-                 (= lowtag sb!vm:odd-fixnum-lowtag))
+      (cond ((is-fixnum-lowtag lowtag)
              (let ((unsigned (logior (ash (descriptor-high des)
                                           (1+ (- descriptor-low-bits
                                                  sb!vm:n-lowtag-bits)))
@@ -309,12 +321,7 @@
                        (if (> unsigned #x1FFFFFFF)
                            (- unsigned #x40000000)
                            unsigned))))
-            ((or (= lowtag sb!vm:other-immediate-0-lowtag)
-                 (= lowtag sb!vm:other-immediate-1-lowtag)
-                 #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-                 (= lowtag sb!vm:other-immediate-2-lowtag)
-                 #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-                 (= lowtag sb!vm:other-immediate-3-lowtag))
+            ((is-other-immediate-lowtag lowtag)
              (format stream
                      "for other immediate: #X~X, type #b~8,'0B"
                      (ash (descriptor-bits des) (- sb!vm:n-widetag-bits))
@@ -376,16 +383,15 @@
         ;; it's hard to see how it could have been wrong, since CMU CL
         ;; genesis worked. It would be nice to understand how this came
         ;; to be.. -- WHN 19990901
-        (logior (ash bits (- 1 sb!vm:n-lowtag-bits))
+        (logior (ash bits (- sb!vm:n-fixnum-tag-bits))
                 (ash -1 (1+ sb!vm:n-positive-fixnum-bits)))
-        (ash bits (- 1 sb!vm:n-lowtag-bits)))))
+        (ash bits (- sb!vm:n-fixnum-tag-bits)))))
 
 (defun descriptor-word-sized-integer (des)
   ;; Extract an (unsigned-byte 32), from either its fixnum or bignum
   ;; representation.
   (let ((lowtag (descriptor-lowtag des)))
-    (if (or (= lowtag sb!vm:even-fixnum-lowtag)
-            (= lowtag sb!vm:odd-fixnum-lowtag))
+    (if (is-fixnum-lowtag lowtag)
         (make-random-descriptor (descriptor-fixnum des))
         (read-wordindexed des 1))))
 
@@ -454,9 +460,9 @@
 
 (defun make-fixnum-descriptor (num)
   (when (>= (integer-length num)
-            (1+ (- sb!vm:n-word-bits sb!vm:n-lowtag-bits)))
+            (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits))
     (error "~W is too big for a fixnum." num))
-  (make-random-descriptor (ash num (1- sb!vm:n-lowtag-bits))))
+  (make-random-descriptor (ash num sb!vm:n-fixnum-tag-bits)))
 
 (defun make-other-immediate-descriptor (data type)
   (make-descriptor (ash data (- sb!vm:n-widetag-bits descriptor-low-bits))
@@ -514,6 +520,9 @@
 ;;; the cold core starts up
 (defvar *current-debug-sources*)
 
+;;; foreign symbol references
+(defparameter *cold-foreign-undefined-symbols* nil)
+
 ;;; the name of the object file currently being cold loaded (as a string, not a
 ;;; pathname), or NIL if we're not currently cold loading any object file
 (defvar *cold-load-filename* nil)
@@ -559,10 +568,12 @@
              *current-reversed-cold-toplevels*)
   (values))
 
-(declaim (ftype (function (descriptor sb!vm:word descriptor)) write-wordindexed))
+(declaim (ftype (function (descriptor sb!vm:word (or descriptor symbol))) write-wordindexed))
 (defun write-wordindexed (address index value)
   #!+sb-doc
   "Write VALUE displaced INDEX words from ADDRESS."
+  ;; If we're passed a symbol as a value then it needs to be interned.
+  (when (symbolp value) (setf value (cold-intern value)))
   (if (eql (descriptor-gspace value) :load-time-value)
     (note-load-time-value-reference address
                                     (- (ash index sb!vm:word-shift)
@@ -575,7 +586,7 @@
       (setf (bvref-word bytes byte-index)
             (descriptor-bits value)))))
 
-(declaim (ftype (function (descriptor descriptor)) write-memory))
+(declaim (ftype (function (descriptor (or descriptor symbol))) write-memory))
 (defun write-memory (address value)
   #!+sb-doc
   "Write VALUE (a DESCRIPTOR) at ADDRESS (also a DESCRIPTOR)."
@@ -762,7 +773,7 @@ core and return a descriptor to it."
 (defun number-to-core (number)
   (typecase number
     (integer (if (< (integer-length number)
-                    (- (1+ sb!vm:n-word-bits) sb!vm:n-lowtag-bits))
+                    (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits))
                  (make-fixnum-descriptor number)
                  (bignum-to-core number)))
     (ratio (number-pair-to-core (number-to-core (numerator number))
@@ -810,14 +821,10 @@ core and return a descriptor to it."
 
 ;;;; symbol magic
 
-;;; FIXME: This should be a &KEY argument of ALLOCATE-SYMBOL.
-(defvar *cold-symbol-allocation-gspace* nil)
-
 ;;; Allocate (and initialize) a symbol.
-(defun allocate-symbol (name)
+(defun allocate-symbol (name &key (gspace *dynamic*))
   (declare (simple-string name))
-  (let ((symbol (allocate-unboxed-object (or *cold-symbol-allocation-gspace*
-                                             *dynamic*)
+  (let ((symbol (allocate-unboxed-object gspace
                                          sb!vm:n-word-bits
                                          (1- sb!vm:symbol-size)
                                          sb!vm:symbol-header-widetag)))
@@ -938,6 +945,7 @@ core and return a descriptor to it."
     (cold-set-layout-slot result 'info *nil-descriptor*)
     (cold-set-layout-slot result 'pure *nil-descriptor*)
     (cold-set-layout-slot result 'n-untagged-slots nuntagged)
+    (cold-set-layout-slot result 'source-location *nil-descriptor*)
     (cold-set-layout-slot result 'for-std-class-p *nil-descriptor*)
 
     (setf (gethash name *cold-layouts*)
@@ -1096,8 +1104,9 @@ core and return a descriptor to it."
 ;;; we allocate the symbol, make sure we record a reference to the
 ;;; symbol in the home package so that the package gets set.
 (defun cold-intern (symbol
-                    &optional
-                    (package (symbol-package-for-target-symbol symbol)))
+                    &key
+                    (package (symbol-package-for-target-symbol symbol))
+                    (gspace *dynamic*))
 
   (aver (package-ok-for-target-symbol-p package))
 
@@ -1121,7 +1130,7 @@ core and return a descriptor to it."
         (cold-intern-info (get symbol 'cold-intern-info)))
     (unless cold-intern-info
       (cond ((eq (symbol-package-for-target-symbol symbol) package)
-             (let ((handle (allocate-symbol (symbol-name symbol))))
+             (let ((handle (allocate-symbol (symbol-name symbol) :gspace gspace)))
                (setf (gethash (descriptor-bits handle) *cold-symbols*) symbol)
                (when (eq package *keyword-package*)
                  (cold-set handle handle))
@@ -1188,29 +1197,29 @@ core and return a descriptor to it."
 (defun initialize-non-nil-symbols ()
   #!+sb-doc
   "Initialize the cold load symbol-hacking data structures."
-  (let ((*cold-symbol-allocation-gspace* *static*))
-    ;; Intern the others.
-    (dolist (symbol sb!vm:*static-symbols*)
-      (let* ((des (cold-intern symbol))
-             (offset-wanted (sb!vm:static-symbol-offset symbol))
-             (offset-found (- (descriptor-low des)
-                              (descriptor-low *nil-descriptor*))))
-        (unless (= offset-wanted offset-found)
-          ;; FIXME: should be fatal
-          (warn "Offset from ~S to ~S is ~W, not ~W"
-                symbol
-                nil
-                offset-found
-                offset-wanted))))
-    ;; Establish the value of T.
-    (let ((t-symbol (cold-intern t)))
-      (cold-set t-symbol t-symbol))
-    ;; Establish the value of *PSEUDO-ATOMIC-BITS* so that the
-    ;; allocation sequences that expect it to be zero upon entrance
-    ;; actually find it to be so.
-    #!+(or x86-64 x86)
-    (let ((p-a-a-symbol (cold-intern 'sb!kernel:*pseudo-atomic-bits*)))
-      (cold-set p-a-a-symbol (make-fixnum-descriptor 0)))))
+  ;; Intern the others.
+  (dolist (symbol sb!vm:*static-symbols*)
+    (let* ((des (cold-intern symbol :gspace *static*))
+           (offset-wanted (sb!vm:static-symbol-offset symbol))
+           (offset-found (- (descriptor-low des)
+                            (descriptor-low *nil-descriptor*))))
+      (unless (= offset-wanted offset-found)
+        ;; FIXME: should be fatal
+        (warn "Offset from ~S to ~S is ~W, not ~W"
+              symbol
+              nil
+              offset-found
+              offset-wanted))))
+  ;; Establish the value of T.
+  (let ((t-symbol (cold-intern t :gspace *static*)))
+    (cold-set t-symbol t-symbol))
+  ;; Establish the value of *PSEUDO-ATOMIC-BITS* so that the
+  ;; allocation sequences that expect it to be zero upon entrance
+  ;; actually find it to be so.
+  #!+(or x86-64 x86)
+  (let ((p-a-a-symbol (cold-intern 'sb!kernel:*pseudo-atomic-bits*
+                                   :gspace *static*)))
+    (cold-set p-a-a-symbol (make-fixnum-descriptor 0))))
 
 ;;; a helper function for FINISH-SYMBOLS: Return a cold alist suitable
 ;;; to be stored in *!INITIAL-LAYOUTS*.
@@ -1446,27 +1455,33 @@ core and return a descriptor to it."
 
 ;;; Given a cold representation of a function name, return a warm
 ;;; representation.
-(declaim (ftype (function (descriptor) (or symbol list)) warm-fun-name))
+(declaim (ftype (function ((or descriptor symbol)) (or symbol list)) warm-fun-name))
 (defun warm-fun-name (des)
   (let ((result
-         (ecase (descriptor-lowtag des)
-           (#.sb!vm:list-pointer-lowtag
-            (aver (not (cold-null des))) ; function named NIL? please no..
-            ;; Do cold (DESTRUCTURING-BIND (COLD-CAR COLD-CADR) DES ..).
-            (let* ((car-des (cold-car des))
-                   (cdr-des (cold-cdr des))
-                   (cadr-des (cold-car cdr-des))
-                   (cddr-des (cold-cdr cdr-des)))
-              (aver (cold-null cddr-des))
-              (list (warm-symbol car-des)
-                    (warm-symbol cadr-des))))
-           (#.sb!vm:other-pointer-lowtag
-            (warm-symbol des)))))
+         (if (symbolp des)
+             ;; This parallels the logic at the start of COLD-INTERN
+             ;; which re-homes symbols in SB-XC to COMMON-LISP.
+             (if (eq (symbol-package des) (find-package "SB-XC"))
+                 (intern (symbol-name des) *cl-package*)
+                 des)
+             (ecase (descriptor-lowtag des)
+                    (#.sb!vm:list-pointer-lowtag
+                     (aver (not (cold-null des))) ; function named NIL? please no..
+                     ;; Do cold (DESTRUCTURING-BIND (COLD-CAR COLD-CADR) DES ..).
+                     (let* ((car-des (cold-car des))
+                            (cdr-des (cold-cdr des))
+                            (cadr-des (cold-car cdr-des))
+                            (cddr-des (cold-cdr cdr-des)))
+                       (aver (cold-null cddr-des))
+                       (list (warm-symbol car-des)
+                             (warm-symbol cadr-des))))
+                    (#.sb!vm:other-pointer-lowtag
+                     (warm-symbol des))))))
     (legal-fun-name-or-type-error result)
     result))
 
 (defun cold-fdefinition-object (cold-name &optional leave-fn-raw)
-  (declare (type descriptor cold-name))
+  (declare (type (or descriptor symbol) cold-name))
   (/show0 "/cold-fdefinition-object")
   (let ((warm-name (warm-fun-name cold-name)))
     (or (gethash warm-name *cold-fdefn-objects*)
@@ -1490,7 +1505,7 @@ core and return a descriptor to it."
 ;;; Handle the at-cold-init-time, fset-for-static-linkage operation
 ;;; requested by FOP-FSET.
 (defun static-fset (cold-name defn)
-  (declare (type descriptor cold-name))
+  (declare (type (or descriptor symbol) cold-name))
   (let ((fdefn (cold-fdefinition-object cold-name t))
         (type (logand (descriptor-low (read-memory defn)) sb!vm:widetag-mask)))
     (write-wordindexed fdefn sb!vm:fdefn-fun-slot defn)
@@ -1592,6 +1607,13 @@ core and return a descriptor to it."
                                 (subseq line (1+ p2)))
                         (values (parse-integer line :end p1 :radix 16)
                                 (subseq line (1+ p2))))
+                  ;; KLUDGE CLH 2010-05-31: on darwin, nm gives us
+                  ;; _function but dlsym expects us to look up
+                  ;; function, without the leading _ . Therefore, we
+                  ;; strip it off here.
+                  #!+darwin
+                  (when (equal (char name 0) #\_)
+                    (setf name (subseq name 1)))
                   (multiple-value-bind (old-value found)
                       (gethash name *cold-foreign-symbol-table*)
                     (when (and found
@@ -1599,7 +1621,19 @@ core and return a descriptor to it."
                       (warn "redefining ~S from #X~X to #X~X"
                             name old-value value)))
                   (/show "adding to *cold-foreign-symbol-table*:" name value)
-                  (setf (gethash name *cold-foreign-symbol-table*) value))))))
+                  (setf (gethash name *cold-foreign-symbol-table*) value)
+                  #!+win32
+                  (let ((at-position (position #\@ name)))
+                    (when at-position
+                      (let ((name (subseq name 0 at-position)))
+                        (multiple-value-bind (old-value found)
+                            (gethash name *cold-foreign-symbol-table*)
+                          (when (and found
+                                     (not (= old-value value)))
+                            (warn "redefining ~S from #X~X to #X~X"
+                                  name old-value value)))
+                        (setf (gethash name *cold-foreign-symbol-table*)
+                              value)))))))))
   (values))     ;; PROGN
 
 (defun cold-foreign-symbol-address (name)
@@ -1895,6 +1929,22 @@ core and return a descriptor to it."
       (when value
         (do-cold-fixup (second fixup) (third fixup) value (fourth fixup))))))
 
+#!+sb-dynamic-core
+(progn
+  (defparameter *dyncore-address* sb!vm::linkage-table-space-start)
+  (defparameter *dyncore-linkage-keys* nil)
+  (defparameter *dyncore-table* (make-hash-table :test 'equal))
+
+  (defun dyncore-note-symbol (symbol-name datap)
+    "Register a symbol and return its address in proto-linkage-table."
+    (let ((key (cons symbol-name datap)))
+      (symbol-macrolet ((entry (gethash key *dyncore-table*)))
+        (or entry
+            (setf entry
+                  (prog1 *dyncore-address*
+                    (push key *dyncore-linkage-keys*)
+                    (incf *dyncore-address* sb!vm::linkage-table-entry-size))))))))
+
 ;;; *COLD-FOREIGN-SYMBOL-TABLE* becomes *!INITIAL-FOREIGN-SYMBOLS* in
 ;;; the core. When the core is loaded, !LOADER-COLD-INIT uses this to
 ;;; create *STATIC-FOREIGN-SYMBOLS*, which the code in
@@ -1902,15 +1952,25 @@ core and return a descriptor to it."
 (defun foreign-symbols-to-core ()
   (let ((symbols nil)
         (result *nil-descriptor*))
-    (maphash (lambda (symbol value)
-               (push (cons symbol value) symbols))
-             *cold-foreign-symbol-table*)
-    (setq symbols (sort symbols #'string< :key #'car))
-    (dolist (symbol symbols)
-      (cold-push (cold-cons (base-string-to-core (car symbol))
-                            (number-to-core (cdr symbol)))
-                 result))
-    (cold-set (cold-intern 'sb!kernel:*!initial-foreign-symbols*) result))
+    #!-sb-dynamic-core
+    (progn
+      (maphash (lambda (symbol value)
+                 (push (cons symbol value) symbols))
+               *cold-foreign-symbol-table*)
+      (setq symbols (sort symbols #'string< :key #'car))
+      (dolist (symbol symbols)
+        (cold-push (cold-cons (base-string-to-core (car symbol))
+                              (number-to-core (cdr symbol)))
+                   result)))
+    (cold-set (cold-intern 'sb!kernel:*!initial-foreign-symbols*) result)
+    #!+sb-dynamic-core
+    (let ((runtime-linking-list *nil-descriptor*))
+      (dolist (symbol *dyncore-linkage-keys*)
+        (cold-push (cold-cons (base-string-to-core (car symbol))
+                              (cdr symbol))
+                   runtime-linking-list))
+      (cold-set (cold-intern 'sb!vm::*required-runtime-c-symbols*)
+                runtime-linking-list)))
   (let ((result *nil-descriptor*))
     (dolist (rtn (sort (copy-list *cold-assembler-routines*) #'string< :key #'car))
       (cold-push (cold-cons (cold-intern (car rtn))
@@ -1927,8 +1987,6 @@ core and return a descriptor to it."
   ;; which aren't appropriate for cold load will be destructively
   ;; modified.
   (copy-seq *fop-funs*))
-
-(defvar *normal-fop-funs*)
 
 ;;; Cause a fop to have a special definition for cold load.
 ;;;
@@ -1973,8 +2031,7 @@ core and return a descriptor to it."
 (defun cold-load (filename)
   #!+sb-doc
   "Load the file named by FILENAME into the cold load image being built."
-  (let* ((*normal-fop-funs* *fop-funs*)
-         (*fop-funs* *cold-fop-funs*)
+  (let* ((*fop-funs* *cold-fop-funs*)
          (*cold-load-filename* (etypecase filename
                                  (string filename)
                                  (pathname (namestring filename)))))
@@ -1988,17 +2045,8 @@ core and return a descriptor to it."
 (define-cold-fop (fop-short-character)
   (make-character-descriptor (read-byte-arg)))
 
-(define-cold-fop (fop-empty-list) *nil-descriptor*)
-(define-cold-fop (fop-truth) (cold-intern t))
-
-(define-cold-fop (fop-normal-load :stackp nil)
-  (setq *fop-funs* *normal-fop-funs*))
-
-(define-fop (fop-maybe-cold-load 82 :stackp nil)
-  (when *cold-load-filename*
-    (setq *fop-funs* *cold-fop-funs*)))
-
-(define-cold-fop (fop-maybe-cold-load :stackp nil))
+(define-cold-fop (fop-empty-list) nil)
+(define-cold-fop (fop-truth) t)
 
 (clone-cold-fop (fop-struct)
                 (fop-small-struct)
@@ -2097,14 +2145,14 @@ core and return a descriptor to it."
 (defun cold-load-symbol (size package)
   (let ((string (make-string size)))
     (read-string-as-bytes *fasl-input-stream* string)
-    (cold-intern (intern string package))))
+    (intern string package)))
 
 (macrolet ((frob (name pname-len package-len)
              `(define-cold-fop (,name)
                 (let ((index (read-arg ,package-len)))
                   (push-fop-table
                    (cold-load-symbol (read-arg ,pname-len)
-                                     (svref *current-fop-table* index)))))))
+                                     (ref-fop-table index)))))))
   (frob fop-symbol-in-package-save #.sb!vm:n-word-bytes #.sb!vm:n-word-bytes)
   (frob fop-small-symbol-in-package-save 1 #.sb!vm:n-word-bytes)
   (frob fop-symbol-in-byte-package-save #.sb!vm:n-word-bytes 1)
@@ -2125,6 +2173,15 @@ core and return a descriptor to it."
     (read-string-as-bytes *fasl-input-stream* name)
     (let ((symbol-des (allocate-symbol name)))
       (push-fop-table symbol-des))))
+
+;;;; cold fops for loading packages
+
+(clone-cold-fop (fop-named-package-save :stackp nil)
+                (fop-small-named-package-save)
+  (let* ((size (clone-arg))
+         (name (make-string size)))
+    (read-string-as-bytes *fasl-input-stream* name)
+    (push-fop-table (find-package name))))
 
 ;;;; cold fops for loading lists
 
@@ -2276,16 +2333,15 @@ core and return a descriptor to it."
     (let ((total-elements 1))
       (dotimes (axis rank)
         (let ((dim (pop-stack)))
-          (unless (or (= (descriptor-lowtag dim) sb!vm:even-fixnum-lowtag)
-                      (= (descriptor-lowtag dim) sb!vm:odd-fixnum-lowtag))
+          (unless (is-fixnum-lowtag (descriptor-lowtag dim))
             (error "non-fixnum dimension? (~S)" dim))
           (setf total-elements
                 (* total-elements
                    (logior (ash (descriptor-high dim)
                                 (- descriptor-low-bits
-                                   (1- sb!vm:n-lowtag-bits)))
+                                   sb!vm:n-fixnum-tag-bits))
                            (ash (descriptor-low dim)
-                                (- 1 sb!vm:n-lowtag-bits)))))
+                                sb!vm:n-fixnum-tag-bits))))
           (write-wordindexed result
                              (+ sb!vm:array-dimensions-offset axis)
                              dim)))
@@ -2363,17 +2419,17 @@ core and return a descriptor to it."
 ;;;; cold fops for fixing up circularities
 
 (define-cold-fop (fop-rplaca :pushp nil)
-  (let ((obj (svref *current-fop-table* (read-word-arg)))
+  (let ((obj (ref-fop-table (read-word-arg)))
         (idx (read-word-arg)))
     (write-memory (cold-nthcdr idx obj) (pop-stack))))
 
 (define-cold-fop (fop-rplacd :pushp nil)
-  (let ((obj (svref *current-fop-table* (read-word-arg)))
+  (let ((obj (ref-fop-table (read-word-arg)))
         (idx (read-word-arg)))
     (write-wordindexed (cold-nthcdr idx obj) 1 (pop-stack))))
 
 (define-cold-fop (fop-svset :pushp nil)
-  (let ((obj (svref *current-fop-table* (read-word-arg)))
+  (let ((obj (ref-fop-table (read-word-arg)))
         (idx (read-word-arg)))
     (write-wordindexed obj
                    (+ idx
@@ -2383,7 +2439,7 @@ core and return a descriptor to it."
                    (pop-stack))))
 
 (define-cold-fop (fop-structset :pushp nil)
-  (let ((obj (svref *current-fop-table* (read-word-arg)))
+  (let ((obj (ref-fop-table (read-word-arg)))
         (idx (read-word-arg)))
     (write-wordindexed obj (1+ idx) (pop-stack))))
 
@@ -2566,6 +2622,12 @@ core and return a descriptor to it."
          (len (read-byte-arg))
          (sym (make-string len)))
     (read-string-as-bytes *fasl-input-stream* sym)
+    #!+sb-dynamic-core
+    (let ((offset (read-word-arg))
+          (value (dyncore-note-symbol sym nil)))
+      (do-cold-fixup code-object offset value kind))
+    #!- (and) (format t "Bad non-plt fixup: ~S~S~%" sym code-object)
+    #!-sb-dynamic-core
     (let ((offset (read-word-arg))
           (value (cold-foreign-symbol-address sym)))
       (do-cold-fixup code-object offset value kind))
@@ -2578,10 +2640,17 @@ core and return a descriptor to it."
          (len (read-byte-arg))
          (sym (make-string len)))
     (read-string-as-bytes *fasl-input-stream* sym)
-    (maphash (lambda (k v)
-               (format *error-output* "~&~S = #X~8X~%" k v))
-             *cold-foreign-symbol-table*)
-    (error "shared foreign symbol in cold load: ~S (~S)" sym kind)))
+    #!+sb-dynamic-core
+    (let ((offset (read-word-arg))
+          (value (dyncore-note-symbol sym t)))
+      (do-cold-fixup code-object offset value kind)
+      code-object)
+    #!-sb-dynamic-core
+    (progn
+      (maphash (lambda (k v)
+                 (format *error-output* "~&~S = #X~8X~%" k v))
+               *cold-foreign-symbol-table*)
+      (error "shared foreign symbol in cold load: ~S (~S)" sym kind))))
 
 (define-cold-fop (fop-assembler-code)
   (let* ((length (read-word-arg))
@@ -2763,7 +2832,11 @@ core and return a descriptor to it."
                                                   priority)))
                      ;; machinery for new-style SBCL Lisp-to-C naming
                      (record-with-translated-name (priority large)
-                       (record (c-name name) priority (if large "LU" "")))
+                       (record (c-name name) priority
+                               (if large
+                                   #!+(and win32 x86-64) "LLU"
+                                   #!-(and win32 x86-64) "LU"
+                                   "")))
                      (maybe-record-with-translated-name (suffixes priority &key large)
                        (when (some (lambda (suffix)
                                      (tailwise-equal name suffix))
@@ -2776,9 +2849,12 @@ core and return a descriptor to it."
               (maybe-record-with-munged-name "-SUBTYPE" "subtype_" 4)
               (maybe-record-with-munged-name "-SC-NUMBER" "sc_" 5)
               (maybe-record-with-translated-name '("-SIZE") 6)
-              (maybe-record-with-translated-name '("-START" "-END" "-PAGE-BYTES") 7 :large t)
+              (maybe-record-with-translated-name '("-START" "-END" "-PAGE-BYTES"
+                                                   "-CARD-BYTES" "-GRANULARITY")
+                                                 7 :large t)
               (maybe-record-with-translated-name '("-CORE-ENTRY-TYPE-CODE") 8)
               (maybe-record-with-translated-name '("-CORE-SPACE-ID") 9)
+              (maybe-record-with-translated-name '("-CORE-SPACE-ID-FLAG") 9)
               (maybe-record-with-translated-name '("-GENERATION+") 10))))))
     ;; KLUDGE: these constants are sort of important, but there's no
     ;; pleasing way to inform the code above about them.  So we fake
@@ -2801,7 +2877,8 @@ core and return a descriptor to it."
       (push (list (c-symbol-name c)
                   9
                   (symbol-value c)
-                  "LU"
+                  #!+(and win32 x86-64) "LLU"
+                  #!-(and win32 x86-64) "LU"
                   nil)
             constants))
     (setf constants
@@ -2832,7 +2909,9 @@ core and return a descriptor to it."
         (unless (eq nil (car current-error))
           (format t "#define ~A ~D~%"
                   (c-symbol-name (car current-error))
-                  i)))))
+                  i))))
+    (format t "#define INTERNAL_ERROR_NAMES \\~%~{~S~#[~:;, \\~%~]~}~%"
+            (map 'list #'cdr internal-errors)))
   (terpri)
 
   ;; I'm not really sure why this is in SB!C, since it seems
@@ -2856,6 +2935,10 @@ core and return a descriptor to it."
   ;; possibly this is another candidate for a rename (to
   ;; pseudo-atomic-trap-number or pseudo-atomic-magic-constant
   ;; [possibly applicable to other platforms])
+
+  #!+sb-safepoint
+  (format t "#define GC_SAFEPOINT_PAGE_ADDR ((void*)0x~XUL) /* ~:*~A */~%"
+            sb!vm:gc-safepoint-page-addr)
 
   (dolist (symbol '(sb!vm::float-traps-byte
                     sb!vm::float-exceptions-byte
@@ -2917,14 +3000,14 @@ core and return a descriptor to it."
   (format t "/* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG~%")
   (format t " * so they work directly on tagged addresses. */~2%")
   (let ((name (sb!vm:primitive-object-name obj))
-        (lowtag (eval (sb!vm:primitive-object-lowtag obj))))
-    (when lowtag
-      (dolist (slot (sb!vm:primitive-object-slots obj))
-        (format t "#define ~A_~A_OFFSET ~D~%"
-                (c-symbol-name name)
-                (c-symbol-name (sb!vm:slot-name slot))
-                (- (* (sb!vm:slot-offset slot) sb!vm:n-word-bytes) lowtag)))
-      (terpri)))
+        (lowtag (or (symbol-value (sb!vm:primitive-object-lowtag obj))
+                    0)))
+    (dolist (slot (sb!vm:primitive-object-slots obj))
+      (format t "#define ~A_~A_OFFSET ~D~%"
+              (c-symbol-name name)
+              (c-symbol-name (sb!vm:slot-name slot))
+              (- (* (sb!vm:slot-offset slot) sb!vm:n-word-bytes) lowtag)))
+    (terpri))
   (format t "#endif /* LANGUAGE_ASSEMBLY */~2%"))
 
 (defun write-structure-object (dd)
@@ -3008,7 +3091,9 @@ initially undefined function references:~2%")
 
       (setf undefs (sort undefs #'string< :key #'fun-name-block-name))
       (dolist (name undefs)
-        (format t "~S~%" name)))
+        (format t "~8,'0X: ~S~%"
+                (descriptor-bits (gethash name *cold-fdefn-objects*))
+                name)))
 
     (format t "~%~|~%layout names:~2%")
     (collect ((stuff))
@@ -3042,8 +3127,6 @@ initially undefined function references:~2%")
 (defconstant new-directory-core-entry-type-code 3861)
 (defconstant initial-fun-core-entry-type-code 3863)
 (defconstant page-table-core-entry-type-code 3880)
-#!+(and sb-lutex sb-thread)
-(defconstant lutex-table-core-entry-type-code 3887)
 (defconstant end-core-entry-type-code 3840)
 
 (declaim (ftype (function (sb!vm:word) sb!vm:word) write-word))
@@ -3210,7 +3293,10 @@ initially undefined function references:~2%")
                       symbol-table-file-name
                       core-file-name
                       map-file-name
-                      c-header-dir-name)
+                      c-header-dir-name
+                      #+nil (list-objects t))
+  #!+sb-dynamic-core
+  (declare (ignorable symbol-table-file-name))
 
   (format t
           "~&beginning GENESIS, ~A~%"
@@ -3224,10 +3310,18 @@ initially undefined function references:~2%")
 
   (let ((*cold-foreign-symbol-table* (make-hash-table :test 'equal)))
 
+    #!-sb-dynamic-core
     (when core-file-name
       (if symbol-table-file-name
           (load-cold-foreign-symbol-table symbol-table-file-name)
           (error "can't output a core file without symbol table file input")))
+
+    #!+sb-dynamic-core
+    (progn
+      (setf (gethash (extern-alien-name "undefined_tramp")
+                     *cold-foreign-symbol-table*)
+            (dyncore-note-symbol "undefined_tramp" nil))
+      (dyncore-note-symbol "undefined_alien_function" nil))
 
     ;; Now that we've successfully read our only input file (by
     ;; loading the symbol table, if any), it's a good time to ensure
@@ -3324,7 +3418,7 @@ initially undefined function references:~2%")
                    ;; nothing if NAME is NIL.
                    (chill (name)
                      (when name
-                       (cold-intern (intern name package) package))))
+                       (cold-intern (intern name package) :package package))))
             (mapc-on-tree #'chill (sb-cold:package-data-export pd))
             (mapc #'chill (sb-cold:package-data-reexport pd))
             (dolist (sublist (sb-cold:package-data-import-from pd))

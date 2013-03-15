@@ -34,6 +34,26 @@
 (defstruct (unknown-type (:include hairy-type)
                          (:copier nil)))
 
+(defun maybe-reparse-specifier (type)
+  (when (unknown-type-p type)
+    (let* ((spec (unknown-type-specifier type))
+           (name (if (consp spec)
+                     (car spec)
+                     spec)))
+      (when (info :type :kind name)
+        (let ((new-type (specifier-type spec)))
+          (unless (unknown-type-p new-type)
+            new-type))))))
+
+;;; Evil macro.
+(defmacro maybe-reparse-specifier! (type)
+  (assert (symbolp type))
+  (with-unique-names (new-type)
+    `(let ((,new-type (maybe-reparse-specifier ,type)))
+       (when ,new-type
+         (setf ,type ,new-type)
+         t))))
+
 (defstruct (negation-type (:include ctype
                                     (class-info (type-class-or-lose 'negation))
                                     ;; FIXME: is this right?  It's
@@ -81,7 +101,7 @@
                                        (subseq optional 0 (1+ last-not-rest))))
                                 rest))))
 
-(defun args-types (lambda-list-like-thing)
+(defun parse-args-types (lambda-list-like-thing)
   (multiple-value-bind
         (required optional restp rest keyp keys allowp auxp aux
                   morep more-context more-count llk-p)
@@ -114,7 +134,13 @@
             (:include args-type
                       (class-info (type-class-or-lose 'values)))
             (:constructor %make-values-type)
+            (:predicate %values-type-p)
             (:copier nil)))
+
+(declaim (inline value-type-p))
+(defun values-type-p (x)
+  (or (eq x *wild-type*)
+      (%values-type-p x)))
 
 (defun-cached (make-values-type-cached
                :hash-bits 8
@@ -136,34 +162,17 @@
                      :rest rest
                      :allowp allowp))
 
-(defun make-values-type (&key (args nil argsp)
-                         required optional rest allowp)
-  (if argsp
-      (if (eq args '*)
-          *wild-type*
-          (multiple-value-bind (required optional rest keyp keywords allowp
-                                llk-p)
-              (args-types args)
-            (declare (ignore keywords))
-            (when keyp
-              (error "&KEY appeared in a VALUES type specifier ~S."
-                     `(values ,@args)))
-            (if llk-p
-                (make-values-type :required required
-                                  :optional optional
-                                  :rest rest
-                                  :allowp allowp)
-                (make-short-values-type required))))
-      (multiple-value-bind (required optional rest)
-          (canonicalize-args-type-args required optional rest)
-        (cond ((and (null required)
-                    (null optional)
-                    (eq rest *universal-type*))
-               *wild-type*)
-              ((memq *empty-type* required)
-               *empty-type*)
-              (t (make-values-type-cached required optional
-                                          rest allowp))))))
+(defun make-values-type (&key required optional rest allowp)
+  (multiple-value-bind (required optional rest)
+      (canonicalize-args-type-args required optional rest)
+    (cond ((and (null required)
+                (null optional)
+                (eq rest *universal-type*))
+           *wild-type*)
+          ((memq *empty-type* required)
+           *empty-type*)
+          (t (make-values-type-cached required optional
+                                      rest allowp)))))
 
 (!define-type-class values)
 
@@ -171,44 +180,18 @@
 (defstruct (fun-type (:include args-type
                                (class-info (type-class-or-lose 'function)))
                      (:constructor
-                      %make-fun-type (&key required optional rest
-                                           keyp keywords allowp
-                                           wild-args
-                                           returns
-                                      &aux (rest (if (eq rest *empty-type*)
-                                                     nil
-                                                     rest)))))
+                      make-fun-type (&key required optional rest
+                                          keyp keywords allowp
+                                          wild-args
+                                          returns
+                                     &aux (rest (if (eq rest *empty-type*)
+                                                    nil
+                                                    rest)))))
   ;; true if the arguments are unrestrictive, i.e. *
   (wild-args nil :type boolean)
   ;; type describing the return values. This is a values type
   ;; when multiple values were specified for the return.
   (returns (missing-arg) :type ctype))
-(defun make-fun-type (&rest initargs
-                      &key (args nil argsp) returns &allow-other-keys)
-  (if argsp
-      (if (eq args '*)
-          (if (eq returns *wild-type*)
-              (specifier-type 'function)
-              (%make-fun-type :wild-args t :returns returns))
-          (multiple-value-bind (required optional rest keyp keywords allowp)
-              (args-types args)
-            (if (and (null required)
-                     (null optional)
-                     (eq rest *universal-type*)
-                     (not keyp))
-                (if (eq returns *wild-type*)
-                    (specifier-type 'function)
-                    (%make-fun-type :wild-args t :returns returns))
-                (%make-fun-type :required required
-                                :optional optional
-                                :rest rest
-                                :keyp keyp
-                                :keywords keywords
-                                :allowp allowp
-                                :returns returns))))
-      ;; FIXME: are we really sure that we won't make something that
-      ;; looks like a completely wild function here?
-      (apply #'%make-fun-type initargs)))
 
 ;;; The CONSTANT-TYPE structure represents a use of the CONSTANT-ARG
 ;;; "type specifier", which is only meaningful in function argument
@@ -566,10 +549,14 @@
               ((orig equal-but-no-car-recursion))
   (let ((u (uncross orig)))
     (or (info :type :builtin u)
-        (let ((spec (type-expand u)))
+        (let ((spec (typexpand u)))
           (cond
            ((and (not (eq spec u))
                  (info :type :builtin spec)))
+           ((and (consp spec) (symbolp (car spec))
+                 (info :type :builtin (car spec))
+                 (let ((expander (info :type :expander (car spec))))
+                   (and expander (values-specifier-type (funcall expander spec))))))
            ((eq (info :type :kind spec) :instance)
             (find-classoid spec))
            ((typep spec 'classoid)
@@ -591,7 +578,11 @@
                                 (not (eq (info :type :kind spec)
                                          :forthcoming-defclass-type)))
                        (signal 'parse-unknown-type :specifier spec))
-                     ;; (The RETURN-FROM here inhibits caching.)
+                     ;; (The RETURN-FROM here inhibits caching; this
+                     ;; does not only make sense from a compiler
+                     ;; diagnostics point of view but is also
+                     ;; indispensable for proper workingness of
+                     ;; VALID-TYPE-SPECIFIER-P.)
                      (return-from values-specifier-type
                        (make-unknown-type :specifier spec)))
                     (t
@@ -614,25 +605,113 @@
       *universal-type*
       (specifier-type x)))
 
-;;; Similar to MACROEXPAND, but expands DEFTYPEs. We don't bother
-;;; returning a second value.
-(defun type-expand (form)
-  (let ((def (cond ((symbolp form)
-                    (info :type :expander form))
-                   ((and (consp form) (symbolp (car form)))
-                    (info :type :expander (car form)))
-                   (t nil))))
-    (if def
-        (type-expand (funcall def (if (consp form) form (list form))))
-        form)))
+(defun typexpand-1 (type-specifier &optional env)
+  #!+sb-doc
+  "Takes and expands a type specifier once like MACROEXPAND-1.
+Returns two values: the expansion, and a boolean that is true when
+expansion happened."
+  (declare (type type-specifier type-specifier))
+  (declare (ignore env))
+  (multiple-value-bind (expander lspec)
+      (let ((spec type-specifier))
+        (cond ((and (symbolp spec) (info :type :builtin spec))
+               ;; We do not expand builtins even though it'd be
+               ;; possible to do so sometimes (e.g. STRING) for two
+               ;; reasons:
+               ;;
+               ;; a) From a user's point of view, CL types are opaque.
+               ;;
+               ;; b) so (EQUAL (TYPEXPAND 'STRING) (TYPEXPAND-ALL 'STRING))
+               (values nil nil))
+              ((symbolp spec)
+               (values (info :type :expander spec) (list spec)))
+              ((and (consp spec) (symbolp (car spec)) (info :type :builtin (car spec)))
+               ;; see above
+               (values nil nil))
+              ((and (consp spec) (symbolp (car spec)))
+               (values (info :type :expander (car spec)) spec))
+              (t nil)))
+    (if expander
+        (values (funcall expander lspec) t)
+        (values type-specifier nil))))
+
+(defun typexpand (type-specifier &optional env)
+  #!+sb-doc
+  "Takes and expands a type specifier repeatedly like MACROEXPAND.
+Returns two values: the expansion, and a boolean that is true when
+expansion happened."
+  (declare (type type-specifier type-specifier))
+  (multiple-value-bind (expansion flag)
+      (typexpand-1 type-specifier env)
+    (if flag
+        (values (typexpand expansion env) t)
+        (values expansion flag))))
+
+(defun typexpand-all (type-specifier &optional env)
+  #!+sb-doc
+  "Takes and expands a type specifier recursively like MACROEXPAND-ALL."
+  (declare (type type-specifier type-specifier))
+  (declare (ignore env))
+  ;; I first thought this would not be a good implementation because
+  ;; it signals an error on e.g. (CONS 1 2) until I realized that
+  ;; walking and calling TYPEXPAND would also result in errors, and
+  ;; it actually makes sense.
+  ;;
+  ;; There's still a small problem in that
+  ;;   (TYPEXPAND-ALL '(CONS * FIXNUM)) => (CONS T FIXNUM)
+  ;; whereas walking+typexpand would result in (CONS * FIXNUM).
+  ;;
+  ;; Similiarly, (TYPEXPAND-ALL '(FUNCTION (&REST T) *)) => FUNCTION.
+  (type-specifier (values-specifier-type type-specifier)))
+
+(defun defined-type-name-p (name &optional env)
+  #!+sb-doc
+  "Returns T if NAME is known to name a type specifier, otherwise NIL."
+  (declare (symbol name))
+  (declare (ignore env))
+  (and (info :type :kind name) t))
+
+(defun valid-type-specifier-p (type-specifier &optional env)
+  #!+sb-doc
+  "Returns T if TYPE-SPECIFIER is a valid type specifier, otherwise NIL.
+
+There may be different metrics on what constitutes a \"valid type
+specifier\" depending on context. If this function does not suit your
+exact need, you may be able to craft a particular solution using a
+combination of DEFINED-TYPE-NAME-P and the TYPEXPAND functions.
+
+The definition of \"valid type specifier\" employed by this function
+is based on the following mnemonic:
+
+          \"Would TYPEP accept it as second argument?\"
+
+Except that unlike TYPEP, this function fully supports compound
+FUNCTION type specifiers, and the VALUES type specifier, too.
+
+In particular, VALID-TYPE-SPECIFIER-P will return NIL if
+TYPE-SPECIFIER is not a class, not a symbol that is known to name a
+type specifier, and not a cons that represents a known compound type
+specifier in a syntactically and recursively correct way.
+
+Examples:
+
+  (valid-type-specifier-p '(cons * *))     => T
+  (valid-type-specifier-p '#:foo)          => NIL
+  (valid-type-specifier-p '(cons * #:foo)) => NIL
+  (valid-type-specifier-p '(cons 1 *)      => NIL
+
+Experimental."
+  (declare (ignore env))
+  (handler-case (prog1 t (values-specifier-type type-specifier))
+    (parse-unknown-type () nil)
+    (error () nil)))
 
 ;;; Note that the type NAME has been (re)defined, updating the
 ;;; undefined warnings and VALUES-SPECIFIER-TYPE cache.
 (defun %note-type-defined (name)
   (declare (symbol name))
   (note-name-defined name :type)
-  (when (boundp 'sb!kernel::*values-specifier-type-cache-vector*)
-    (values-specifier-type-cache-clear))
+  (values-specifier-type-cache-clear)
   (values))
 
 

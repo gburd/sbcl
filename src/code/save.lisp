@@ -21,13 +21,17 @@
   (file c-string)
   (initial-fun (unsigned #.sb!vm:n-word-bits))
   (prepend-runtime int)
-  (save-runtime-options int))
+  (save-runtime-options int)
+  (compressed int)
+  (compression-level int))
 
 #!+gencgc
 (define-alien-routine "gc_and_save" void
   (file c-string)
   (prepend-runtime int)
-  (save-runtime-options int))
+  (save-runtime-options int)
+  (compressed int)
+  (compression-level int))
 
 #!+gencgc
 (defvar sb!vm::*restart-lisp-function*)
@@ -38,7 +42,8 @@
                                          (save-runtime-options nil)
                                          (purify t)
                                          (root-structures ())
-                                         (environment-name "auxiliary"))
+                                         (environment-name "auxiliary")
+                                         (compression nil))
   #!+sb-doc
   "Save a \"core image\", i.e. enough information to restart a Lisp
 process later in the same state, in the file of the specified name.
@@ -50,7 +55,10 @@ The following &KEY arguments are defined:
      The function to run when the created core file is resumed. The
      default function handles command line toplevel option processing
      and runs the top level read-eval-print loop. This function returning
-     is equivalent to (SB-EXT:QUIT :UNIX-STATUS 0) being called.
+     is equivalent to (SB-EXT:EXIT :CODE 0) being called.
+
+     TOPLEVEL functions should always provide an ABORT restart: otherwise
+     code they call will run without one.
 
   :EXECUTABLE
      If true, arrange to combine the SBCL runtime and the core image
@@ -85,6 +93,13 @@ The following &KEY arguments are defined:
      This is also passed to the PURIFY function when :PURIFY is T.
      (rarely used)
 
+  :COMPRESSION
+     This is only meaningful if the runtime was built with the :SB-CORE-COMPRESSION
+     feature enabled. If NIL (the default), saves to uncompressed core files. If
+     :SB-CORE-COMPRESSION was enabled at build-time, the argument may also be
+     an integer from -1 to 9, corresponding to zlib compression levels, or T
+     (which is equivalent to the default compression level, -1).
+
 The save/load process changes the values of some global variables:
 
   *STANDARD-OUTPUT*, *DEBUG-IO*, etc.
@@ -116,6 +131,13 @@ seem to be good quick fixes for either limitation and no one has been
 sufficiently motivated to do lengthy fixes."
   #!+gencgc
   (declare (ignore purify root-structures environment-name))
+  #!+sb-core-compression
+  (check-type compression (or boolean (integer -1 9)))
+  #!-sb-core-compression
+  (when compression
+    (error "Unable to save compressed core: this runtime was not built with zlib support"))
+  (when (eql t compression)
+    (setf compression -1))
   (tune-hashtable-sizes-of-all-packages)
   (deinit)
   ;; FIXME: Would it be possible to unmix the PURIFY logic from this
@@ -126,9 +148,7 @@ sufficiently motivated to do lengthy fixes."
              (handling-end-of-the-world
                (reinit)
                #!+hpux (sb!sys:%primitive sb!vm::setup-return-from-lisp-stub)
-               (progn
-                 (funcall toplevel)
-                 (sb!ext:quit))))
+               (funcall toplevel)))
            (foreign-bool (value)
              (if value 1 0))
            (save-core (gc)
@@ -143,12 +163,16 @@ sufficiently motivated to do lengthy fixes."
                  ;; since the GC will invalidate the stack.
                  #!+gencgc (gc-and-save name
                                         (foreign-bool executable)
-                                        (foreign-bool save-runtime-options)))
+                                        (foreign-bool save-runtime-options)
+                                        (foreign-bool compression)
+                                        (or compression 0)))
                (without-gcing
                  (save name
                        (get-lisp-obj-address #'restart-lisp)
                        (foreign-bool executable)
-                       (foreign-bool save-runtime-options))))))
+                       (foreign-bool save-runtime-options)
+                       (foreign-bool compression)
+                       (or compression 0))))))
     ;; Save the restart function into a static symbol, to allow GC-AND-SAVE
     ;; access to it even after the GC has moved it.
     #!+gencgc
@@ -162,10 +186,16 @@ sufficiently motivated to do lengthy fixes."
            ;; Compact the environment even though we're skipping the
            ;; other purification stages.
            (sb!kernel::compact-environment-aux "Auxiliary" 200)
-           (save-core t)))))
+           (save-core t)))
+    ;; Something went very wrong -- reinitialize to have a prayer
+    ;; of being able to report the error.
+    (reinit)
+    (error "Could not save core.")))
 
 (defun deinit ()
   (call-hooks "save" *save-hooks*)
+  #!+sb-wtimer
+  (itimer-emulation-deinit)
   (when (rest (sb!thread:list-all-threads))
     (error "Cannot save core with multiple threads running."))
   (float-deinit)
@@ -173,4 +203,5 @@ sufficiently motivated to do lengthy fixes."
   (debug-deinit)
   (foreign-deinit)
   (stream-deinit)
-  (deinit-finalizers))
+  (deinit-finalizers)
+  (drop-all-hash-caches))

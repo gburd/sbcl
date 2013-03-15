@@ -17,11 +17,11 @@
 
 struct ndir_entry {
 #ifndef LISP_FEATURE_ALPHA
-    long identifier;
-    long nwords;
-    long data_page;
-    long address;
-    long page_count;
+    sword_t identifier;
+    sword_t nwords;
+    sword_t data_page;
+    sword_t address;
+    sword_t page_count;
 #else
     u32 identifier;
     u32 nwords;
@@ -30,6 +30,16 @@ struct ndir_entry {
     u32 page_count;
 #endif
 };
+
+/* Tri-state flag to determine whether we attempt to mark pages
+ * as targets for virtual memory deduplication (ala MADV_MERGEABLE
+ * on Linux).
+ *
+ * 1: Yes
+ * 0: No
+ * -1: default, yes for compressed cores, no otherwise.
+ */
+extern int merge_core_pages;
 
 extern lispobj load_core_file(char *file, os_vm_offset_t offset);
 extern os_vm_offset_t search_for_embedded_core(char *file);

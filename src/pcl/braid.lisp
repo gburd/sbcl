@@ -85,6 +85,28 @@
           (allocate-standard-funcallable-instance-slots
            wrapper slots-init-p slots-init))
     fin))
+
+(defun classify-slotds (slotds)
+  (let (instance-slots class-slots custom-slots bootp)
+    (dolist (slotd slotds)
+      (let ((alloc (cond ((consp slotd) ; bootstrap
+                          (setf bootp t)
+                          :instance)
+                         (t
+                          (slot-definition-allocation slotd)))))
+        (case alloc
+          (:instance
+           (push slotd instance-slots))
+          (:class
+           (push slotd class-slots))
+          (t
+           (push slotd custom-slots)))))
+    (values (if bootp
+                (nreverse instance-slots)
+                (when slotds
+                  (sort instance-slots #'< :key #'slot-definition-location)))
+            class-slots
+            custom-slots)))
 
 ;;;; BOOTSTRAP-META-BRAID
 ;;;;
@@ -96,7 +118,7 @@
                  (let ((wr (format-symbol *pcl-package* "~A-WRAPPER" class)))
                    `(setf ,wr ,(if (eq class 'standard-generic-function)
                                    '*sgf-wrapper*
-                                   `(boot-make-wrapper
+                                   `(!boot-make-wrapper
                                      (early-class-size ',class)
                                      ',class))
                           ,class (allocate-standard-instance
@@ -177,7 +199,7 @@
                                   ((eq class standard-generic-function)
                                    standard-generic-function-wrapper)
                                   (t
-                                   (boot-make-wrapper (length slots) name))))
+                                   (!boot-make-wrapper (length slots) name))))
                    (proto nil))
               (when (eq name t) (setq *the-wrapper-of-t* wrapper))
               (set (make-class-symbol name) class)
@@ -186,11 +208,8 @@
                   (error "Slot allocation ~S is not supported in bootstrap."
                          (getf slot :allocation))))
 
-              (when (typep wrapper 'wrapper)
-                (setf (wrapper-instance-slots-layout wrapper)
-                      (mapcar #'canonical-slot-name slots))
-                (setf (wrapper-class-slots wrapper)
-                      ()))
+              (when (wrapper-p wrapper)
+                (setf (wrapper-slots wrapper) slots))
 
               (setq proto (if (eq meta 'funcallable-standard-class)
                               (allocate-standard-funcallable-instance wrapper)
@@ -206,6 +225,8 @@
                      standard-effective-slot-definition-wrapper t))
 
               (setf (layout-slot-table wrapper) (make-slot-table class slots t))
+              (when (wrapper-p wrapper)
+                (setf (wrapper-slots wrapper) slots))
 
               (case meta
                 ((standard-class funcallable-standard-class)
@@ -306,7 +327,9 @@
       (setf (layout-slot-table wrapper)
             (make-slot-table class slots
                              (member metaclass-name
-                                     '(standard-class funcallable-standard-class)))))
+                                     '(standard-class funcallable-standard-class))))
+      (when (wrapper-p wrapper)
+        (setf (wrapper-slots wrapper) slots)))
 
     ;; For all direct superclasses SUPER of CLASS, make sure CLASS is
     ;; a direct subclass of SUPER.  Note that METACLASS-NAME doesn't
@@ -367,19 +390,20 @@
       (set-val 'writers      (get-val :writers))
       (set-val 'allocation   :instance)
       (set-val '%type        (or (get-val :type) t))
-      (set-val '%type-check-function (get-val 'type-check-function))
       (set-val '%documentation (or (get-val :documentation) ""))
       (set-val '%class   class)
       (when effective-p
         (set-val 'location index)
-        (let ((fsc-p nil))
-          (set-val 'reader-function (make-optimized-std-reader-method-function
-                                     fsc-p nil slot-name index))
-          (set-val 'writer-function (make-optimized-std-writer-method-function
-                                     fsc-p nil slot-name index))
-          (set-val 'boundp-function (make-optimized-std-boundp-method-function
-                                     fsc-p nil slot-name index)))
-        (set-val 'accessor-flags 7))
+        (set-val 'accessor-flags 7)
+        (set-val
+         'info
+         (make-slot-info
+          :reader
+          (make-optimized-std-reader-method-function nil nil slot-name index)
+          :writer
+          (make-optimized-std-writer-method-function nil nil slot-name index)
+          :boundp
+          (make-optimized-std-boundp-method-function nil nil slot-name index))))
       (when (and (eq name 'standard-class)
                  (eq slot-name 'slots) effective-p)
         (setq *the-eslotd-standard-class-slots* slotd))
@@ -545,11 +569,8 @@
          (let ((accessor (structure-slotd-accessor-symbol slotd)))
            `(:name ,(structure-slotd-name slotd)
              :defstruct-accessor-symbol ,accessor
-             ,@(when (fboundp accessor)
-                 `(:internal-reader-function
-                   ,(structure-slotd-reader-function slotd)
-                   :internal-writer-function
-                   ,(structure-slotd-writer-function name slotd)))
+             :internal-reader-function ,(structure-slotd-reader-function slotd)
+             :internal-writer-function ,(structure-slotd-writer-function name slotd)
              :type ,(or (structure-slotd-type slotd) t)
              :initform ,(structure-slotd-init-form slotd)
              :initfunction ,(eval-form (structure-slotd-init-form slotd)))))

@@ -17,6 +17,14 @@
 #define _GC_INTERNAL_H_
 
 #include <genesis/simple-fun.h>
+#include "thread.h"
+#include "interr.h"
+
+#ifdef LISP_FEATURE_GENCGC
+#include "gencgc-internal.h"
+#else
+#include "cheneygc-internal.h"
+#endif
 
 /* disabling gc assertions made no discernable difference to GC speed,
  * last I tried it - dan 2003.12.21
@@ -46,13 +54,13 @@ do {                                                                   \
 
 #define CEILING(x,y) (((x) + ((y) - 1)) & (~((y) - 1)))
 
-static inline unsigned long
-NWORDS(unsigned long x, unsigned long n_bits)
+static inline uword_t
+NWORDS(uword_t x, uword_t n_bits)
 {
     /* A good compiler should be able to constant-fold this whole thing,
        even with the conditional. */
     if(n_bits <= N_WORD_BITS) {
-        unsigned long elements_per_word = N_WORD_BITS/n_bits;
+        uword_t elements_per_word = N_WORD_BITS/n_bits;
 
         return CEILING(x, elements_per_word)/elements_per_word;
     }
@@ -85,10 +93,10 @@ NWORDS(unsigned long x, unsigned long n_bits)
 #ifdef LISP_FEATURE_GENCGC
 #include "gencgc-alloc-region.h"
 void *
-gc_alloc_with_region(long nbytes,int page_type_flag, struct alloc_region *my_region,
+gc_alloc_with_region(sword_t nbytes,int page_type_flag, struct alloc_region *my_region,
                      int quick_p);
 static inline void *
-gc_general_alloc(long nbytes, int page_type_flag, int quick_p)
+gc_general_alloc(sword_t nbytes, int page_type_flag, int quick_p)
 {
     struct alloc_region *my_region;
     if (UNBOXED_PAGE_FLAG == page_type_flag) {
@@ -101,27 +109,45 @@ gc_general_alloc(long nbytes, int page_type_flag, int quick_p)
     return gc_alloc_with_region(nbytes, page_type_flag, my_region, quick_p);
 }
 #else
-extern void *gc_general_alloc(long nbytes,int page_type_flag,int quick_p);
+extern void *gc_general_alloc(word_t nbytes,int page_type_flag,int quick_p);
 #endif
 
-extern long (*scavtab[256])(lispobj *where, lispobj object);
+static inline lispobj
+gc_general_copy_object(lispobj object, long nwords, int page_type_flag)
+{
+    lispobj *new;
+
+    gc_assert(is_lisp_pointer(object));
+    gc_assert(from_space_p(object));
+    gc_assert((nwords & 0x01) == 0);
+
+    /* Allocate space. */
+    new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag, ALLOC_QUICK);
+
+    /* Copy the object. */
+    memcpy(new,native_pointer(object),nwords*N_WORD_BYTES);
+
+    return make_lispobj(new, lowtag_of(object));
+}
+
+extern sword_t (*scavtab[256])(lispobj *where, lispobj object);
 extern lispobj (*transother[256])(lispobj object);
-extern long (*sizetab[256])(lispobj *where);
+extern sword_t (*sizetab[256])(lispobj *where);
 
 extern struct weak_pointer *weak_pointers; /* in gc-common.c */
 extern struct hash_table *weak_hash_tables; /* in gc-common.c */
 
-extern void scavenge(lispobj *start, long n_words);
-extern void scavenge_interrupt_contexts(void);
+extern void scavenge(lispobj *start, sword_t n_words);
+extern void scavenge_interrupt_contexts(struct thread *thread);
 extern void scav_weak_hash_tables(void);
 extern void scan_weak_hash_tables(void);
 extern void scan_weak_pointers(void);
 
-lispobj  copy_large_unboxed_object(lispobj object, long nwords);
-lispobj  copy_unboxed_object(lispobj object, long nwords);
-lispobj  copy_large_object(lispobj object, long nwords);
-lispobj  copy_object(lispobj object, long nwords);
-lispobj  copy_code_object(lispobj object, long nwords);
+lispobj  copy_large_unboxed_object(lispobj object, sword_t nwords);
+lispobj  copy_unboxed_object(lispobj object, sword_t nwords);
+lispobj  copy_large_object(lispobj object, sword_t nwords);
+lispobj  copy_object(lispobj object, sword_t nwords);
+lispobj  copy_code_object(lispobj object, sword_t nwords);
 
 lispobj *search_read_only_space(void *pointer);
 lispobj *search_static_space(void *pointer);
@@ -129,7 +155,11 @@ lispobj *search_dynamic_space(void *pointer);
 
 lispobj *gc_search_space(lispobj *start, size_t words, lispobj *pointer);
 
-extern void scrub_control_stack();
+extern int looks_like_valid_lisp_pointer_p(lispobj pointer, lispobj *start_addr);
+
+extern void scavenge_control_stack(struct thread *th);
+extern void scrub_control_stack(void);
+extern void scrub_thread_control_stack(struct thread *);
 
 #include "fixnump.h"
 

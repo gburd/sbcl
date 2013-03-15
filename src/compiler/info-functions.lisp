@@ -41,15 +41,28 @@
   ;; legal name?
   (check-fun-name name)
 
-  ;; scrubbing old data I: possible collision with old definition
-  (when (fboundp name)
-    (ecase (info :function :kind name)
-      (:function) ; happy case
-      ((nil)) ; another happy case
-      (:macro ; maybe-not-so-good case
-       (compiler-style-warn "~S was previously defined as a macro." name)
-       (setf (info :function :where-from name) :assumed)
-       (clear-info :function :macro-function name))))
+
+  ;; KLUDGE: This can happen when eg. compiling a NAMED-LAMBDA, and isn't
+  ;; guarded against elsewhere -- so we want to assert package locks here. The
+  ;; reason we do it only when stomping on existing stuff is because we want
+  ;; to keep
+  ;;   (WITHOUT-PACKAGE-LOCKS (DEFUN LOCKED:FOO ...))
+  ;; viable, which requires no compile-time violations in the harmless cases.
+  (with-single-package-locked-error ()
+    (flet ((assert-it ()
+             (assert-symbol-home-package-unlocked name "proclaiming ~S as a function")))
+
+      (let ((kind (info :function :kind name)))
+        ;; scrubbing old data I: possible collision with a macro
+        (when (and (fboundp name) (eq :macro kind))
+          (assert-it)
+          (compiler-style-warn "~S was previously defined as a macro." name)
+          (setf (info :function :where-from name) :assumed)
+          (clear-info :function :macro-function name))
+
+        (unless (eq :function kind)
+          (assert-it)
+          (setf (info :function :kind name) :function)))))
 
   ;; scrubbing old data II: dangling forward references
   ;;
@@ -58,11 +71,9 @@
   ;; in EVAL-WHEN (:COMPILE) inside something like DEFSTRUCT, in which
   ;; case it's reasonable style. Either way, NAME is no longer a free
   ;; function.)
-  (when (boundp '*free-funs*) ; when compiling
+  (when (boundp '*free-funs*)       ; when compiling
     (remhash name *free-funs*))
 
-  ;; recording the ordinary case
-  (setf (info :function :kind name) :function)
   (note-if-setf-fun-and-macro name)
 
   (values))
@@ -95,6 +106,7 @@
       (frob :where-from :assumed)
       (frob :inlinep)
       (frob :kind)
+      (frob :macro-function)
       (frob :inline-expansion-designator)
       (frob :source-transform)
       (frob :structure-accessor)
@@ -130,14 +142,11 @@ only."
   (declare (symbol symbol))
   (let* ((fenv (when env (lexenv-funs env)))
          (local-def (cdr (assoc symbol fenv))))
-    (cond (local-def
-           (if (and (consp local-def) (eq (car local-def) 'macro))
-               (cdr local-def)
-               nil))
-          ((eq (info :function :kind symbol) :macro)
-           (values (info :function :macro-function symbol)))
-          (t
-           nil))))
+    (if local-def
+        (if (and (consp local-def) (eq (car local-def) 'macro))
+            (cdr local-def)
+            nil)
+        (values (info :function :macro-function symbol)))))
 
 (defun (setf sb!xc:macro-function) (function symbol &optional environment)
   (declare (symbol symbol) (type function function))
@@ -151,19 +160,20 @@ only."
            symbol environment))
   (when (eq (info :function :kind symbol) :special-form)
     (error "~S names a special form." symbol))
-  (setf (info :function :kind symbol) :macro)
-  (setf (info :function :macro-function symbol) function)
-  ;; This is a nice thing to have in the target SBCL, but in the
-  ;; cross-compilation host it's not nice to mess with
-  ;; (SYMBOL-FUNCTION FOO) where FOO might be a symbol in the
-  ;; cross-compilation host's COMMON-LISP package.
-  #-sb-xc-host
-  (setf (symbol-function symbol)
-        (lambda (&rest args)
-          (declare (ignore args))
-          ;; (ANSI specification of FUNCALL says that this should be
-          ;; an error of type UNDEFINED-FUNCTION, not just SIMPLE-ERROR.)
-          (error 'undefined-function :name symbol)))
+  (with-single-package-locked-error (:symbol symbol "setting the macro-function of ~S")
+    (setf (info :function :kind symbol) :macro)
+    (setf (info :function :macro-function symbol) function)
+    ;; This is a nice thing to have in the target SBCL, but in the
+    ;; cross-compilation host it's not nice to mess with
+    ;; (SYMBOL-FUNCTION FOO) where FOO might be a symbol in the
+    ;; cross-compilation host's COMMON-LISP package.
+    #-sb-xc-host
+    (setf (symbol-function symbol)
+          (lambda (&rest args)
+            (declare (ignore args))
+            ;; (ANSI specification of FUNCALL says that this should be
+            ;; an error of type UNDEFINED-FUNCTION, not just SIMPLE-ERROR.)
+            (error 'undefined-function :name symbol))))
   function)
 
 (defun fun-locally-defined-p (name env)

@@ -451,13 +451,22 @@
         (t
          `(prin1 ,(expand-next-arg) stream))))
 
-(def-format-directive #\C (colonp atsignp params)
+(def-format-directive #\C (colonp atsignp params string end)
   (expand-bind-defaults () params
-    (if colonp
-        `(format-print-named-character ,(expand-next-arg) stream)
-        (if atsignp
-            `(prin1 ,(expand-next-arg) stream)
-            `(write-char ,(expand-next-arg) stream)))))
+    (let ((n-arg (sb!xc:gensym "ARG")))
+      `(let ((,n-arg ,(expand-next-arg)))
+         (unless (typep ,n-arg 'character)
+           (error 'format-error
+                  :complaint "~s is not of type CHARACTER."
+                  :args (list ,n-arg)
+                  :control-string ,string
+                  :offset ,(1- end)))
+         ,(cond (colonp
+                 `(format-print-named-character ,n-arg stream))
+                (atsignp
+                 `(prin1 ,n-arg stream))
+                (t
+                 `(write-char ,n-arg stream)))))))
 
 (def-format-directive #\W (colonp atsignp params)
   (expand-bind-defaults () params
@@ -497,13 +506,20 @@
 (def-format-directive #\X (colonp atsignp params)
   (expand-format-integer 16 colonp atsignp params))
 
-(def-format-directive #\R (colonp atsignp params)
+(def-format-directive #\R (colonp atsignp params string end)
   (expand-bind-defaults
       ((base nil) (mincol 0) (padchar #\space) (commachar #\,)
        (commainterval 3))
       params
     (let ((n-arg (sb!xc:gensym "ARG")))
       `(let ((,n-arg ,(expand-next-arg)))
+         (unless (or ,base
+                     (integerp ,n-arg))
+           (error 'format-error
+                  :complaint "~s is not of type INTEGER."
+                  :args (list ,n-arg)
+                  :control-string ,string
+                  :offset ,(1- end)))
          (if ,base
              (format-print-integer stream ,n-arg ,colonp ,atsignp
                                    ,base ,mincol
@@ -602,9 +618,10 @@
   (if params
       (expand-bind-defaults ((count 1)) params
         `(progn
-           (fresh-line stream)
-           (dotimes (i (1- ,count))
-             (terpri stream))))
+           (when (plusp ,count)
+             (fresh-line stream)
+             (dotimes (i (1- ,count))
+               (terpri stream)))))
       '(fresh-line stream)))
 
 (def-format-directive #\| (colonp atsignp params)
@@ -1032,7 +1049,7 @@
   (multiple-value-bind (segments first-semi close remaining)
       (parse-format-justification directives)
     (values
-     (if (format-directive-colonp close)
+     (if (format-directive-colonp close) ; logical block vs. justification
          (multiple-value-bind (prefix per-line-p insides suffix)
              (parse-format-logical-block segments colonp first-semi
                                          close params string end)
@@ -1046,6 +1063,16 @@
                     :complaint "~D illegal directive~:P found inside justification block"
                     :args (list count)
                     :references (list '(:ansi-cl :section (22 3 5 2)))))
+           ;; ANSI does not explicitly say that an error should be
+           ;; signalled, but the @ modifier is not explicitly allowed
+           ;; for ~> either.
+           (when (format-directive-atsignp close)
+             (error 'format-error
+                    :complaint "@ modifier not allowed in close ~
+                    directive of justification ~
+                    block (i.e. ~~<...~~@>."
+                    :offset (1- (format-directive-end close))
+                    :references (list '(:ansi-cl :section (22 3 6 2)))))
            (expand-format-justification segments colonp atsignp
                                         first-semi params)))
      remaining)))

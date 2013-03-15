@@ -1,10 +1,9 @@
 #+#.(cl:if (cl:find-package "ASDF") '(or) '(and))
-(load (merge-pathnames "../contrib/asdf/asdf.fasl"))
+(require :asdf)
 
 #+#.(cl:if (cl:find-package "SB-POSIX") '(or) '(and))
-(let ((asdf:*central-registry*
-       (cons "../contrib/systems/" asdf:*central-registry*)))
-  (asdf:oos 'asdf:load-op 'sb-posix))
+(handler-bind (#+win32 (warning #'muffle-warning))
+  (require :sb-posix))
 
 (load "test-util.lisp")
 
@@ -15,8 +14,11 @@
 
 (in-package run-tests)
 
+(load "colorize.lisp")
+
 (defvar *all-failures* nil)
 (defvar *break-on-error* nil)
+(defvar *report-skipped-tests* nil)
 (defvar *accept-files* nil)
 
 (defun run-all ()
@@ -26,6 +28,9 @@
            (setf test-util:*break-on-failure* t))
           ((string= arg "--break-on-expected-failure")
            (setf test-util:*break-on-expected-failure* t))
+          ((string= arg "--report-skipped-tests")
+           (setf *report-skipped-tests* t))
+          ((string= arg "--no-color"))
           (t
            (push (truename (parse-namestring arg)) *accept-files*))))
   (pure-runner (pure-load-files) #'load-test)
@@ -34,34 +39,53 @@
   (impure-runner (impure-cload-files) #'cload-test)
   #-win32 (impure-runner (sh-files) #'sh-test)
   (report)
-  (sb-ext:quit :unix-status (if (unexpected-failures)
-                                1
-                                104)))
+  (sb-ext:exit :code (if (unexpected-failures)
+                         1
+                         104)))
 
 (defun report ()
   (terpri)
   (format t "Finished running tests.~%")
-  (cond (*all-failures*
-         (format t "Status:~%")
-         (dolist (fail (reverse *all-failures*))
-           (cond ((eq (car fail) :unhandled-error)
-                  (format t " ~20a ~a~%"
-                          "Unhandled error"
-                          (enough-namestring (second fail))))
-                 ((eq (car fail) :invalid-exit-status)
-                  (format t " ~20a ~a~%"
-                          "Invalid exit status:"
-                          (enough-namestring (second fail))))
-                 (t
-                  (format t " ~20a ~a / ~a~%"
-                          (ecase (first fail)
-                            (:expected-failure "Expected failure:")
-                            (:unexpected-failure "Failure:")
-                            (:unexpected-success "Unexpected success:"))
-                          (enough-namestring (second fail))
-                          (third fail))))))
-        (t
-         (format t "All tests succeeded~%"))))
+  (let ((skipcount 0)
+        (*print-pretty* nil))
+    (cond (*all-failures*
+           (format t "Status:~%")
+           (dolist (fail (reverse *all-failures*))
+             (cond ((eq (car fail) :unhandled-error)
+                    (output-colored-text (car fail)
+                                          " Unhandled Error")
+                    (format t " ~a~%"
+                            (enough-namestring (second fail))))
+                   ((eq (car fail) :invalid-exit-status)
+                    (output-colored-text (car fail)
+                                          " Invalid exit status:")
+                    (format t " ~a~%"
+                            (enough-namestring (second fail))))
+                   ((eq (car fail) :skipped-disabled)
+                    (when *report-skipped-tests*
+                      (format t " ~20a ~a / ~a~%"
+                              "Skipped (irrelevant):"
+                              (enough-namestring (second fail))
+                              (third fail)))
+                    (incf skipcount))
+                   (t
+                    (output-colored-text
+                     (first fail)
+                     (ecase (first fail)
+                       (:expected-failure " Expected failure:")
+                       (:unexpected-failure " Failure:")
+                       (:leftover-thread " Leftover thread (broken):")
+                       (:unexpected-success " Unexpected success:")
+                       (:skipped-broken " Skipped (broken):")
+                       (:skipped-disabled " Skipped (irrelevant):")))
+                    (format t " ~a / ~a~%"
+                            (enough-namestring (second fail))
+                            (third fail)))))
+           (when (> skipcount 0)
+             (format t " (~a tests skipped for this combination of platform and features)~%"
+                     skipcount)))
+          (t
+           (format t "All tests succeeded~%")))))
 
 (defun pure-runner (files test-fun)
   (format t "// Running pure tests (~a)~%" test-fun)
@@ -78,32 +102,24 @@
     (append-failures)))
 
 (defun run-in-child-sbcl (load-forms forms)
-  (declare (ignorable load-forms))
-  #-win32
-  (let ((pid (sb-posix:fork)))
-    (cond ((= pid 0)
-           (dolist (form forms)
-             (eval form)))
-          (t
-           (let ((status (make-array 1 :element-type '(signed-byte 32))))
-             (sb-posix:waitpid pid 0 status)
-             (if (sb-posix:wifexited (aref status 0))
-                 (sb-posix:wexitstatus (aref status 0))
-                 1)))))
-  #+win32
+  ;; We used to fork() for POSIX platforms, and use this for Windows.
+  ;; However, it seems better to use the same solution everywhere.
   (process-exit-code
-   (sb-ext:run-program
-    (first *POSIX-ARGV*)
-    (append
-     (list "--core" SB-INT:*CORE-STRING*
-           "--noinform"
-           "--no-sysinit"
-           "--no-userinit")
-     (loop for form in (append load-forms forms)
-           collect "--eval"
-           collect (write-to-string form)))
-    :output sb-sys:*stdout*
-    :input sb-sys:*stdin*)))
+   (#-win32 with-open-file #-win32 (devnull "/dev/null") #+win32 progn
+     (sb-ext:run-program
+      (first *POSIX-ARGV*)
+      (append
+       (list "--core" SB-INT:*CORE-STRING*
+             "--noinform"
+             "--no-sysinit"
+             "--no-userinit"
+             "--noprint"
+             "--disable-debugger")
+       (loop for form in (append load-forms forms)
+             collect "--eval"
+             collect (write-to-string form)))
+      :output sb-sys:*stdout*
+      :input #-win32 devnull #+win32 sb-sys:*stdin*))))
 
 (defun run-impure-in-child-sbcl (test-file test-code)
   (run-in-child-sbcl
@@ -120,6 +136,7 @@
             ,test-util:*break-on-expected-failure*)
       (let ((file ,test-file)
             (*break-on-error* ,run-tests::*break-on-error*))
+        (declare (special *break-on-error*))
         (format t "// Running ~a~%" file)
         (restart-case
             (handler-bind
@@ -131,13 +148,13 @@
                                 (t
                                  (format *error-output* "~&Unhandled ~a: ~a~%"
                                          (type-of condition) condition)
-                                 (sb-debug:backtrace)))
+                                 (sb-debug:print-backtrace)))
                           (invoke-restart 'skip-file))))
               ,test-code)
           (skip-file ()
             (format t ">>>~a<<<~%" test-util::*failures*)))
         (test-util:report-test-status)
-        (sb-ext:quit :unix-status 104)))))
+        (sb-ext:exit :code 104)))))
 
 (defun impure-runner (files test-fun)
   (format t "// Running impure tests (~a)~%" test-fun)
@@ -164,7 +181,7 @@
           (t
            (format *error-output* "~&Unhandled ~a: ~a~%"
                    (type-of condition) condition)
-           (sb-debug:backtrace)))
+           (sb-debug:print-backtrace)))
     (invoke-restart 'skip-file)))
 
 (defun append-failures (&optional (failures *failures*))
@@ -173,7 +190,9 @@
 (defun unexpected-failures ()
   (remove-if (lambda (x)
                (or (eq (car x) :expected-failure)
-                   (eq (car x) :unexpected-success)))
+                   (eq (car x) :unexpected-success)
+                   (eq (car x) :skipped-broken)
+                   (eq (car x) :skipped-disabled)))
              *all-failures*))
 
 (defun setup-cl-user ()
@@ -196,8 +215,11 @@
   ;; What? No SB-POSIX:EXECV?
   `(let ((process (sb-ext:run-program "/bin/sh"
                                       (list (native-namestring ,file))
+                                      :environment (test-util::test-env)
                                       :output *error-output*)))
-     (sb-ext:quit :unix-status (process-exit-code process))))
+     (let ((*failures* nil))
+       (test-util:report-test-status))
+     (sb-ext:exit :code (process-exit-code process))))
 
 (defun accept-test-file (file)
   (if *accept-files*

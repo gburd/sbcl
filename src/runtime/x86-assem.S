@@ -51,10 +51,12 @@
 #define align_4byte	4
 #define align_8byte	8
 #define align_16byte	16
+#define align_page	4096
 #else
 #define	align_4byte	2
 #define	align_8byte	3
 #define	align_16byte	4	
+#define align_page	12
 #endif			
 
 /*
@@ -71,6 +73,92 @@
 #define SIZE(name)
 #endif
 
+/* Helper macros for access to thread-locals slots for both OS types:
+ * ------------------------------------------------------------------------
+ *
+ *                          Windows TEB block
+ * ==================        __________
+ * | Win32 %FS base | ---->  |        | 0
+ * ==================        |        | 1
+ *                           z        z
+ *     TLS slots start here> |XXXXXXXX| e10 = TEB_STATIC_TLS_SLOTS_OFFSET
+ *                           |XXXXXXXX| e11
+ *                           z   ...  z
+ *                           |XXXXXXXX| e4e
+ *     TLS ends here>     ,- |XXXXXXXX| e4f = TEB_STATIC_TLS_SLOTS_OFFSET+63
+ *                       /   z        z
+ *                       |   ----------                    "os_address" ----.
+ *                       |                                                   |
+ *                       |   big blob of SBCL-specific thread-local data     |
+ *                       |     |----------------------------------------| <--'
+ *                       |     |   CONTROL, BINDING, ALIEN STACK        |
+ *                       |     z                                        z
+ * ==================    |     |----------------------------------------|
+ * | Linux %FS base | -->|     |   FFI stack pointer                    |
+ * ==================    |     |    (extra page for mprotect)           |
+ *                        \    |----------------------------------------|
+ *   (union p_t_d) ----->  \-> | struct thread {   | dynamic_values[0]  |
+ *   .                         |   ...             |               [1]  |
+ *   .                         z   ...             z               ...  z
+ *   [tls data begins]         | }                 |               ...  | <-
+ *   [declared end of p_t_d]   |----------------------------------------| . |
+ *   .                         |                                   ...  | . |
+ *   .                         |                           [TLS_SIZE-1] | <-|
+ *   [tls data actually ends]  |----------------------------------------|   |
+ *   .                         | ALTSTACK                               |   |
+ *   .                         |----------------------------------------|   |
+ *   .                         | struct nonpointer_thread_data { }      |   |
+ *   .                         ------------------------------------------   |
+ *   [blob actually ends]                                                   |
+ *                                                                         /
+ *                                                                        /
+ *                                                                       /
+ *          ______________________                                      /
+ *          | struct symbol {    |                                     /
+ *          z   ...              z                                    /
+ *          |   fixnum tls_index;  // fixnum value relative to union /
+ *          | }                  |           (< TLS_SIZE = 4096)
+ *          ---------------------|
+ */
+#ifdef LISP_FEATURE_WIN32
+# define TEB_STATIC_TLS_SLOTS_OFFSET 0xE10
+# define TEB_SBCL_THREAD_BASE_OFFSET (TEB_STATIC_TLS_SLOTS_OFFSET+(63*4))
+# define SBCL_THREAD_BASE_EA %fs:TEB_SBCL_THREAD_BASE_OFFSET
+# define MAYBE_FS(addr) addr
+# define LoadTlSymbolValueAddress(symbol,reg) ;         \
+	movl	SBCL_THREAD_BASE_EA, reg ; 		\
+	addl	(symbol+SYMBOL_TLS_INDEX_OFFSET), reg ;
+# define LoadCurrentThreadSlot(offset,reg);     \
+	movl	SBCL_THREAD_BASE_EA, reg ;      \
+	movl	offset(reg), reg ;
+#elif defined(LISP_FEATURE_LINUX) || defined(LISP_FEATURE_SUNOS) || defined(LISP_FEATURE_FREEBSD)
+  /* see comment in arch_os_thread_init */
+# define SBCL_THREAD_BASE_EA %fs:THREAD_SELFPTR_OFFSET
+# define MAYBE_FS(addr) addr
+#else
+  /* perhaps there's an OS out there that actually supports %fs without
+   * jumping through hoops, so just in case, here a default definition: */
+# define SBCL_THREAD_BASE_EA $0
+# define MAYBE_FS(addr) %fs:addr
+#endif
+
+/* gas can't parse 4096LU; redefine */
+#if BACKEND_PAGE_BYTES == 4096
+# undef BACKEND_PAGE_BYTES
+# define BACKEND_PAGE_BYTES 4096
+#elif BACKEND_PAGE_BYTES == 32768
+# undef BACKEND_PAGE_BYTES
+# define BACKEND_PAGE_BYTES 32768
+#else
+# error BACKEND_PAGE_BYTES mismatch
+#endif
+
+/* OAOOM because we don't have the C headers here */
+#define THREAD_CSP_PAGE_SIZE BACKEND_PAGE_BYTES
+
+/* the CSP page sits right before the thread */
+#define THREAD_SAVED_CSP_OFFSET (-THREAD_CSP_PAGE_SIZE)
+
 /*
  * x86/darwin (as of MacOS X 10.4.5) doesn't reliably file signal
  * handlers (SIGTRAP or Mach exception handlers) for 0xCC, wo we have
@@ -79,7 +167,7 @@
  * for this instruction in the SIGILL handler and if we see it, we
  * advance the EIP by two bytes to skip over ud2 instruction and
  * call sigtrap_handler. */
-#if defined(LISP_FEATURE_DARWIN)
+#if defined(LISP_FEATURE_UD2_BREAKPOINTS)
 #define END()
 #define TRAP ud2
 #else
@@ -104,6 +192,58 @@
  * FIXME & OAOOM: This duplicates call-out in src/compiler/x86/c-call.lisp,
  * so if you tweak this, change that too!
  */
+/*
+ * Note on sections specific to LISP_FEATURE_SB_SAFEPOINT:
+ *
+ * The code below is essential to safepoint-based garbage collection,
+ * and several details need to be considered for correct implementation.
+ *
+ * The stack spilling approach:
+ *   On SB-SAFEPOINT platforms, the CALL-OUT vop is defined to spill all
+ *   live Lisp TNs to the stack to provide information for conservative
+ *   GC cooperatively (avoiding the need to retrieve register values
+ *   from POSIX signal contexts or Windows GetThreadContext()).
+ *
+ * Finding the SP at all:
+ *   The main remaining value needed by GC is the stack pointer (SP) at
+ *   the moment of entering the foreign function.  For this purpose, a
+ *   thread-local field for the SP is used.  Two stores to that field
+ *   are done for each C call, one to save the SP before calling out and
+ *   and one to undo that store afterwards.
+ *
+ * Stores as synchronization points:
+ *   These two stores delimit the C call: While the SP is set, our
+ *   thread is known not to run Lisp code: During GC, memory protection
+ *   ensures that no thread proceeds across stores.
+ *
+ * The return PC issue:
+ *   (Note that CALL-OUT has, in principle, two versions: Inline
+ *   assembly in the VOP -or- alternatively the out-of-line version you
+ *   are currently reading.  In reality, safepoint builds currently
+ *   lack the inline code entirely.)
+ *
+ *   Both versions need to take special care with the return PC:
+ *   - In the inline version of the code (if it existed), the two stores
+ *     would be done directly in the CALL-OUT vop.  In that theoretical
+ *     implementation, there is a time interval between return of the
+ *     actual C call and a second SP store during which the return
+ *     address might not be on the stack anymore.
+ *   - In this out-of-line version, the stores are done during
+ *     call_into_c's frame, but an equivalent problem arises: In order
+ *     to present the stack of arguments as our foreign function expects
+ *     them, call_into_c has to pop the Lisp return address into a
+ *     register first; this register has to be preserved by GENCGC
+ *     separately: our return address is not in the stack anymore.
+ *   In both case, stack scanning alone is not sufficient to pin
+ *   the return address, and we communicate it to GC explicitly
+ *   in addition to the SP.
+ *
+ * Note on look-alike accessor macros with vastly different behaviour:
+ *   THREAD_PC_AROUND_FOREIGN_CALL_OFFSET is an "ordinary" field of the
+ *   struct thread, whereas THREAD_SAVED_CSP_OFFSET is a synchronization
+ *   point on a potentially write-protected page.
+*/
+
 	.text
 	.align	align_16byte,0x90
 	.globl GNAME(call_into_c)
@@ -113,6 +253,11 @@ GNAME(call_into_c):
 	popl	%ebx
 
 /* Setup the NPX for C */
+        /* The VOP says regarding CLD: "Clear out DF: Darwin, Windows,
+         * and Solaris at least require this, and it should not hurt
+         * others either." call_into_c didn't have it, but better safe than
+         * sorry. */
+        cld
 	fstp	%st(0)
 	fstp	%st(0)
 	fstp	%st(0)
@@ -122,8 +267,25 @@ GNAME(call_into_c):
 	fstp	%st(0)
 	fstp	%st(0)
 
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+        /* enter safe region: store SP and return PC */
+	movl	SBCL_THREAD_BASE_EA,%edi
+	movl	%esp,MAYBE_FS(THREAD_SAVED_CSP_OFFSET(%edi))
+	movl	%ebx,MAYBE_FS(THREAD_PC_AROUND_FOREIGN_CALL_OFFSET(%edi))
+#endif
+
+	/* foreign call, preserving ESI, EDI, and EBX */
 	call	*%eax		  # normal callout using Lisp stack
-	movl	%eax,%ecx	  # remember integer return value
+        /* return values now in eax/edx OR st(0) */
+
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+        /* leave region: clear the SP!  (Also unpin the return PC.) */
+	xorl	%ecx,%ecx
+	movl	%ecx,MAYBE_FS(THREAD_SAVED_CSP_OFFSET(%edi))
+	movl	%ecx,MAYBE_FS(THREAD_PC_AROUND_FOREIGN_CALL_OFFSET(%edi))
+#endif
+
+        movl	%eax,%ecx	  # remember integer return value
 
 /* Check for a return FP value. */
 	fxam
@@ -163,7 +325,7 @@ Lfp_rtn_value:
 
 /* We don't need to restore eax, because the result is in st(0). */
 
-/* Return. FIXME: It would be nice to restructure this to use RET. */	
+/* Return. FIXME: It would be nice to restructure this to use RET. */
 	jmp	*%ebx
 
 	SIZE(GNAME(call_into_c))
@@ -202,6 +364,7 @@ GNAME(call_into_lisp_first_time):
 GNAME(call_into_lisp):
 	pushl	%ebp		# Save old frame pointer.
 	movl	%esp,%ebp	# Establish new frame.
+
 Lstack:
 /* Save the NPX state */
 	fwait			# Catch any pending NPX exceptions.
@@ -261,8 +424,13 @@ Ldone:
 #ifdef LISP_FEATURE_WIN32
 	/* Establish an SEH frame. */
 #ifdef LISP_FEATURE_SB_THREAD
-	/* FIXME: need to save BSP here. */
-#error "need to save BSP here, but don't know how yet."
+	/* Save binding stack pointer */
+	subl $4, %esp
+	pushl %eax
+        movl SBCL_THREAD_BASE_EA, %eax
+	movl THREAD_BINDING_STACK_POINTER_OFFSET(%eax), %eax
+	movl %eax, 4(%esp)
+	popl %eax
 #else
 	pushl	BINDING_STACK_POINTER + SYMBOL_VALUE_OFFSET
 #endif
@@ -288,6 +456,7 @@ LsingleValue:
 
 #ifdef LISP_FEATURE_WIN32
 	/* Remove our SEH frame. */
+	mov     %fs:0,%esp
 	popl	%fs:0
 	add	$8, %esp
 #endif
@@ -338,6 +507,7 @@ GNAME(fpu_restore):
 	TYPE(GNAME(undefined_tramp))
         .byte   0, 0, 0, SIMPLE_FUN_HEADER_WIDETAG
 GNAME(undefined_tramp):
+	pop	4(%ebp)         # Save return PC for backtrace.
 	TRAP
 	.byte	trap_Error
         .byte   2
@@ -345,6 +515,10 @@ GNAME(undefined_tramp):
         .byte   sc_DescriptorReg # eax in the Descriptor-reg SC
 	ret
 	SIZE(GNAME(undefined_tramp))
+
+/* KLUDGE: FIND-ESCAPED-FRAME (SYS:SRC;CODE;DEBUG-INT.LISP) needs
+ * to know the name of the function immediately following the
+ * undefined-function trampoline. */
 
 /*
  * the closure trampoline
@@ -379,6 +553,12 @@ GNAME(funcallable_instance_tramp):
 /*
  * fun-end breakpoint magic
  */
+
+/*
+ * For an explanation of the magic involved in function-end
+ * breakpoints, see the implementation in ppc-assem.S.
+ */
+
 	.text
 	.globl	GNAME(fun_end_breakpoint_guts)
 	.align	align_16byte
@@ -538,10 +718,18 @@ DEFINE_ALLOC_TO_REG(alloc_16_to_edi,%edi,$16)
 #define START_REGION GNAME(boxed_region)
 #endif
 
-#define ALLOC_OVERFLOW(size)                                    \
-        /* Calculate the size for the allocation. */            \
-        subl    START_REGION,size;                              \
-        ALLOC(size)
+#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_WIN32)
+#define ALLOC_OVERFLOW(size,scratch)				\
+	movl SBCL_THREAD_BASE_EA, scratch;			\
+	/* Calculate the size for the allocation. */		\
+	subl THREAD_ALLOC_REGION_OFFSET(scratch),size;		\
+	ALLOC(size)
+#else
+#define ALLOC_OVERFLOW(size,scratch)			\
+	  /* Calculate the size for the allocation. */	\
+	  subl    START_REGION,size;			\
+	  ALLOC(size)
+#endif
 
 /* This routine handles an overflow with eax=crfp+size. So the
    size=eax-crfp. */
@@ -551,7 +739,7 @@ DEFINE_ALLOC_TO_REG(alloc_16_to_edi,%edi,$16)
 GNAME(alloc_overflow_eax):
         pushl   %ecx            # Save ecx
         pushl   %edx            # Save edx
-	ALLOC_OVERFLOW(%eax)
+	ALLOC_OVERFLOW(%eax,%edx)
         popl    %edx    # Restore edx.
         popl    %ecx    # Restore ecx.
         ret
@@ -563,7 +751,7 @@ GNAME(alloc_overflow_eax):
 GNAME(alloc_overflow_ecx):
         pushl   %eax            # Save eax
         pushl   %edx            # Save edx
-	ALLOC_OVERFLOW(%ecx)
+	ALLOC_OVERFLOW(%ecx,%edx)
         movl    %eax,%ecx       # setup the destination.
         popl    %edx    # Restore edx.
         popl    %eax    # Restore eax.
@@ -576,7 +764,7 @@ GNAME(alloc_overflow_ecx):
 GNAME(alloc_overflow_edx):
         pushl   %eax            # Save eax
         pushl   %ecx            # Save ecx
-	ALLOC_OVERFLOW(%edx)
+	ALLOC_OVERFLOW(%edx,%ecx)
         movl    %eax,%edx       # setup the destination.
         popl    %ecx    # Restore ecx.
         popl    %eax    # Restore eax.
@@ -592,7 +780,7 @@ GNAME(alloc_overflow_ebx):
         pushl   %eax            # Save eax
         pushl   %ecx            # Save ecx
         pushl   %edx            # Save edx
-	ALLOC_OVERFLOW(%ebx)
+	ALLOC_OVERFLOW(%ebx,%edx)
         movl    %eax,%ebx       # setup the destination.
         popl    %edx    # Restore edx.
         popl    %ecx    # Restore ecx.
@@ -609,7 +797,7 @@ GNAME(alloc_overflow_esi):
         pushl   %eax            # Save eax
         pushl   %ecx            # Save ecx
         pushl   %edx            # Save edx
-	ALLOC_OVERFLOW(%esi)
+	ALLOC_OVERFLOW(%esi,%edx)
         movl    %eax,%esi       # setup the destination.
         popl    %edx    # Restore edx.
         popl    %ecx    # Restore ecx.
@@ -624,7 +812,7 @@ GNAME(alloc_overflow_edi):
         pushl   %eax            # Save eax
         pushl   %ecx            # Save ecx
         pushl   %edx            # Save edx
-	ALLOC_OVERFLOW(%edi)
+	ALLOC_OVERFLOW(%edi,%edx)
         movl    %eax,%edi       # setup the destination.
         popl    %edx    # Restore edx.
         popl    %ecx    # Restore ecx.
@@ -874,6 +1062,81 @@ Lend_base:
         pop %eax
 	ret
 	SIZE(GNAME(fast_bzero_base))
-        
-	
+
+
+/* When LISP_FEATURE_C_STACK_IS_CONTROL_STACK, we cannot safely scrub
+ * the control stack from C, largely due to not knowing where the
+ * active stack frame ends.  On such platforms, we reimplement the
+ * core scrubbing logic in assembly, in this case here:
+ */
+	.text
+	.align	align_16byte,0x90
+	.globl GNAME(arch_scrub_control_stack)
+	TYPE(GNAME(arch_scrub_control_stack))
+GNAME(arch_scrub_control_stack):
+	/* We are passed three parameters:
+	 * A (struct thread *) at [ESP+4],
+	 * the address of the guard page at [ESP+8], and
+	 * the address of the hard guard page at [ESP+12].
+	 * We may trash EAX, ECX, and EDX with impunity.
+	 * [ESP] is our return address, [ESP-4] is the first
+	 * stack slot to scrub. */
+
+	/* We start by setting up our scrub pointer in EAX, our
+	 * guard page upper bound in ECX, and our hard guard
+	 * page upper bound in EDX. */
+	lea	-4(%esp), %eax
+	mov	GNAME(os_vm_page_size),%edx
+	mov	%edx, %ecx
+	add	8(%esp), %ecx
+	add	12(%esp), %edx
+
+	/* We need to do a memory operation relative to the
+	 * thread pointer, so put it in %ecx and our guard
+	 * page upper bound in 4(%esp). */
+	xchg	4(%esp), %ecx
+
+	/* Now we begin our main scrub loop. */
+ascs_outer_loop:
+
+	/* If we're about to scrub the hard guard page, exit. */
+	cmp	%edx, %eax
+	jae	ascs_check_guard_page
+	cmp	12(%esp), %eax
+	ja	ascs_finished
+
+ascs_check_guard_page:
+	/* If we're about to scrub the guard page, and the guard
+	 * page is protected, exit. */
+	cmp	4(%esp), %eax
+	jae	ascs_clear_loop
+	cmp	8(%esp), %eax
+	jbe	ascs_clear_loop
+	cmpl	$(NIL), THREAD_CONTROL_STACK_GUARD_PAGE_PROTECTED_OFFSET(%ecx)
+	jne	ascs_finished
+
+	/* Clear memory backwards to the start of the (4KiB) page */
+ascs_clear_loop:
+	movl	$0, (%eax)
+	test	$0xfff, %eax
+	lea	-4(%eax), %eax
+	jnz	ascs_clear_loop
+
+	/* If we're about to hit the hard guard page, exit. */
+	cmp	%edx, %eax
+	jae	ascs_finished
+
+	/* If the next (previous?) 4KiB page contains a non-zero
+	 * word, continue scrubbing. */
+ascs_check_loop:
+	testl	$-1, (%eax)
+	jnz	ascs_outer_loop
+	test	$0xfff, %eax
+	lea	-4(%eax), %eax
+	jnz	ascs_check_loop
+
+ascs_finished:
+	ret
+	SIZE(GNAME(arch_scrub_control_stack))
+
         END()

@@ -630,7 +630,7 @@
   (frob %long-float long-float))
 
 ;;; Convert a ratio to a float. We avoid any rounding error by doing an
-;;; integer division. Accuracy is important to preserve read/print
+;;; integer division. Accuracy is important to preserve print-read
 ;;; consistency, since this is ultimately how the reader reads a float. We
 ;;; scale the numerator by a power of two until the division results in the
 ;;; desired number of fraction bits, then do round-to-nearest.
@@ -810,12 +810,13 @@
          (truly-the fixnum (%unary-round number))
          (multiple-value-bind (bits exp) (integer-decode-float number)
            (let* ((shifted (ash bits exp))
-                  (rounded (if (and (minusp exp)
-                                    (oddp shifted)
-                                    (eql (logand bits
-                                                 (lognot (ash -1 (- exp))))
-                                         (ash 1 (- -1 exp))))
-                               (1+ shifted)
+                  (rounded (if (minusp exp)
+                               (let ((fractional-bits (logand bits (lognot (ash -1 (- exp)))))
+                                     (0.5bits (ash 1 (- -1 exp))))
+                                 (cond
+                                   ((> fractional-bits 0.5bits) (1+ shifted))
+                                   ((< fractional-bits 0.5bits) shifted)
+                                   (t (if (oddp shifted) (1+ shifted) shifted))))
                                shifted)))
              (if (minusp number)
                  (- rounded)

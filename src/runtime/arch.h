@@ -22,6 +22,7 @@ extern void arch_init(void);
 
 /* FIXME: It would be good to document these too! */
 extern void arch_skip_instruction(os_context_t*);
+extern void arch_handle_allocation_trap(os_context_t*);
 extern boolean arch_pseudo_atomic_atomic(os_context_t*);
 extern void arch_set_pseudo_atomic_interrupted(os_context_t*);
 extern void arch_clear_pseudo_atomic_interrupted(os_context_t*);
@@ -34,6 +35,9 @@ extern void arch_do_displaced_inst(os_context_t *context,
                                    unsigned int orig_inst);
 
 extern int arch_os_thread_init(struct thread *thread);
+#if defined(LISP_FEATURE_X86) && defined(LISP_FEATURE_SB_THREAD)
+extern void arch_os_load_ldt(struct thread *thread);
+#endif
 extern int arch_os_thread_cleanup(struct thread *thread);
 
 extern lispobj funcall0(lispobj function);
@@ -43,10 +47,10 @@ extern lispobj funcall3(lispobj function, lispobj arg0, lispobj arg1,
                         lispobj arg2);
 extern lispobj *component_ptr_from_pc(lispobj *pc);
 
-extern void fpu_save(void *);
-extern void fpu_restore(void *);
+extern void AMD64_SYSV_ABI fpu_save(void *);
+extern void AMD64_SYSV_ABI fpu_restore(void *);
 
-#ifdef LISP_FEATURE_X86
+#if defined(LISP_FEATURE_X86)||defined(LISP_FEATURE_X86_64)
 extern unsigned int * single_stepping;
 extern void restore_breakpoint_from_single_step(os_context_t * context);
 #endif

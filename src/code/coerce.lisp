@@ -80,9 +80,6 @@
         ;; FIXME: If we go to a compiler-only implementation, this can
         ;; become COMPILE instead of EVAL, which seems nicer to me.
         (eval `(function ,object)))
-       ((instance-lambda)
-        (deprecation-warning 'instance-lambda 'lambda)
-        (eval `(function ,object)))
        (t
         (error 'simple-type-error
                :datum object
@@ -125,7 +122,7 @@
          object)
         ((eq type *empty-type*)
          (coerce-error))
-        ((csubtypep type (specifier-type 'character))
+        ((type= type (specifier-type 'character))
          (character object))
         ((numberp object)
          (cond
@@ -244,6 +241,8 @@
         ((and (csubtypep type (specifier-type 'sequence))
               (find-class output-type-spec nil))
          (let ((class (find-class output-type-spec)))
+           (unless (sb!mop:class-finalized-p class)
+             (sb!mop:finalize-inheritance class))
            (sb!sequence:make-sequence-like
             (sb!mop:class-prototype class)
             (length object) :initial-contents object)))

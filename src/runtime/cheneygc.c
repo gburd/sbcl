@@ -62,19 +62,19 @@ tv_diff(struct timeval *x, struct timeval *y)
 #endif
 
 void *
-gc_general_alloc(long bytes, int page_type_flag, int quick_p) {
+gc_general_alloc(word_t bytes, int page_type_flag, int quick_p) {
     lispobj *new=new_space_free_pointer;
     new_space_free_pointer+=(bytes/N_WORD_BYTES);
     return new;
 }
 
-lispobj  copy_large_unboxed_object(lispobj object, long nwords) {
+lispobj  copy_large_unboxed_object(lispobj object, sword_t nwords) {
     return copy_object(object,nwords);
 }
-lispobj  copy_unboxed_object(lispobj object, long nwords) {
+lispobj  copy_unboxed_object(lispobj object, sword_t nwords) {
     return copy_object(object,nwords);
 }
-lispobj  copy_large_object(lispobj object, long nwords) {
+lispobj  copy_large_object(lispobj object, sword_t nwords) {
     return copy_object(object,nwords);
 }
 
@@ -140,7 +140,7 @@ collect_garbage(generation_index_t ignore)
 #ifdef PRINTNOISE
     printf("Scavenging interrupt contexts ...\n");
 #endif
-    scavenge_interrupt_contexts();
+    scavenge_interrupt_contexts(th);
 
 #ifdef PRINTNOISE
     printf("Scavenging interrupt handlers (%d bytes) ...\n",
@@ -149,24 +149,18 @@ collect_garbage(generation_index_t ignore)
     scavenge((lispobj *) interrupt_handlers,
              sizeof(interrupt_handlers) / sizeof(lispobj));
 
-    /* _size quantities are in units of sizeof(lispobj) - i.e. 4 */
-    control_stack_size =
-        current_control_stack_pointer-
-        (lispobj *)th->control_stack_start;
 #ifdef PRINTNOISE
-    printf("Scavenging the control stack at %p (%ld words) ...\n",
-           ((lispobj *)th->control_stack_start),
-           control_stack_size);
+    printf("Scavenging the control stack ...\n");
 #endif
-    scavenge(((lispobj *)th->control_stack_start), control_stack_size);
+    scavenge_control_stack(th);
 
 
     binding_stack_size =
-        current_binding_stack_pointer -
+        (lispobj *)get_binding_stack_pointer(th) -
         (lispobj *)th->binding_stack_start;
 #ifdef PRINTNOISE
     printf("Scavenging the binding stack %x - %x (%d words) ...\n",
-           th->binding_stack_start,current_binding_stack_pointer,
+           th->binding_stack_start,get_binding_stack_pointer(th),
            (int)(binding_stack_size));
 #endif
     scavenge(((lispobj *)th->binding_stack_start), binding_stack_size);
@@ -282,134 +276,6 @@ scavenge_newspace(void)
     }
     /* printf("done with newspace\n"); */
 }
-
-/* scavenging interrupt contexts */
-
-static int boxed_registers[] = BOXED_REGISTERS;
-
-static void
-scavenge_interrupt_context(os_context_t *context)
-{
-    int i;
-#ifdef reg_LIP
-    unsigned long lip;
-    unsigned long lip_offset;
-    int lip_register_pair;
-#endif
-    unsigned long pc_code_offset;
-#ifdef ARCH_HAS_LINK_REGISTER
-    unsigned long lr_code_offset;
-#endif
-#ifdef ARCH_HAS_NPC_REGISTER
-    unsigned long npc_code_offset;
-#endif
-#ifdef DEBUG_SCAVENGE_VERBOSE
-    fprintf(stderr, "Scavenging interrupt context at 0x%x\n",context);
-#endif
-    /* Find the LIP's register pair and calculate its offset */
-    /* before we scavenge the context. */
-#ifdef reg_LIP
-    lip = *os_context_register_addr(context, reg_LIP);
-    /* 0x7FFFFFFF on 32-bit platforms;
-       0x7FFFFFFFFFFFFFFF on 64-bit platforms */
-    lip_offset = (((unsigned long)1) << (N_WORD_BITS - 1)) - 1;
-    lip_register_pair = -1;
-    for (i = 0; i < (int)(sizeof(boxed_registers) / sizeof(int)); i++) {
-        unsigned long reg;
-        unsigned long offset;
-        int index;
-
-        index = boxed_registers[i];
-        reg = *os_context_register_addr(context, index);
-        /* would be using PTR if not for integer length issues */
-        if ((reg & ~((1L<<N_LOWTAG_BITS)-1)) <= lip) {
-            offset = lip - reg;
-            if (offset < lip_offset) {
-                lip_offset = offset;
-                lip_register_pair = index;
-            }
-        }
-    }
-#endif /* reg_LIP */
-
-    /* Compute the PC's offset from the start of the CODE */
-    /* register. */
-    pc_code_offset =
-        *os_context_pc_addr(context) -
-        *os_context_register_addr(context, reg_CODE);
-#ifdef ARCH_HAS_NPC_REGISTER
-    npc_code_offset =
-        *os_context_npc_addr(context) -
-        *os_context_register_addr(context, reg_CODE);
-#endif
-#ifdef ARCH_HAS_LINK_REGISTER
-    lr_code_offset =
-        *os_context_lr_addr(context) -
-        *os_context_register_addr(context, reg_CODE);
-#endif
-
-    /* Scavenge all boxed registers in the context. */
-    for (i = 0; i < (int)(sizeof(boxed_registers) / sizeof(int)); i++) {
-        int index;
-        lispobj foo;
-
-        index = boxed_registers[i];
-        foo = *os_context_register_addr(context,index);
-        scavenge((lispobj *) &foo, 1);
-        *os_context_register_addr(context,index) = foo;
-
-        /* this is unlikely to work as intended on bigendian
-         * 64 bit platforms */
-
-        scavenge((lispobj *)
-                 os_context_register_addr(context, index), 1);
-    }
-
-#ifdef reg_LIP
-    /* Fix the LIP */
-    *os_context_register_addr(context, reg_LIP) =
-        *os_context_register_addr(context, lip_register_pair) + lip_offset;
-#endif /* reg_LIP */
-
-    /* Fix the PC if it was in from space */
-    if (from_space_p(*os_context_pc_addr(context)))
-        *os_context_pc_addr(context) =
-            *os_context_register_addr(context, reg_CODE) + pc_code_offset;
-#ifdef ARCH_HAS_LINK_REGISTER
-    /* Fix the LR ditto; important if we're being called from
-     * an assembly routine that expects to return using blr, otherwise
-     * harmless */
-    if (from_space_p(*os_context_lr_addr(context)))
-        *os_context_lr_addr(context) =
-            *os_context_register_addr(context, reg_CODE) + lr_code_offset;
-#endif
-
-#ifdef ARCH_HAS_NPC_REGISTER
-    if (from_space_p(*os_context_npc_addr(context)))
-        *os_context_npc_addr(context) =
-            *os_context_register_addr(context, reg_CODE) + npc_code_offset;
-#endif
-}
-
-void scavenge_interrupt_contexts(void)
-{
-    int i, index;
-    os_context_t *context;
-
-    struct thread *th=arch_os_get_current_thread();
-
-    index = fixnum_value(SymbolValue(FREE_INTERRUPT_CONTEXT_INDEX,0));
-
-
-#ifdef DEBUG_SCAVENGE_VERBOSE
-    fprintf(stderr, "%d interrupt contexts to scan\n",index);
-#endif
-    for (i = 0; i < index; i++) {
-        context = th->interrupt_contexts[i];
-        scavenge_interrupt_context(context);
-    }
-}
-
 
 /* debugging code */
 

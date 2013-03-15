@@ -133,13 +133,20 @@
   (def-data-vector-frobs simple-array-unsigned-byte-32 word-index
     unsigned-num unsigned-reg)
 
-  (def-data-vector-frobs simple-array-unsigned-byte-29 word-index
+  (def-data-vector-frobs simple-array-unsigned-fixnum word-index
     positive-fixnum any-reg)
-  (def-data-vector-frobs simple-array-signed-byte-30 word-index
+  (def-data-vector-frobs simple-array-fixnum word-index
     tagged-num any-reg)
   (def-data-vector-frobs simple-array-signed-byte-32 word-index
     signed-num signed-reg))
 
+#!+compare-and-swap-vops
+(define-vop (%compare-and-swap-svref word-index-cas)
+  (:note "inline array compare-and-swap")
+  (:policy :fast-safe)
+  (:variant vector-data-offset other-pointer-lowtag)
+  (:translate %compare-and-swap-svref)
+  (:arg-types simple-vector positive-fixnum * *))
 
 ;;; Integer vectors whos elements are smaller than a byte.  I.e. bit, 2-bit,
 ;;; and 4-bit vectors.
@@ -551,4 +558,31 @@
          (value :scs (signed-reg)))
   (:results (result :scs (signed-reg)))
   (:result-types tagged-num))
+
+;;;; ATOMIC-INCF for arrays
 
+(define-vop (array-atomic-incf/word)
+  (:translate %array-atomic-incf/word)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg) :target offset)
+         (diff :scs (unsigned-reg)))
+  (:arg-types * positive-fixnum unsigned-num)
+  (:results (result :scs (unsigned-reg) :from :load))
+  (:result-types unsigned-num)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) offset)
+  (:temporary (:sc non-descriptor-reg) sum)
+  (:generator 4
+    (inst addi offset index
+          (- (* vector-data-offset n-word-bytes)
+             other-pointer-lowtag))
+    ;; load the slot value, add DIFF, write the sum back, and return
+    ;; the original slot value, atomically, and include a memory
+    ;; barrier.
+    (inst sync)
+    LOOP
+    (inst lwarx result offset object)
+    (inst add sum result diff)
+    (inst stwcx. sum offset object)
+    (inst bne LOOP)
+    (inst isync)))

@@ -55,6 +55,10 @@
 #else
 #include "cheneygc-internal.h"
 #endif
+#include <fcntl.h>
+#ifdef LISP_FEATURE_SB_WTIMER
+# include <sys/timerfd.h>
+#endif
 
 #ifdef LISP_FEATURE_X86
 /* Prototype for personality(2). Done inline here since the header file
@@ -64,7 +68,7 @@ int personality (unsigned long);
 
 size_t os_vm_page_size;
 
-#if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_SB_LUTEX) && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
+#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_FUTEX) && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <errno.h>
@@ -198,12 +202,18 @@ os_init(char *argv[], char *envp[])
     int patch_version;
     char *p;
     uname(&name);
+
     p=name.release;
     major_version = atoi(p);
-    p=strchr(p,'.')+1;
-    minor_version = atoi(p);
-    p=strchr(p,'.')+1;
-    patch_version = atoi(p);
+    minor_version = patch_version = 0;
+    p=strchr(p,'.');
+    if (p != NULL) {
+            minor_version = atoi(++p);
+            p=strchr(p,'.');
+            if (p != NULL)
+                    patch_version = atoi(++p);
+    }
+
     if (major_version<2) {
         lose("linux kernel version too old: major version=%d (can't run in version < 2.0.0)\n",
              major_version);
@@ -215,7 +225,7 @@ os_init(char *argv[], char *envp[])
 #endif
     }
 #ifdef LISP_FEATURE_SB_THREAD
-#if !defined(LISP_FEATURE_SB_LUTEX) && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
+#if defined(LISP_FEATURE_SB_FUTEX) && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
     futex_init();
 #endif
     if(! isnptl()) {
@@ -365,7 +375,7 @@ os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
             lose("An mprotect call failed with ENOMEM. This probably means that the maximum amount\n"
                  "of separate memory mappings was exceeded. To fix the problem, either increase\n"
                  "the maximum with e.g. 'echo 262144 > /proc/sys/vm/max_map_count' or recompile\n"
-                 "SBCL with a larger value for GENCGC-PAGE-BYTES in\n"
+                 "SBCL with a larger value for GENCGC-CARD-BYTES in\n"
                  "'src/compiler/target/backend-parms.lisp'.");
         } else {
             perror("mprotect");
@@ -429,6 +439,10 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
     }
 #endif
 
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+    if (!handle_safepoint_violation(context, addr))
+#endif
+
 #ifdef LISP_FEATURE_GENCGC
     if (!gencgc_handle_wp_violation(addr))
 #else
@@ -443,14 +457,23 @@ os_install_interrupt_handlers(void)
 {
     undoably_install_low_level_interrupt_handler(SIG_MEMORY_FAULT,
                                                  sigsegv_handler);
+
+    /* OAOOM c.f. sunos-os.c.
+     * Should we have a reusable function gc_install_interrupt_handlers? */
 #ifdef LISP_FEATURE_SB_THREAD
+# ifdef LISP_FEATURE_SB_SAFEPOINT
+#  ifdef LISP_FEATURE_SB_THRUPTION
+    undoably_install_low_level_interrupt_handler(SIGPIPE, thruption_handler);
+#  endif
+# else
     undoably_install_low_level_interrupt_handler(SIG_STOP_FOR_GC,
                                                  sig_stop_for_gc_handler);
+# endif
 #endif
 }
 
 char *
-os_get_runtime_executable_path()
+os_get_runtime_executable_path(int external)
 {
     char path[PATH_MAX + 1];
     int size;
@@ -463,3 +486,61 @@ os_get_runtime_executable_path()
 
     return copied_string(path);
 }
+
+#ifdef LISP_FEATURE_SB_WTIMER
+/*
+ * Waitable timer implementation for the safepoint-based (SIGALRM-free)
+ * timer facility using timerfd_create().
+ */
+int
+os_create_wtimer()
+{
+    int fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (fd == -1)
+        lose("os_create_wtimer: timerfd_create");
+
+    /* Cannot count on TFD_CLOEXEC availability, so do it manually: */
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)
+        lose("os_create_wtimer: fcntl");
+
+    return fd;
+}
+
+int
+os_wait_for_wtimer(int fd)
+{
+    unsigned char buf[8];
+    int n = read(fd, buf, sizeof(buf));
+    if (n == -1) {
+        if (errno == EINTR)
+            return -1;
+        lose("os_wtimer_listen failed");
+    }
+    if (n != sizeof(buf))
+        lose("os_wtimer_listen read too little");
+    return 0;
+}
+
+void
+os_close_wtimer(int fd)
+{
+    if (close(fd) == -1)
+        lose("os_close_wtimer failed");
+}
+
+void
+os_set_wtimer(int fd, int sec, int nsec)
+{
+    struct itimerspec spec = { {0,0}, {0,0} };
+    spec.it_value.tv_sec = sec;
+    spec.it_value.tv_nsec = nsec;
+    if (timerfd_settime(fd, 0, &spec, 0) == -1)
+        lose("timerfd_settime");
+}
+
+void
+os_cancel_wtimer(int fd)
+{
+    os_set_wtimer(fd, 0, 0);
+}
+#endif

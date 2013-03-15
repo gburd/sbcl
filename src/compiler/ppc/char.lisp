@@ -81,7 +81,7 @@
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 1
-    (inst slwi res ch 2)))
+    (inst slwi res ch n-fixnum-tag-bits)))
 
 (define-vop (code-char)
   (:translate code-char)
@@ -91,7 +91,7 @@
   (:results (res :scs (character-reg)))
   (:result-types character)
   (:generator 1
-    (inst srwi res code 2)))
+    (inst srwi res code n-fixnum-tag-bits)))
 
 ;;; Comparison of characters.
 (define-vop (character-compare)
@@ -121,7 +121,17 @@
 
 (define-vop (character-compare/c)
   (:args (x :scs (character-reg)))
-  (:arg-types character (:constant character))
+  (:arg-types character
+              ;; KLUDGE: having a SATISFIES type here is too hairy for
+              ;; the cross-compiler (running on an arbitrary CL host)
+              ;; to cope with.  Since we know we only have standard
+              ;; characters in the build anyway, we can restrict the
+              ;; cross-compiler's arg type to standard char, and all
+              ;; is well.
+              #+sb-xc-host
+              (:constant standard-char)
+              #-sb-xc-host
+              (:constant (satisfies inlinable-character-constant-p)))
   (:conditional)
   (:info target not-p y)
   (:policy :fast-safe)

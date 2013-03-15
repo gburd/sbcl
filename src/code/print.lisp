@@ -18,8 +18,8 @@
 
 (defvar *print-readably* nil
   #!+sb-doc
-  "If true, all objects will printed readably. If readable printing is
-  impossible, an error will be signalled. This overrides the value of
+  "If true, all objects will be printed readably. If readable printing
+  is impossible, an error will be signalled. This overrides the value of
   *PRINT-ESCAPE*.")
 (defvar *print-escape* t
   #!+sb-doc
@@ -30,7 +30,7 @@
   "Should pretty printing be used?")
 (defvar *print-base* 10.
   #!+sb-doc
-  "the output base for RATIONALs (including integers)")
+  "The output base for RATIONALs (including integers).")
 (defvar *print-radix* nil
   #!+sb-doc
   "Should base be verified when printing RATIONALs?")
@@ -56,10 +56,10 @@
   "Should #: prefixes be used when printing symbols with null SYMBOL-PACKAGE?")
 (defvar *print-lines* nil
   #!+sb-doc
-  "the maximum number of lines to print per object")
+  "The maximum number of lines to print per object.")
 (defvar *print-right-margin* nil
   #!+sb-doc
-  "the position of the right margin in ems (for pretty-printing)")
+  "The position of the right margin in ems (for pretty-printing).")
 (defvar *print-miser-width* nil
   #!+sb-doc
   "If the remaining space between the current column and the right margin
@@ -69,33 +69,40 @@
 (defvar *print-pprint-dispatch*)
 #!+sb-doc
 (setf (fdocumentation '*print-pprint-dispatch* 'variable)
-      "the pprint-dispatch-table that controls how to pretty-print objects")
+      "The pprint-dispatch-table that controls how to pretty-print objects.")
+(defvar *suppress-print-errors* nil
+  #!+sb-doc
+  "Suppress printer errors when the condition is of the type designated by this
+variable: an unreadable object representing the error is printed instead.")
 
 (defmacro with-standard-io-syntax (&body body)
   #!+sb-doc
   "Bind the reader and printer control variables to values that enable READ
    to reliably read the results of PRINT. These values are:
-       *PACKAGE*                        the COMMON-LISP-USER package
-       *PRINT-ARRAY*                    T
-       *PRINT-BASE*                     10
-       *PRINT-CASE*                     :UPCASE
-       *PRINT-CIRCLE*                   NIL
-       *PRINT-ESCAPE*                   T
-       *PRINT-GENSYM*                   T
-       *PRINT-LENGTH*                   NIL
-       *PRINT-LEVEL*                    NIL
-       *PRINT-LINES*                    NIL
-       *PRINT-MISER-WIDTH*              NIL
-       *PRINT-PPRINT-DISPATCH*          the standard pprint dispatch table
-       *PRINT-PRETTY*                   NIL
-       *PRINT-RADIX*                    NIL
-       *PRINT-READABLY*                 T
-       *PRINT-RIGHT-MARGIN*             NIL
-       *READ-BASE*                      10
-       *READ-DEFAULT-FLOAT-FORMAT*      SINGLE-FLOAT
-       *READ-EVAL*                      T
-       *READ-SUPPRESS*                  NIL
-       *READTABLE*                      the standard readtable"
+
+         *PACKAGE*                        the COMMON-LISP-USER package
+         *PRINT-ARRAY*                    T
+         *PRINT-BASE*                     10
+         *PRINT-CASE*                     :UPCASE
+         *PRINT-CIRCLE*                   NIL
+         *PRINT-ESCAPE*                   T
+         *PRINT-GENSYM*                   T
+         *PRINT-LENGTH*                   NIL
+         *PRINT-LEVEL*                    NIL
+         *PRINT-LINES*                    NIL
+         *PRINT-MISER-WIDTH*              NIL
+         *PRINT-PPRINT-DISPATCH*          the standard pprint dispatch table
+         *PRINT-PRETTY*                   NIL
+         *PRINT-RADIX*                    NIL
+         *PRINT-READABLY*                 T
+         *PRINT-RIGHT-MARGIN*             NIL
+         *READ-BASE*                      10
+         *READ-DEFAULT-FLOAT-FORMAT*      SINGLE-FLOAT
+         *READ-EVAL*                      T
+         *READ-SUPPRESS*                  NIL
+         *READTABLE*                      the standard readtable
+  SB-EXT:*SUPPRESS-PRINT-ERRORS*          NIL
+"
   `(%with-standard-io-syntax (lambda () ,@body)))
 
 (defun %with-standard-io-syntax (function)
@@ -120,7 +127,8 @@
         (*read-default-float-format* 'single-float)
         (*read-eval* t)
         (*read-suppress* nil)
-        (*readtable* *standard-readtable*))
+        (*readtable* *standard-readtable*)
+        (*suppress-print-errors* nil))
     (funcall function)))
 
 ;;;; routines to print objects
@@ -144,7 +152,8 @@
       :right-margin *print-right-margin*
       :miser-width *print-miser-width*
       :lines *print-lines*
-      :pprint-dispatch *print-pprint-dispatch*)))
+      :pprint-dispatch *print-pprint-dispatch*
+      :suppress-errors *suppress-print-errors*)))
 
 (defun write (object &key
                      ((:stream stream) *standard-output*)
@@ -165,9 +174,11 @@
                       *print-miser-width*)
                      ((:lines *print-lines*) *print-lines*)
                      ((:pprint-dispatch *print-pprint-dispatch*)
-                      *print-pprint-dispatch*))
+                      *print-pprint-dispatch*)
+                     ((:suppress-errors *suppress-print-errors*)
+                      *suppress-print-errors*))
   #!+sb-doc
-  "Output OBJECT to the specified stream, defaulting to *STANDARD-OUTPUT*"
+  "Output OBJECT to the specified stream, defaulting to *STANDARD-OUTPUT*."
   (output-object object (out-synonym-of stream))
   object)
 
@@ -193,9 +204,11 @@
         (push (list variable value) bind)))
     (unless (assoc 'stream bind)
       (push (list 'stream '*standard-output*) bind))
-    `(let ,(nreverse bind)
-       ,@(when ignore `((declare (ignore ,@ignore))))
-       (output-object ,object stream))))
+    (once-only ((object object))
+      `(let ,(nreverse bind)
+         ,@(when ignore `((declare (ignore ,@ignore))))
+         (output-object ,object (out-synonym-of stream))
+         ,object))))
 
 (defun prin1 (object &optional stream)
   #!+sb-doc
@@ -251,7 +264,9 @@
             ((:miser-width *print-miser-width*) *print-miser-width*)
             ((:lines *print-lines*) *print-lines*)
             ((:pprint-dispatch *print-pprint-dispatch*)
-             *print-pprint-dispatch*))
+             *print-pprint-dispatch*)
+            ((:suppress-errors *suppress-print-errors*)
+             *suppress-print-errors*))
   #!+sb-doc
   "Return the printed representation of OBJECT as a string."
   (stringify-object object))
@@ -275,9 +290,10 @@
           (push variable ignore))
         (push (list variable value) bind)))
     (if bind
-        `(let ,(nreverse bind)
-           ,@(when ignore `((declare (ignore ,@ignore))))
-           (stringify-object ,object))
+        (once-only ((object object))
+          `(let ,(nreverse bind)
+             ,@(when ignore `((declare (ignore ,@ignore))))
+             (stringify-object ,object)))
         `(stringify-object ,object))))
 
 (defun prin1-to-string (object)
@@ -305,38 +321,54 @@
 
 ;;;; support for the PRINT-UNREADABLE-OBJECT macro
 
+(defun print-not-readable-error (object stream)
+  (restart-case
+      (error 'print-not-readable :object object)
+    (print-unreadably ()
+      :report "Print unreadably."
+      (let ((*print-readably* nil))
+        (output-object object stream)
+        object))
+    (use-value (o)
+      :report "Supply an object to be printed instead."
+      :interactive
+      (lambda ()
+        (read-evaluated-form "~@<Enter an object (evaluated): ~@:>"))
+      (output-object o stream)
+      o)))
+
 ;;; guts of PRINT-UNREADABLE-OBJECT
 (defun %print-unreadable-object (object stream type identity body)
   (declare (type (or null function) body))
-  (when *print-readably*
-    (error 'print-not-readable :object object))
-  (flet ((print-description ()
-           (when type
-             (write (type-of object) :stream stream :circle nil
-                    :level nil :length nil)
-             (write-char #\space stream))
-           (when body
-             (pprint-newline :fill stream)
-             (funcall body))
-           (when identity
-             (when (or body (not type))
-               (write-char #\space stream))
-             (pprint-newline :fill stream)
-             (write-char #\{ stream)
-             (write (get-lisp-obj-address object) :stream stream
-                    :radix nil :base 16)
-             (write-char #\} stream))))
-    (cond ((print-pretty-on-stream-p stream)
-           ;; Since we're printing prettily on STREAM, format the
-           ;; object within a logical block. PPRINT-LOGICAL-BLOCK does
-           ;; not rebind the stream when it is already a pretty stream,
-           ;; so output from the body will go to the same stream.
-           (pprint-logical-block (stream nil :prefix "#<" :suffix ">")
-             (print-description)))
-          (t
-           (write-string "#<" stream)
-           (print-description)
-           (write-char #\> stream))))
+  (if *print-readably*
+      (print-not-readable-error object stream)
+      (flet ((print-description ()
+               (when type
+                 (write (type-of object) :stream stream :circle nil
+                                         :level nil :length nil)
+                 (write-char #\space stream)
+                 (pprint-newline :fill stream))
+               (when body
+                 (funcall body))
+               (when identity
+                 (when (or body (not type))
+                   (write-char #\space stream))
+                 (pprint-newline :fill stream)
+                 (write-char #\{ stream)
+                 (write (get-lisp-obj-address object) :stream stream
+                                                      :radix nil :base 16)
+                 (write-char #\} stream))))
+        (cond ((print-pretty-on-stream-p stream)
+               ;; Since we're printing prettily on STREAM, format the
+               ;; object within a logical block. PPRINT-LOGICAL-BLOCK does
+               ;; not rebind the stream when it is already a pretty stream,
+               ;; so output from the body will go to the same stream.
+               (pprint-logical-block (stream nil :prefix "#<" :suffix ">")
+                 (print-description)))
+              (t
+               (write-string "#<" stream)
+               (print-description)
+               (write-char #\> stream)))))
   nil)
 
 ;;;; OUTPUT-OBJECT -- the main entry point
@@ -349,12 +381,41 @@
       (and (symbolp x)
            (symbol-package x))))
 
+(defvar *in-print-error* nil)
+
 ;;; Output OBJECT to STREAM observing all printer control variables.
 (defun output-object (object stream)
   (labels ((print-it (stream)
              (if *print-pretty*
                  (sb!pretty:output-pretty-object object stream)
                  (output-ugly-object object stream)))
+           (handle-it (stream)
+             (if *suppress-print-errors*
+                 (handler-bind ((condition
+                                  (lambda (condition) nil
+                                    (when (typep condition *suppress-print-errors*)
+                                      (cond (*in-print-error*
+                                             (write-string "(error printing " stream)
+                                             (write-string *in-print-error* stream)
+                                             (write-string ")" stream))
+                                            (t
+                                             ;; Give outer handlers a chance.
+                                             (with-simple-restart
+                                                 (continue "Suppress the error.")
+                                               (signal condition))
+                                             (let ((*print-readably* nil)
+                                                   (*print-escape* t))
+                                               (write-string
+                                                "#<error printing a " stream)
+                                               (let ((*in-print-error* "type"))
+                                                 (output-object (type-of object) stream))
+                                               (write-string ": " stream)
+                                               (let ((*in-print-error* "condition"))
+                                                 (output-object condition stream))
+                                               (write-string ">" stream))))
+                                      (return-from handle-it object)))))
+                   (print-it stream))
+                 (print-it stream)))
            (check-it (stream)
              (multiple-value-bind (marker initiate)
                  (check-for-circularity object t)
@@ -367,12 +428,12 @@
                    ;; otherwise
                    (if marker
                        (when (handle-circularity marker stream)
-                         (print-it stream))
-                       (print-it stream))))))
+                         (handle-it stream))
+                       (handle-it stream))))))
     (cond (;; Maybe we don't need to bother with circularity detection.
            (or (not *print-circle*)
                (uniquely-identified-by-print-p object))
-           (print-it stream))
+           (handle-it stream))
           (;; If we have already started circularity detection, this
            ;; object might be a shared reference. If we have not, then
            ;; if it is a compound object it might contain a circular
@@ -381,7 +442,7 @@
                (compound-object-p object))
            (check-it stream))
           (t
-           (print-it stream)))))
+           (handle-it stream)))))
 
 ;;; a hack to work around recurring gotchas with printing while
 ;;; DEFGENERIC PRINT-OBJECT is being built
@@ -523,7 +584,8 @@
 (defun output-symbol (object stream)
   (if (or *print-escape* *print-readably*)
       (let ((package (symbol-package object))
-            (name (symbol-name object)))
+            (name (symbol-name object))
+            (current (sane-package)))
         (cond
          ;; The ANSI spec "22.1.3.3.1 Package Prefixes for Symbols"
          ;; requires that keywords be printed with preceding colons
@@ -532,19 +594,24 @@
           (write-char #\: stream))
          ;; Otherwise, if the symbol's home package is the current
          ;; one, then a prefix is never necessary.
-         ((eq package (sane-package)))
+         ((eq package current))
          ;; Uninterned symbols print with a leading #:.
          ((null package)
           (when (or *print-gensym* *print-readably*)
             (write-string "#:" stream)))
          (t
           (multiple-value-bind (symbol accessible)
-              (find-symbol name (sane-package))
+              (find-symbol name current)
             ;; If we can find the symbol by looking it up, it need not
             ;; be qualified. This can happen if the symbol has been
             ;; inherited from a package other than its home package.
+            ;;
+            ;; To preserve print-read consistency, use the local nickname if
+            ;; one exists.
             (unless (and accessible (eq symbol object))
-              (output-symbol-name (package-name package) stream)
+              (let ((prefix (or (car (rassoc package (package-%local-nicknames current)))
+                                (package-name package))))
+                (output-symbol-name prefix stream))
               (multiple-value-bind (symbol externalp)
                   (find-external-symbol name package)
                 (declare (ignore symbol))
@@ -930,6 +997,13 @@
         (incf length)))
     (write-char #\) stream)))
 
+(defun output-unreadable-vector-readably (vector stream)
+  (declare (vector vector))
+  (write-string "#." stream)
+  (write `(coerce ,(coerce vector '(vector t))
+                  '(simple-array ,(array-element-type vector) (*)))
+         :stream stream))
+
 (defun output-vector (vector stream)
   (declare (vector vector))
   (cond ((stringp vector)
@@ -938,7 +1012,7 @@
                               (load-time-value
                                (array-element-type
                                 (make-array 0 :element-type 'character))))))
-                (error 'print-not-readable :object vector))
+                (print-not-readable-error vector stream))
                ((or *print-escape* *print-readably*)
                 (write-char #\" stream)
                 (quote-string vector stream)
@@ -953,10 +1027,8 @@
            ;; (Don't use OUTPUT-OBJECT here, since this code
            ;; has to work for all possible *PRINT-BASE* values.)
            (write-char (if (zerop bit) #\0 #\1) stream)))
-        (t
-         (when (and *print-readably*
-                    (not (array-readably-printable-p vector)))
-           (error 'print-not-readable :object vector))
+        ((or (not *print-readably*)
+             (array-readably-printable-p vector))
          (descend-into (stream)
                        (write-string "#(" stream)
                        (dotimes (i (length vector))
@@ -964,7 +1036,11 @@
                            (write-char #\space stream))
                          (punt-print-if-too-long i stream)
                          (output-object (aref vector i) stream))
-                       (write-string ")" stream)))))
+                       (write-string ")" stream)))
+        (*read-eval*
+         (output-unreadable-vector-readably vector stream))
+        (t
+         (print-not-readable-error vector stream))))
 
 ;;; This function outputs a string quoting characters sufficiently
 ;;; so that someone can read it in again. Basically, put a slash in
@@ -1004,19 +1080,45 @@
         (*print-length* nil))
     (print-unreadable-object (array stream :type t :identity t))))
 
-;;; Output the readable #A form of an array.
-(defun output-array-guts (array stream)
-  (when (and *print-readably*
-             (not (array-readably-printable-p array)))
-    (error 'print-not-readable :object array))
-  (write-char #\# stream)
-  (let ((*print-base* 10)
-        (*print-radix* nil))
-    (output-integer (array-rank array) stream))
-  (write-char #\A stream)
+;;; Convert an array into a list that can be used with MAKE-ARRAY's
+;;; :INITIAL-CONTENTS keyword argument.
+(defun listify-array (array)
   (with-array-data ((data array) (start) (end))
     (declare (ignore end))
-    (sub-output-array-guts data (array-dimensions array) stream start)))
+    (labels ((listify (dimensions index)
+               (if (null dimensions)
+                   (aref data index)
+                   (let* ((dimension (car dimensions))
+                          (dimensions (cdr dimensions))
+                          (count (reduce #'* dimensions)))
+                     (loop for i below dimension
+                           collect (listify dimensions index)
+                           do (incf index count))))))
+      (listify (array-dimensions array) start))))
+
+(defun output-unreadable-array-readably (array stream)
+  (write-string "#." stream)
+  (write `(make-array ',(array-dimensions array)
+                      :element-type ',(array-element-type array)
+                      :initial-contents ',(listify-array array))
+         :stream stream))
+
+;;; Output the readable #A form of an array.
+(defun output-array-guts (array stream)
+  (cond ((or (not *print-readably*)
+             (array-readably-printable-p array))
+         (write-char #\# stream)
+         (let ((*print-base* 10)
+               (*print-radix* nil))
+           (output-integer (array-rank array) stream))
+         (write-char #\A stream)
+         (with-array-data ((data array) (start) (end))
+           (declare (ignore end))
+           (sub-output-array-guts data (array-dimensions array) stream start)))
+        (*read-eval*
+         (output-unreadable-array-readably array stream))
+        (t
+         (print-not-readable-error array stream))))
 
 (defun sub-output-array-guts (array dimensions stream index)
   (declare (type (simple-array * (*)) array) (fixnum index))
@@ -1274,71 +1376,68 @@
   ;; FIXME: I think only FORMAT-DOLLARS calls FLONUM-TO-STRING with
   ;; possibly-negative X.
   (setf x (abs x))
-  (cond ((zerop x)
-         ;; Zero is a special case which FLOAT-STRING cannot handle.
-         (if fdigits
-             (let ((s (make-string (1+ fdigits) :initial-element #\0)))
-               (setf (schar s 0) #\.)
-               (values s (length s) t (zerop fdigits) 0))
-             (values "." 1 t t 0)))
-        (t
-         (multiple-value-bind (e string)
-             (if fdigits
-                 (flonum-to-digits x (min (- (+ fdigits (or scale 0)))
-                                          (- (or fmin 0))))
-                 (if (and width (> width 1))
-                     (let ((w (multiple-value-list
-                               (flonum-to-digits x
-                                                 (max 1
-                                                      (+ (1- width)
-                                                         (if (and scale (minusp scale))
-                                                             scale 0)))
-                                                 t)))
-                           (f (multiple-value-list
-                               (flonum-to-digits x (- (+ (or fmin 0)
-                                                         (if scale scale 0)))))))
-                       (cond
-                         ((>= (length (cadr w)) (length (cadr f)))
-                          (values-list w))
-                         (t (values-list f))))
-                     (flonum-to-digits x)))
-           (let ((e (+ e (or scale 0)))
-                 (stream (make-string-output-stream)))
-             (if (plusp e)
-                 (progn
-                   (write-string string stream :end (min (length string)
-                                                         e))
-                   (dotimes (i (- e (length string)))
-                     (write-char #\0 stream))
-                   (write-char #\. stream)
-                   (write-string string stream :start (min (length
-                                                            string) e))
-                   (when fdigits
-                     (dotimes (i (- fdigits
-                                    (- (length string)
-                                       (min (length string) e))))
-                       (write-char #\0 stream))))
-                 (progn
-                   (write-string "." stream)
-                   (dotimes (i (- e))
-                     (write-char #\0 stream))
-                   (write-string string stream)
-                   (when fdigits
-                     (dotimes (i (+ fdigits e (- (length string))))
-                       (write-char #\0 stream)))))
-             (let ((string (get-output-stream-string stream)))
-               (values string (length string)
-                       (char= (char string 0) #\.)
-                       (char= (char string (1- (length string))) #\.)
-                       (position #\. string))))))))
+  (multiple-value-bind (e string)
+      (if fdigits
+          (flonum-to-digits x (min (- (+ fdigits (or scale 0)))
+                                   (- (or fmin 0))))
+          (if (and width (> width 1))
+              (let ((w (multiple-value-list
+                        (flonum-to-digits x
+                                          (max 1
+                                               (+ (1- width)
+                                                  (if (and scale (minusp scale))
+                                                      scale 0)))
+                                          t)))
+                    (f (multiple-value-list
+                        (flonum-to-digits x (- (+ (or fmin 0)
+                                                  (if scale scale 0)))))))
+                (cond
+                  ((>= (length (cadr w)) (length (cadr f)))
+                   (values-list w))
+                  (t (values-list f))))
+              (flonum-to-digits x)))
+    (let ((e (if (zerop x)
+                 e
+                 (+ e (or scale 0))))
+          (stream (make-string-output-stream)))
+      (if (plusp e)
+          (progn
+            (write-string string stream :end (min (length string) e))
+            (dotimes (i (- e (length string)))
+              (write-char #\0 stream))
+            (write-char #\. stream)
+            (write-string string stream :start (min (length string) e))
+            (when fdigits
+              (dotimes (i (- fdigits
+                             (- (length string)
+                                (min (length string) e))))
+                (write-char #\0 stream))))
+          (progn
+            (write-string "." stream)
+            (dotimes (i (- e))
+              (write-char #\0 stream))
+            (write-string string stream :end (when fdigits
+                                               (min (length string)
+                                                    (max (or fmin 0)
+                                                         (+ fdigits e)))))
+            (when fdigits
+              (dotimes (i (+ fdigits e (- (length string))))
+                (write-char #\0 stream)))))
+      (let ((string (get-output-stream-string stream)))
+        (values string (length string)
+                (char= (char string 0) #\.)
+                (char= (char string (1- (length string))) #\.)
+                (position #\. string))))))
 
-;;; implementation of figure 1 from Burger and Dybvig, 1996.  As the
-;;; implementation of the Dragon from Classic CMUCL (and previously in
-;;; SBCL above FLONUM-TO-STRING) says: "DO NOT EVEN THINK OF
-;;; ATTEMPTING TO UNDERSTAND THIS CODE WITHOUT READING THE PAPER!",
-;;; and in this case we have to add that even reading the paper might
-;;; not bring immediate illumination as CSR has attempted to turn
-;;; idiomatic Scheme into idiomatic Lisp.
+;;; implementation of figure 1 from Burger and Dybvig, 1996. It is
+;;; extended in order to handle rounding.
+;;;
+;;; As the implementation of the Dragon from Classic CMUCL (and
+;;; previously in SBCL above FLONUM-TO-STRING) says: "DO NOT EVEN
+;;; THINK OF ATTEMPTING TO UNDERSTAND THIS CODE WITHOUT READING THE
+;;; PAPER!", and in this case we have to add that even reading the
+;;; paper might not bring immediate illumination as CSR has attempted
+;;; to turn idiomatic Scheme into idiomatic Lisp.
 ;;;
 ;;; FIXME: figure 1 from Burger and Dybvig is the unoptimized
 ;;; algorithm, noticeably slow at finding the exponent.  Figure 2 has
@@ -1381,9 +1480,10 @@
                                (r r (* r print-base))
                                (m+ m+ (* m+ print-base))
                                (m- m- (* m- print-base)))
-                              ((not (or (< (* (+ r m+) print-base) s)
-                                        (and (not high-ok)
-                                             (= (* (+ r m+) print-base) s))))
+                              ((not (and (plusp (- r m-)) ; Extension to handle zero
+                                         (or (< (* (+ r m+) print-base) s)
+                                             (and (not high-ok)
+                                                  (= (* (+ r m+) print-base) s)))))
                                (values k (generate r s m+ m-)))))))
                    (generate (r s m+ m-)
                      (let (d tc1 tc2)
@@ -1559,7 +1659,8 @@
   (cond (*read-eval*
          (write-string "#." stream))
         (*print-readably*
-         (error 'print-not-readable :object x))
+         (return-from output-float-infinity
+           (print-not-readable-error x stream)))
         (t
          (write-string "#<" stream)))
   (write-string "SB-EXT:" stream)
@@ -1688,15 +1789,15 @@
   nil)
 
 (defun output-fun (object stream)
-    (let* ((*print-length* 3)  ; in case we have to..
-           (*print-level* 3)  ; ..print an interpreted function definition
-           (name (%fun-name object))
-           (proper-name-p (and (legal-fun-name-p name) (fboundp name)
-                               (eq (fdefinition name) object))))
-      (print-unreadable-object (object stream :identity (not proper-name-p))
-        (format stream "~:[FUNCTION~;CLOSURE~]~@[ ~S~]"
-                (closurep object)
-                name))))
+  (let* ((*print-length* 4)  ; in case we have to..
+         (*print-level* 3)  ; ..print an interpreted function definition
+         (name (%fun-name object))
+         (proper-name-p (and (legal-fun-name-p name) (fboundp name)
+                             (eq (fdefinition name) object))))
+    (print-unreadable-object (object stream :identity (not proper-name-p))
+      (format stream "~:[FUNCTION~;CLOSURE~]~@[ ~S~]"
+              (closurep object)
+              name))))
 
 ;;;; catch-all for unknown things
 

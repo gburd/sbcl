@@ -17,6 +17,10 @@
 ;;; slightly differently) elsewhere.
 (declaim (special *posix-argv*
                   *core-string*
+                  *stdin*
+                  *stdout*
+                  *stderr*
+                  *tty*
                   *read-only-space-free-pointer*
                   sb!vm:*static-space-free-pointer*
                   sb!vm::*current-catch-block*
@@ -38,6 +42,9 @@
                   sb!unix::*unblock-deferrables-on-enabling-interrupts-p*
                   *interrupts-enabled*
                   *interrupt-pending*
+                  #!+sb-thruption *thruption-pending*
+                  #!+sb-safepoint *gc-safe*
+                  #!+sb-safepoint *in-safepoint*
                   *free-interrupt-context-index*
                   sb!kernel::*gc-epoch*
                   sb!vm::*unwind-to-frame-function*

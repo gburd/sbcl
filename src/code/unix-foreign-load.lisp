@@ -46,6 +46,9 @@
   (dlerror)
   (let (dlerror)
     (cond ((and (not objp) *runtime-dlhandle*)
+           ;; CLH/NS: if we're on sufficiently old darwin we can't close
+           ;; *runtime-dlhandle* for some reason, so don't.
+           #!-darwin
            (dlclose *runtime-dlhandle*)
            (setf dlerror (dlerror)
                  *runtime-dlhandle* nil))

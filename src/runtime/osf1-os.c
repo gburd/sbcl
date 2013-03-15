@@ -54,7 +54,7 @@ size_t os_vm_page_size;
 void
 os_init(char *argv[], char *envp[])
 {
-    os_vm_page_size = getpagesize();
+    os_vm_page_size = BACKEND_PAGE_BYTES;
 }
 
 
@@ -146,7 +146,7 @@ os_install_interrupt_handlers(void)
 }
 
 char *
-os_get_runtime_executable_path()
+os_get_runtime_executable_path(int external)
 {
     return NULL;
 }

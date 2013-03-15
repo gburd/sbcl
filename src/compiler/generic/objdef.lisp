@@ -35,7 +35,8 @@
 
 ;;;; the primitive objects themselves
 
-(define-primitive-object (cons :lowtag list-pointer-lowtag
+(define-primitive-object (cons :type cons
+                               :lowtag list-pointer-lowtag
                                :alloc-trans cons)
   (car :ref-trans car :set-trans sb!c::%rplaca :init :arg
        :cas-trans %compare-and-swap-car)
@@ -50,7 +51,7 @@
 (define-primitive-object (bignum :lowtag other-pointer-lowtag
                                  :widetag bignum-widetag
                                  :alloc-trans sb!bignum::%allocate-bignum)
-  (digits :rest-p t :c-type #!-alpha "long" #!+alpha "u32"))
+  (digits :rest-p t :c-type #!-alpha "sword_t" #!+alpha "u32"))
 
 (define-primitive-object (ratio :type ratio
                                 :lowtag other-pointer-lowtag
@@ -102,37 +103,37 @@
                 :ref-trans %array-fill-pointer
                 :ref-known (flushable foldable)
                 :set-trans (setf %array-fill-pointer)
-                :set-known (unsafe))
+                :set-known ())
   (fill-pointer-p :type (member t nil)
                   :ref-trans %array-fill-pointer-p
                   :ref-known (flushable foldable)
                   :set-trans (setf %array-fill-pointer-p)
-                  :set-known (unsafe))
+                  :set-known ())
   (elements :type index
             :ref-trans %array-available-elements
             :ref-known (flushable foldable)
             :set-trans (setf %array-available-elements)
-            :set-known (unsafe))
+            :set-known ())
   (data :type array
         :ref-trans %array-data-vector
         :ref-known (flushable foldable)
         :set-trans (setf %array-data-vector)
-        :set-known (unsafe))
+        :set-known ())
   (displacement :type (or index null)
                 :ref-trans %array-displacement
                 :ref-known (flushable foldable)
                 :set-trans (setf %array-displacement)
-                :set-known (unsafe))
+                :set-known ())
   (displaced-p :type t
                :ref-trans %array-displaced-p
                :ref-known (flushable foldable)
                :set-trans (setf %array-displaced-p)
-               :set-known (unsafe))
+               :set-known ())
   (displaced-from :type list
                   :ref-trans %array-displaced-from
                   :ref-known (flushable)
                   :set-trans (setf %array-displaced-from)
-                  :set-known (unsafe))
+                  :set-known ())
   (dimensions :rest-p t))
 
 (define-primitive-object (vector :type vector
@@ -142,7 +143,7 @@
   ;; VECTOR -- see SHRINK-VECTOR.
   (length :ref-trans sb!c::vector-length
           :type index)
-  (data :rest-p t :c-type #!-alpha "unsigned long" #!+alpha "u32"))
+  (data :rest-p t :c-type #!-alpha "uword_t" #!+alpha "u32"))
 
 (define-primitive-object (code :type code-component
                                :lowtag other-pointer-lowtag
@@ -153,12 +154,12 @@
   (entry-points :type (or function null)
                 :ref-known (flushable)
                 :ref-trans %code-entry-points
-                :set-known (unsafe)
+                :set-known ()
                 :set-trans (setf %code-entry-points))
   (debug-info :type t
               :ref-known (flushable)
               :ref-trans %code-debug-info
-              :set-known (unsafe)
+              :set-known ()
               :set-trans (setf %code-debug-info))
   (trace-table-offset)
   (constants :rest-p t))
@@ -196,20 +197,20 @@
   (next :type (or function null)
         :ref-known (flushable)
         :ref-trans %simple-fun-next
-        :set-known (unsafe)
+        :set-known ()
         :set-trans (setf %simple-fun-next))
   (name :ref-known (flushable)
         :ref-trans %simple-fun-name
-        :set-known (unsafe)
+        :set-known ()
         :set-trans (setf %simple-fun-name))
   (arglist :type list
            :ref-known (flushable)
            :ref-trans %simple-fun-arglist
-           :set-known (unsafe)
+           :set-known ()
            :set-trans (setf %simple-fun-arglist))
   (type :ref-known (flushable)
         :ref-trans %simple-fun-type
-        :set-known (unsafe)
+        :set-known ()
         :set-trans (setf %simple-fun-type))
   ;; NIL for empty, STRING for a docstring, SIMPLE-VECTOR for XREFS, and (CONS
   ;; STRING SIMPLE-VECTOR) for both.
@@ -217,12 +218,12 @@
         :ref-trans %simple-fun-info
         :ref-known (flushable)
         :set-trans (setf %simple-fun-info)
-        :set-known (unsafe))
+        :set-known ())
   ;; the SB!C::DEBUG-FUN object corresponding to this object, or NIL for none
   #+nil ; FIXME: doesn't work (gotcha, lowly maintenoid!) See notes on bug 137.
   (debug-fun :ref-known (flushable)
              :ref-trans %simple-fun-debug-fun
-             :set-known (unsafe)
+             :set-known ()
              :set-trans (setf %simple-fun-debug-fun))
   (code :rest-p t :c-type "unsigned char"))
 
@@ -240,7 +241,7 @@
                           :alloc-trans %make-funcallable-instance)
   (trampoline :init :funcallable-instance-tramp)
   (function :ref-known (flushable) :ref-trans %funcallable-instance-function
-            :set-known (unsafe) :set-trans (setf %funcallable-instance-function))
+            :set-known () :set-trans (setf %funcallable-instance-function))
   (info :rest-p t))
 
 (define-primitive-object (value-cell :lowtag other-pointer-lowtag
@@ -249,7 +250,7 @@
                                      ;; for this. Is this needed as well?
                                      :alloc-trans make-value-cell)
   (value :set-trans value-cell-set
-         :set-known (unsafe)
+         :set-known ()
          :ref-trans value-cell-ref
          :ref-known (flushable)
          :init :arg))
@@ -296,8 +297,8 @@
   (current-cont :c-type #!-alpha "lispobj *" #!+alpha "u32")
   #!-(or x86 x86-64) current-code
   entry-pc
-  #!+win32 next-seh-frame
-  #!+win32 seh-frame-handler
+  #!+(and win32 x86) next-seh-frame
+  #!+(and win32 x86) seh-frame-handler
   tag
   (previous-catch :c-type #!-alpha "struct catch_block *" #!+alpha "u32"))
 
@@ -309,7 +310,8 @@
 
 (define-primitive-object (symbol :lowtag other-pointer-lowtag
                                  :widetag symbol-header-widetag
-                                 :alloc-trans %make-symbol)
+                                 :alloc-trans %make-symbol
+                                 :type symbol)
 
   ;; Beware when changing this definition.  NIL-the-symbol is defined
   ;; using this layout, and NIL-the-end-of-list-marker is the cons
@@ -323,7 +325,7 @@
   ;; also the CAR of NIL-as-end-of-list
   (value :init :unbound
          :set-trans %set-symbol-global-value
-         :set-known (unsafe))
+         :set-known ())
   ;; also the CDR of NIL-as-end-of-list.  Its reffer needs special
   ;; care for this reason, as hash values must be fixnums.
   (hash :set-trans %set-symbol-hash)
@@ -356,29 +358,11 @@
   (real :c-type "double" :length #!-x86-64 2 #!+x86-64 1)
   (imag :c-type "double" :length #!-x86-64 2 #!+x86-64 1))
 
-#!+(and sb-lutex sb-thread)
-(define-primitive-object (lutex
-                          :lowtag other-pointer-lowtag
-                          :widetag lutex-widetag
-                          :alloc-trans %make-lutex)
-  (gen :c-type "long" :length 1)
-  (live :c-type "long" :length 1)
-  (next :c-type "struct lutex *" :length 1)
-  (prev :c-type "struct lutex *" :length 1)
-  (mutex :c-type "pthread_mutex_t *"
-         :length 1)
-  (mutexattr :c-type "pthread_mutexattr_t *"
-             :length 1)
-  (condition-variable :c-type "pthread_cond_t *"
-                      :length 1))
-
 ;;; this isn't actually a lisp object at all, it's a c structure that lives
 ;;; in c-land.  However, we need sight of so many parts of it from Lisp that
 ;;; it makes sense to define it here anyway, so that the GENESIS machinery
 ;;; can take care of maintaining Lisp and C versions.
-;;; Hence the even-fixnum lowtag just so we don't get odd(sic) numbers
-;;; added to the slot offsets
-(define-primitive-object (thread :lowtag even-fixnum-lowtag)
+(define-primitive-object (thread)
   ;; no_tls_value_marker is borrowed very briefly at thread startup to
   ;; pass the address of initial-function into new_thread_trampoline.
   ;; tls[0] = NO_TLS_VALUE_MARKER_WIDETAG because a the tls index slot
@@ -390,30 +374,68 @@
   ;; Kept here so that when the thread dies we can release the whole
   ;; memory we reserved.
   (os-address :c-type "void *" :length #!+alpha 2 #!-alpha 1)
+  ;; Keep these next four slots close to the beginning of the structure.
+  ;; Doing so reduces code size for x86-64 allocation sequences and
+  ;; special variable manipulations.
+  #!+gencgc (alloc-region :c-type "struct alloc_region" :length 5)
+  #!+(or x86 x86-64 sb-thread) (pseudo-atomic-bits)
+  (binding-stack-start :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1)
+  (binding-stack-pointer :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1)
   #!+sb-thread
   (os-attr :c-type "pthread_attr_t *" :length #!+alpha 2 #!-alpha 1)
   #!+sb-thread
-  (state-lock :c-type "pthread_mutex_t *" :length #!+alpha 2 #!-alpha 1)
+  (state-sem :c-type "os_sem_t *" :length #!+alpha 2 #!-alpha 1)
   #!+sb-thread
-  (state-cond :c-type "pthread_cond_t *" :length #!+alpha 2 #!-alpha 1)
-  (binding-stack-start :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1)
-  (binding-stack-pointer :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1)
+  (state-not-running-sem :c-type "os_sem_t *" :length #!+alpha 2 #!-alpha 1)
+  #!+sb-thread
+  (state-not-running-waitcount :c-type "int" :length 1)
+  #!+sb-thread
+  (state-not-stopped-sem :c-type "os_sem_t *" :length #!+alpha 2 #!-alpha 1)
+  #!+sb-thread
+  (state-not-stopped-waitcount :c-type "int" :length 1)
   (control-stack-start :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1)
   (control-stack-end :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1)
   (control-stack-guard-page-protected)
   (alien-stack-start :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1)
   (alien-stack-pointer :c-type "lispobj *" :length #!+alpha 2 #!-alpha 1)
-  #!+gencgc (alloc-region :c-type "struct alloc_region" :length 5)
+  #!+win32 (private-events :c-type "struct private_events" :length 2)
   (this :c-type "struct thread *" :length #!+alpha 2 #!-alpha 1)
   (prev :c-type "struct thread *" :length #!+alpha 2 #!-alpha 1)
   (next :c-type "struct thread *" :length #!+alpha 2 #!-alpha 1)
   ;; starting, running, suspended, dead
   (state :c-type "lispobj")
   (tls-cookie)                          ;  on x86, the LDT index
-  #!+(or x86 x86-64) (pseudo-atomic-bits)
   (interrupt-data :c-type "struct interrupt_data *"
                   :length #!+alpha 2 #!-alpha 1)
   (stepping)
+  ;; For various reasons related to pseudo-atomic and interrupt
+  ;; handling, we need to know if the machine context is in Lisp code
+  ;; or not.  On non-threaded targets, this is a global variable in
+  ;; the runtime, but it's clearly a per-thread value.
+  #!+sb-thread
+  (foreign-function-call-active :c-type "boolean")
+  ;; Same as above for the location of the current control stack frame.
+  #!+(and sb-thread (not (or x86 x86-64)))
+  (control-frame-pointer :c-type "lispobj *")
+  ;; Same as above for the location of the current control stack
+  ;; pointer.  This is also used on threaded x86oids to allow LDB to
+  ;; print an approximation of the CSP as needed.
+  #!+sb-thread
+  (control-stack-pointer :c-type "lispobj *")
+  #!+mach-exception-handler
+  (mach-port-name :c-type "mach_port_name_t")
+  (nonpointer-data :c-type "struct nonpointer_thread_data *" :length #!+alpha 2 #!-alpha 1)
+  #!+(and sb-safepoint x86) (selfptr :c-type "struct thread *")
+  ;; Context base pointer for running on top of system libraries built using
+  ;; -fomit-frame-pointer.  Currently truly required and implemented only
+  ;; for (and win32 x86-64), but could be generalized to other platforms if
+  ;; needed:
+  #!+win32 (carried-base-pointer :c-type "os_context_register_t")
+  #!+sb-safepoint (csp-around-foreign-call :c-type "lispobj *")
+  #!+sb-safepoint (pc-around-foreign-call :c-type "lispobj *")
+  #!+win32 (synchronous-io-handle-and-flag :c-type "HANDLE" :length 1)
+  #!+(and sb-safepoint-strictly (not win32))
+  (sprof-alloc-region :c-type "struct alloc_region" :length 5)
   ;; KLUDGE: On alpha, until STEPPING we have been lucky and the 32
   ;; bit slots came in pairs. However the C compiler will align
   ;; interrupt_contexts on a double word boundary. This logic should

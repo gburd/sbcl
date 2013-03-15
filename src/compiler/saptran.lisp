@@ -14,9 +14,13 @@
 ;;;; DEFKNOWNs
 
 #!+linkage-table
-(deftransform foreign-symbol-address ((symbol &optional datap) (simple-string boolean))
-  (if (and (constant-lvar-p symbol) (constant-lvar-p datap))
-      `(sap-int (foreign-symbol-sap symbol datap))
+(deftransform foreign-symbol-address ((symbol &optional datap) (simple-string boolean)
+                                      * :important t :policy :fast-safe)
+  (if (and (constant-lvar-p symbol)
+           (constant-lvar-p datap)
+           #!+sb-dynamic-core (not (lvar-value datap)))
+      (values `(sap-int (foreign-symbol-sap symbol datap))
+              (or #!+sb-dynamic-core t))
       (give-up-ir1-transform)))
 
 (deftransform foreign-symbol-sap ((symbol &optional datap)
@@ -27,13 +31,18 @@
         `(foreign-symbol-sap symbol))
     #!+linkage-table
     (if (and (constant-lvar-p symbol) (constant-lvar-p datap))
-        (let ((name (lvar-value symbol))
+        (let (#!-sb-dynamic-core (name (lvar-value symbol))
               (datap (lvar-value datap)))
+          #!-sb-dynamic-core
           (if (or #+sb-xc-host t ; only static symbols on host
                   (not datap)
                   (find-foreign-symbol-in-table name *static-foreign-symbols*))
               `(foreign-symbol-sap ,name) ; VOP
-              `(foreign-symbol-dataref-sap ,name))) ; VOP
+              `(foreign-symbol-dataref-sap ,name)) ; VOP
+          #!+sb-dynamic-core
+          (if datap
+              `(foreign-symbol-dataref-sap symbol)
+              `(foreign-symbol-sap symbol)))
         (give-up-ir1-transform)))
 
 (defknown (sap< sap<= sap= sap>= sap>)
@@ -80,6 +89,7 @@
   (defsapref signed-sap-ref-64 (signed-byte 64))
   (defsapref signed-sap-ref-word (signed-byte #.sb!vm:n-word-bits))
   (defsapref sap-ref-sap system-area-pointer)
+  (defsapref sap-ref-lispobj t)
   (defsapref sap-ref-single single-float)
   (defsapref sap-ref-double double-float)
   (defsapref sap-ref-long long-float)
@@ -158,6 +168,8 @@
   (def %set-signed-sap-ref-64 t (signed-byte 64))
   (def sap-ref-sap)
   (def %set-sap-ref-sap t system-area-pointer)
+  (def sap-ref-lispobj)
+  (def %set-sap-ref-lispobj t t)
   (def sap-ref-single)
   (def %set-sap-ref-single t single-float)
   (def sap-ref-double)

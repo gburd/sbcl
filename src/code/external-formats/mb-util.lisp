@@ -254,7 +254,9 @@
          ;; replacement character, so we hardcode the preferred
          ;; replacement here.
          #\?
-         (mb-char-len (or (,ucs-to-mb (char-code byte)) -1))
+         (block size
+           (mb-char-len (or (,ucs-to-mb (char-code byte))
+                            (return-from size 0))))
          (let ((mb (,ucs-to-mb bits)))
            (if (null mb)
                (external-format-encoding-error stream byte)
@@ -265,7 +267,7 @@
                  (3 (setf (sap-ref-8 sap tail) (ldb (byte 8 16) mb)
                           (sap-ref-8 sap (1+ tail)) (ldb (byte 8 8) mb)
                           (sap-ref-8 sap (+ 2 tail)) (ldb (byte 8 0) mb))))))
-         (,mb-len byte)
+         (1 (,mb-len byte))
          (let* ((mb (ecase size
                       (1 byte)
                       (2 (let ((byte2 (sap-ref-8 sap (1+ head))))

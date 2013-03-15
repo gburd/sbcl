@@ -5,7 +5,7 @@
 
 (defvar *test-directory*
   (ensure-directories-exist
-   (merge-pathnames (make-pathname :directory '(:relative "test-lab"))
+   (merge-pathnames (make-pathname :directory '(:relative "test-output"))
                     (make-pathname :directory
                                    (pathname-directory *load-truename*)))))
 
@@ -107,11 +107,16 @@
   (handler-case
       (sb-posix:mkdir #-win32 "/" #+win32 "C:/" 0)
     (sb-posix:syscall-error (c)
-      (sb-posix:syscall-errno c)))
-  #-win32
-  #.sb-posix::eexist
-  #+win32
-  #.sb-posix:eacces)
+      ;; The results aren't the most consistent ones across platforms. Darwin
+      ;; likes EISDIR, Windows either EACCESS or EEXIST, others EEXIST.
+      ;; ...let's just accept them all.
+      (when (member (sb-posix:syscall-errno c)
+                    (list #.sb-posix:eisdir
+                          #.sb-posix:eacces
+                          #.sb-posix::eexist)
+                    :test #'eql)
+        :ok)))
+  :ok)
 
 (define-eacces-test mkdir.error.3
   (let* ((dir (merge-pathnames
@@ -164,13 +169,21 @@
 
 (deftest rmdir.error.3
   (handler-case
-      (sb-posix:rmdir #-win32 "/" #+win32 "C:/")
+      (sb-posix:rmdir #-win32 "/" #+win32 (sb-ext:posix-getenv "windir"))
     (sb-posix:syscall-error (c)
-      (sb-posix:syscall-errno c)))
-  #-win32
-  #.sb-posix::ebusy
-  #+win32
-  #.sb-posix::eacces)
+      (typep
+       (sb-posix:syscall-errno c)
+       '(member
+         #+(or darwin openbsd)
+         #.sb-posix:eisdir
+         #+win32
+         #.sb-posix::eacces
+         #+win32
+         #.sb-posix::enotempty
+         #+sunos
+         #.sb-posix::einval
+         #-(or darwin openbsd win32 sunos)
+         #.sb-posix::ebusy)))) t)
 
 (deftest rmdir.error.4
   (let* ((dir (ensure-directories-exist
@@ -213,7 +226,6 @@
         result)))
   #.sb-posix::eacces)
 
-#-darwin
 (deftest stat.1
   (let* ((stat (sb-posix:stat *test-directory*))
          (mode (sb-posix::stat-mode stat)))
@@ -221,7 +233,7 @@
     (logand mode (logior sb-posix::s-iread sb-posix::s-iwrite sb-posix::s-iexec)))
   #.(logior sb-posix::s-iread sb-posix::s-iwrite sb-posix::s-iexec))
 
-#-(or darwin win32)
+#-win32
 (deftest stat.2
   (let* ((stat (sb-posix:stat "/"))
          (mode (sb-posix::stat-mode stat)))
@@ -242,7 +254,7 @@
     (< (- atime unix-now) 10))
   t)
 
-#-(or darwin win32)
+#-win32
 (deftest stat.4
   (let* ((stat (sb-posix:stat (make-pathname :directory '(:absolute :up))))
          (mode (sb-posix::stat-mode stat)))
@@ -268,14 +280,15 @@
 
 #+win32
 (deftest stat.5
-    (let* ((stat-1 (sb-posix:stat "/"))
-           (mode-1 (sb-posix:stat-mode stat-1))
-           (stat-2 (sb-posix:stat "C:\\CONFIG.SYS"
-                                   stat-1))
-           (mode-2 (sb-posix:stat-mode stat-2)))
-      (values
-       (eq stat-1 stat-2)
-       (/= mode-1 mode-2)))
+    (let ((f (namestring (merge-pathnames "some.file" *test-directory*))))
+      (close (open f :if-exists :append :if-does-not-exist :create))
+      (let* ((stat-1 (sb-posix:stat "/"))
+             (mode-1 (sb-posix:stat-mode stat-1))
+             (stat-2 (sb-posix:stat f stat-1))
+             (mode-2 (sb-posix:stat-mode stat-2)))
+        (values
+         (eq stat-1 stat-2)
+         (/= mode-1 mode-2))))
   t
   t)
 
@@ -331,7 +344,6 @@
     (sb-posix:s-isreg mode))
   nil)
 
-#-darwin
 (deftest stat-mode.2
   (with-stat-mode (mode *test-directory*)
     (sb-posix:s-isdir mode))
@@ -358,7 +370,7 @@
     (sb-posix:s-issock mode))
   nil)
 
-#-(or win32 darwin)
+#-win32
 (deftest stat-mode.7
   (let ((link-pathname (make-pathname :name "stat-mode.7"
                                       :defaults *test-directory*)))
@@ -370,7 +382,6 @@
       (ignore-errors (sb-posix:unlink link-pathname))))
   t)
 
-#-darwin
 (deftest stat-mode.8
   (let ((pathname (make-pathname :name "stat-mode.8"
                                  :defaults *test-directory*)))
@@ -450,13 +461,13 @@
                   (progn
                     (multiple-value-bind (nope error)
                         (ignore-errors (sb-posix:fcntl f sb-posix:f-setlk flock))
-                      (sb-ext:quit
-                       :unix-status
+                      (sb-ext:exit
+                       :code
                        (cond ((not (null nope)) 1)
                              ((= (sb-posix:syscall-errno error) sb-posix:eagain)
                               42)
                              (t 86))
-                       :recklessly-p t #| don't delete the file |#)))
+                       :abort t #| don't delete the file |#)))
                   (progn
                     (setf kid-status
                           (sb-posix:wexitstatus
@@ -467,7 +478,7 @@
   42)
 
 
-#-win32
+#-(or win32 netbsd)
 (deftest fcntl.flock.2
     (locally (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
       (let ((flock (make-instance 'sb-posix:flock
@@ -484,12 +495,12 @@
                   (pid (sb-posix:fork)))
               (if (zerop pid)
                   (let ((r (sb-posix:fcntl f sb-posix:f-getlk flock)))
-                    (sb-ext:quit
-                     :unix-status
+                    (sb-ext:exit
+                     :code
                      (cond ((not (zerop r)) 1)
                            ((= (sb-posix:flock-pid flock) ppid) 42)
                            (t 86))
-                     :recklessly-p t #| don't delete the file |#))
+                     :abort t #| don't delete the file |#))
                   (progn
                     (setf kid-status
                           (sb-posix:wexitstatus
@@ -498,6 +509,24 @@
                     (throw 'test nil))))))
         kid-status))
   42)
+
+(deftest read.1
+    (progn
+      (with-open-file (ouf (merge-pathnames "read-test.txt" *test-directory*)
+                           :direction :output
+                           :if-exists :supersede
+                           :if-does-not-exist :create)
+        (write-string "foo" ouf))
+      (let ((fd (sb-posix:open (merge-pathnames "read-test.txt" *test-directory*) sb-posix:o-rdonly)))
+        (unwind-protect
+             (let ((buf (make-array 10 :element-type '(unsigned-byte 8))))
+               (values
+                (sb-posix:read fd (sb-sys:vector-sap buf) 10)
+                (code-char (aref buf 0))
+                (code-char (aref buf 1))
+                (code-char (aref buf 2))))
+          (sb-posix:close fd))))
+  3 #\f #\o #\o)
 
 (deftest opendir.1
   (let ((dir (sb-posix:opendir "/")))
@@ -539,6 +568,23 @@
                         #'string<))
         (sb-posix:closedir dir)))
   t)
+
+
+(deftest write.1
+    (progn
+      (let ((fd (sb-posix:open (merge-pathnames "write-test.txt" *test-directory*)
+                               (logior sb-posix:o-creat sb-posix:o-wronly)
+                               (logior sb-posix:s-irusr sb-posix:s-iwusr)))
+            (retval nil))
+        (unwind-protect
+             (let ((buf (coerce "foo" 'simple-base-string)))
+               (setf retval (sb-posix:write fd (sb-sys:vector-sap buf) 3)))
+          (sb-posix:close fd))
+
+        (with-open-file (inf (merge-pathnames "write-test.txt" *test-directory*)
+                             :direction :input)
+          (values retval (read-line inf)))))
+  3 "foo")
 
 #-win32
 (deftest pwent.1
@@ -611,12 +657,12 @@
   t)
 
 
-#-(or darwin win32)
+#-win32
 (deftest time.1
     (plusp (sb-posix:time))
   t)
 
-#-(or darwin win32)
+#-win32
 (deftest utimes.1
     (let ((file (merge-pathnames #p"utimes.1" *test-directory*))
           (atime (random (1- (expt 2 31))))
@@ -773,7 +819,7 @@
 
 ;#-(or win32 sunos hpux)
 ;;;; mkdtemp is unimplemented on at least Solaris 10
-#-(or win32 hpux)
+#-(or win32 hpux sunos)
 ;;; But it is implemented on OpenSolaris 2008.11
 (deftest mkdtemp.1
     (let ((pathname
@@ -818,8 +864,35 @@
                              :type (format nil "~AXXXXXX"
                                            (make-string n :initial-element #\x))
                              :defaults default))
-        (let ((pathname (sb-ext:parse-native-namestring temp)))
           (unwind-protect
-               (values (integerp fd) (pathname-name pathname))
-            (delete-file temp)))))
-  t "mkstemp-1")
+               (values (integerp fd) (subseq temp 0 (position #\. temp)))
+            (delete-file temp))))
+  t "/tmp/mkstemp-1")
+
+(deftest envstuff
+    (let ((name1 "ASLIFJLSDKFJKAHGSDKLJH")
+          (name2 "KJHFKLJDSHIUYHBSDNFCBH"))
+      (values (sb-posix:getenv name1)
+              (sb-posix:getenv name1)
+              (progn
+                (sb-posix:putenv (concatenate 'string name1 "=name1,test1"))
+                (sb-ext:gc :full t)
+                (sb-posix:getenv name1))
+              (progn
+                (sb-posix:setenv name1 "name1,test2" 0)
+                (sb-ext:gc :full t)
+                (sb-posix:getenv name1))
+              (progn
+                (sb-posix:setenv name2 "name2,test1" 0)
+                (sb-ext:gc :full t)
+                (sb-posix:getenv name2))
+              (progn
+                (sb-posix:setenv name2 "name2,test2" 1)
+                (sb-ext:gc :full t)
+                (sb-posix:getenv name2))))
+  nil
+  nil
+  "name1,test1"
+  "name1,test1"
+  "name2,test1"
+  "name2,test2")

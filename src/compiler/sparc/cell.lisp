@@ -29,6 +29,8 @@
   (:results)
   (:generator 1
     (storew value object offset lowtag)))
+
+(define-vop (init-slot set-slot))
 
 ;;;; Symbol hacking VOPs:
 
@@ -227,6 +229,12 @@
 
 (define-vop (closure-init slot-set)
   (:variant closure-info-offset fun-pointer-lowtag))
+
+(define-vop (closure-init-from-fp)
+  (:args (object :scs (descriptor-reg)))
+  (:info offset)
+  (:generator 4
+    (storew cfp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; value cell hackery.
 
@@ -289,7 +297,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset
@@ -311,7 +319,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset
@@ -333,7 +341,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset
@@ -355,7 +363,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset
@@ -378,7 +386,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset
@@ -400,7 +408,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset
@@ -423,7 +431,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset
@@ -447,7 +455,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset
@@ -478,7 +486,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset
@@ -502,7 +510,7 @@
   (:generator 5
     (loadw offset object 0 instance-pointer-lowtag)
     (inst srl offset offset n-widetag-bits)
-    (inst sll offset offset 2)
+    (inst sll offset offset n-fixnum-tag-bits)
     (inst sub offset offset index)
     (inst add
           offset

@@ -11,6 +11,8 @@
 
 (cl:in-package :cl-user)
 
+(use-package :test-util)
+
 ;;; Bug from CLOCC.
 (defpackage :p1
   (:use :cl)
@@ -36,6 +38,8 @@
   (setf (code-msg code) 2)
   (assert (eql (code-msg code) 2))
   (assert (eql (%code-msg code) 1)))
+
+(in-package :cl-user)
 
 ;;; Check that initializing the condition class metaobject doesn't create
 ;;; any instances. Reported by Marco Baringer on sbcl-devel Mon, 05 Jul 2004.
@@ -92,22 +96,23 @@
 (define-condition my-stream-error-1-0-9 (stream-error) ())
 (define-condition parse-foo-error-1-0-9 (parse-error) ())
 (define-condition read-bar-error-1-0-9 (reader-error) ())
-(let (;; instances created initializing all the slots specified in
-      ;; ANSI CL
-      (parse-foo-error-1-0-9 (make-condition 'parse-foo-error-1-0-9
-                                             :stream *standard-input*))
-      (read-foo-error-1-0-9 (make-condition 'read-bar-error-1-0-9
-                                            :stream *standard-input*))
-      (my-stream-error-1-0-9 (make-condition 'my-stream-error-1-0-9
-                                             :stream *standard-input*)))
-  ;; should be printable
-  (dolist (c (list
-              my-stream-error-1-0-9
-              parse-foo-error-1-0-9
-              read-foo-error-1-0-9))
-    ;; whether escaped or not
-    (dolist (*print-escape* '(nil t))
-      (write c :stream (make-string-output-stream)))))
+(with-test (:name :printable-conditions)
+  (let (;; instances created initializing all the slots specified in
+        ;; ANSI CL
+        (parse-foo-error-1-0-9 (make-condition 'parse-foo-error-1-0-9
+                                               :stream *standard-input*))
+        (read-foo-error-1-0-9 (make-condition 'read-bar-error-1-0-9
+                                              :stream *standard-input*))
+        (my-stream-error-1-0-9 (make-condition 'my-stream-error-1-0-9
+                                               :stream *standard-input*)))
+    ;; should be printable
+    (dolist (c (list
+                my-stream-error-1-0-9
+                parse-foo-error-1-0-9
+                read-foo-error-1-0-9))
+      ;; whether escaped or not
+      (dolist (*print-escape* '(nil t))
+        (write c :stream (make-string-output-stream))))))
 
 ;;; Reported by Michael Weber: restart computation in :TEST-FUNCTION used to
 ;;; cause infinite recursion.
@@ -121,3 +126,19 @@
     (when (find-restart 'bar)
       (invoke-restart 'bar))))
 (assert (not (restart-test-finds-restarts)))
+
+(with-test (:name :bug-896379)
+  (let ((*evaluator-mode* :compile))
+    (handler-bind ((style-warning #'error))
+      (let ((reader (gensym "READER"))
+            (name (gensym "FOO-ERROR")))
+        (eval `(define-condition ,name (error)
+                 ((slot :initarg :slot :reader ,reader))
+                 (:report (lambda (c stream)
+                            (format stream "Oops: ~S" (,reader c))))))))))
+
+(with-test (:name :define-condition-result)
+  (let ((name (gensym "CONDITION")))
+    (assert
+     (eq (eval `(define-condition ,name () ()))
+         name))))

@@ -129,7 +129,7 @@
           (sc-is target signed-reg unsigned-reg descriptor-reg any-reg))
      (inst mov target val))
     ;; Likewise if the value is small enough.
-    ((typep val '(signed-byte 31))
+    ((typep val '(signed-byte 32))
      (inst mov target val))
     ;; Otherwise go through the temporary register
     (tmp-tn
@@ -159,10 +159,8 @@
              (etypecase val
                ((integer 0 0)
                 (zeroize y))
-               ((or (signed-byte 29) (unsigned-byte 29))
-                (inst mov y (fixnumize val)))
                (integer
-                (move-immediate y (fixnumize val)))
+                (inst mov y (fixnumize val)))
                (symbol
                 (load-symbol y val))
                (character
@@ -238,7 +236,7 @@
   (:note "fixnum untagging")
   (:generator 1
     (move y x)
-    (inst sar y  (1- n-lowtag-bits))))
+    (inst sar y n-fixnum-tag-bits)))
 (define-move-vop move-to-word/fixnum :move
   (any-reg descriptor-reg) (signed-reg unsigned-reg))
 
@@ -266,12 +264,12 @@
                    :from (:argument 0) :to (:result 0) :target y) eax)
   (:generator 4
     (move eax x)
-    (inst test al-tn 7)                 ; a symbolic constant for this
-    (inst jmp :z FIXNUM)                ; would be nice
+    (inst test al-tn fixnum-tag-mask)
+    (inst jmp :z FIXNUM)
     (loadw y eax bignum-digits-offset other-pointer-lowtag)
     (inst jmp DONE)
     FIXNUM
-    (inst sar eax (1- n-lowtag-bits))
+    (inst sar eax n-fixnum-tag-bits)
     (move y eax)
     DONE))
 (define-move-vop move-to-word/integer :move
@@ -290,12 +288,14 @@
   (:generator 1
     (cond ((and (sc-is x signed-reg unsigned-reg)
                 (not (location= x y)))
-           ;; Uses 7 bytes, but faster on the Pentium
-           (inst lea y (make-ea :qword :index x :scale 8)))
+           (if (= n-fixnum-tag-bits 1)
+               (inst lea y (make-ea :qword :base x :index x))
+               (inst lea y (make-ea :qword :index x
+                                    :scale (ash 1 n-fixnum-tag-bits)))))
           (t
            ;; Uses: If x is a reg 2 + 3; if x = y uses only 3 bytes
            (move y x)
-           (inst shl y (1- n-lowtag-bits))))))
+           (inst shl y n-fixnum-tag-bits)))))
 (define-move-vop move-from-word/fixnum :move
   (signed-reg unsigned-reg) (any-reg descriptor-reg))
 
@@ -346,15 +346,20 @@
   (:generator 20
     (aver (not (location= x y)))
     (let ((done (gen-label)))
-      (inst mov y #.(ash lowtag-mask (- n-word-bits n-fixnum-tag-bits 1)))
+      (inst mov y #.(ash (1- (ash 1 (1+ n-fixnum-tag-bits)))
+                         n-positive-fixnum-bits))
       ;; The assembly routines test the sign flag from this one, so if
       ;; you change stuff here, make sure the sign flag doesn't get
       ;; overwritten before the CALL!
       (inst test x y)
-      ;; Faster but bigger then SHL Y 4. The cost of doing this
-      ;; speculatively should be noise compared to bignum consing if
-      ;; that is needed and saves one branch.
-      (inst lea y (make-ea :qword :index x :scale 8))
+      ;; Using LEA is faster but bigger than MOV+SHL; it also doesn't
+      ;; twiddle the sign flag.  The cost of doing this speculatively
+      ;; should be noise compared to bignum consing if that is needed
+      ;; and saves one branch.
+      (if (= n-fixnum-tag-bits 1)
+          (inst lea y (make-ea :qword :base x :index x))
+          (inst lea y (make-ea :qword :index x
+                               :scale (ash 1 n-fixnum-tag-bits))))
       (inst jmp :z done)
       (inst mov y x)
       (inst lea temp-reg-tn

@@ -35,6 +35,8 @@
         (storew value object offset lowtag))
     #!-gengc
     (storew value object offset lowtag)))
+
+(define-vop (init-slot set-slot))
 
 ;;;; symbol hacking VOPs
 
@@ -239,6 +241,12 @@
 
 (define-vop (closure-init slot-set)
   (:variant closure-info-offset fun-pointer-lowtag))
+
+(define-vop (closure-init-from-fp)
+  (:args (object :scs (descriptor-reg)))
+  (:info offset)
+  (:generator 4
+    (storew cfp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; value cell hackery
 
@@ -360,7 +368,7 @@
                       (:variant ,offset))
                     ,@(when writable
                         `((defknown ((setf ,fn)) (,lisp-type) ,lisp-type
-                            (unsafe))
+                            ())
                           (define-vop (,set ,set-vop)
                             (:translate (setf ,fn))
                             (:variant ,offset)))))))))

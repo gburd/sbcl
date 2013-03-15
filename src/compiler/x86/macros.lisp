@@ -110,17 +110,19 @@
 
 #!+sb-thread
 (defmacro load-tl-symbol-value (reg symbol)
-  `(progn
-    (inst mov ,reg (make-ea-for-symbol-tls-index ,symbol))
-    (inst mov ,reg (make-ea :dword :base ,reg) :fs)))
+  `(with-tls-ea (EA :base ,reg
+                    :disp-type :index
+                    :disp (make-ea-for-symbol-tls-index ,symbol))
+     (inst mov ,reg (make-ea :dword :base ,reg) :maybe-fs)))
 #!-sb-thread
 (defmacro load-tl-symbol-value (reg symbol) `(load-symbol-value ,reg ,symbol))
 
 #!+sb-thread
 (defmacro store-tl-symbol-value (reg symbol temp)
-  `(progn
-    (inst mov ,temp (make-ea-for-symbol-tls-index ,symbol))
-    (inst mov (make-ea :dword :base ,temp) ,reg :fs)))
+  `(with-tls-ea (EA :base ,temp
+                    :disp-type :index
+                    :disp (make-ea-for-symbol-tls-index ,symbol))
+     (inst mov EA ,reg :maybe-fs)))
 #!-sb-thread
 (defmacro store-tl-symbol-value (reg symbol temp)
   (declare (ignore temp))
@@ -128,19 +130,29 @@
 
 (defmacro load-binding-stack-pointer (reg)
   #!+sb-thread
-  `(progn
-     (inst mov ,reg (make-ea :dword
-                             :disp (* 4 thread-binding-stack-pointer-slot))
-           :fs))
+  `(with-tls-ea (EA :base ,reg
+                    :disp-type :constant
+                    :disp (* 4 thread-binding-stack-pointer-slot))
+     (inst mov ,reg EA :maybe-fs))
   #!-sb-thread
   `(load-symbol-value ,reg *binding-stack-pointer*))
 
 (defmacro store-binding-stack-pointer (reg)
   #!+sb-thread
   `(progn
-     (inst mov (make-ea :dword
+     #!+win32
+     (progn
+       (inst push eax-tn)
+       (inst push ,reg)
+       (with-tls-ea (EA :base eax-tn
+                        :disp-type :constant
                         :disp (* 4 thread-binding-stack-pointer-slot))
-           ,reg :fs))
+         (inst pop EA))
+       (inst pop eax-tn))
+     #!-win32
+     (with-tls-ea (EA :disp-type :constant
+                      :disp (* 4 thread-binding-stack-pointer-slot))
+       (inst mov EA ,reg :maybe-fs)))
   #!-sb-thread
   `(store-symbol-value ,reg *binding-stack-pointer*))
 
@@ -209,8 +221,15 @@
                            :foreign))))
 
 (defun allocation-inline (alloc-tn size)
-  (let ((ok (gen-label))
+  (let* ((ok (gen-label)) ;reindent after merging
         (done (gen-label))
+        #!+(and sb-thread win32)
+        (scratch-tns (loop for my-tn in `(,eax-tn ,ebx-tn ,edx-tn ,ecx-tn)
+                           when (and (not (location= alloc-tn my-tn))
+                                     (or (not (tn-p size))
+                                         (not (location= size my-tn))))
+                             collect my-tn))
+        (tls-prefix #!+sb-thread :fs #!-sb-thread nil)
         (free-pointer
          (make-ea :dword :disp
                   #!+sb-thread (* n-word-bytes thread-alloc-region-slot)
@@ -220,11 +239,23 @@
          (make-ea :dword :disp
                   #!+sb-thread (* n-word-bytes (1+ thread-alloc-region-slot))
                   #!-sb-thread (make-fixup "boxed_region" :foreign 4)
-                  :scale 1)))   ; thread->alloc_region.end_addr
+                  :scale 1))   ; thread->alloc_region.end_addr
+        #!+(and sb-thread win32) (scratch-tn (pop scratch-tns))
+        #!+(and sb-thread win32) (swap-tn (pop scratch-tns)))
     (unless (and (tn-p size) (location= alloc-tn size))
       (inst mov alloc-tn size))
-    (inst add alloc-tn free-pointer #!+sb-thread :fs)
-    (inst cmp alloc-tn end-addr #!+sb-thread :fs)
+    #!+(and sb-thread win32)
+    (progn
+      (inst push scratch-tn)
+      (inst push swap-tn)
+      (inst mov scratch-tn
+            (make-ea :dword :disp
+                     +win32-tib-arbitrary-field-offset+) tls-prefix)
+      (setf (ea-base free-pointer) scratch-tn
+            (ea-base end-addr) scratch-tn
+            tls-prefix nil))
+    (inst add alloc-tn free-pointer tls-prefix)
+    (inst cmp alloc-tn end-addr tls-prefix)
     (inst jmp :be ok)
     (let ((dst (ecase (tn-offset alloc-tn)
                  (#.eax-offset "alloc_overflow_eax")
@@ -239,15 +270,26 @@
     ;; Swap ALLOC-TN and FREE-POINTER
     (cond ((and (tn-p size) (location= alloc-tn size))
            ;; XCHG is extremely slow, use the xor swap trick
-           (inst xor alloc-tn free-pointer #!+sb-thread :fs)
-           (inst xor free-pointer alloc-tn #!+sb-thread :fs)
-           (inst xor alloc-tn free-pointer #!+sb-thread :fs))
+           #!-(and sb-thread win32)
+           (progn
+             (inst xor alloc-tn free-pointer tls-prefix)
+             (inst xor free-pointer alloc-tn tls-prefix)
+             (inst xor alloc-tn free-pointer tls-prefix))
+           #!+(and sb-thread win32)
+           (progn
+             (inst mov swap-tn free-pointer tls-prefix)
+             (inst mov free-pointer alloc-tn tls-prefix)
+             (inst mov alloc-tn swap-tn)))
           (t
            ;; It's easier if SIZE is still available.
-           (inst mov free-pointer alloc-tn #!+sb-thread :fs)
+           (inst mov free-pointer alloc-tn tls-prefix)
            (inst sub alloc-tn size)))
-    (emit-label done))
-  (values))
+    (emit-label done)
+    #!+(and sb-thread win32)
+    (progn
+      (inst pop swap-tn)
+      (inst pop scratch-tn))
+    (values)))
 
 
 ;;; Emit code to allocate an object with a size in bytes given by
@@ -261,6 +303,7 @@
 ;;; (FIXME: so why aren't we asserting this?)
 
 (defun allocation (alloc-tn size &optional inline dynamic-extent lowtag)
+  (declare (ignorable inline))
   (cond
     (dynamic-extent
      (allocation-dynamic-extent alloc-tn size lowtag))
@@ -290,7 +333,7 @@
 ;;;; error code
 (defun emit-error-break (vop kind code values)
   (assemble ()
-    #!-darwin
+    #!-ud2-breakpoints
     (inst int 3)                        ; i386 breakpoint instruction
     ;; CLH 20060314
     ;; On Darwin, we need to use #x0b0f instead of int3 in order
@@ -298,7 +341,7 @@
     ;; doesn't seem to be reliably firing SIGTRAP
     ;; handlers. Hopefully this will be fixed by Apple at a
     ;; later date.
-    #!+darwin
+    #!+ud2-breakpoints
     (inst word #x0b0f)
     ;; The return PC points here; note the location for the debugger.
     (when vop
@@ -350,8 +393,24 @@
        (progn ,@forms)
        (pseudo-atomic ,@forms)))
 
+;;; Unsafely clear pa flags so that the image can properly lose in a
+;;; pa section.
+#!+sb-thread
+(defmacro %clear-pseudo-atomic ()
+  #!+win32
+  `(progn)
+  #!-win32
+  '(inst mov (make-ea :dword :disp (* 4 thread-pseudo-atomic-bits-slot)) 0 :fs))
+
+#!+sb-safepoint
+(defun emit-safepoint ()
+  (inst test eax-tn (make-ea :dword :disp sb!vm::gc-safepoint-page-addr)))
+
 #!+sb-thread
 (defmacro pseudo-atomic (&rest forms)
+  #!+sb-safepoint-strictly
+  `(progn ,@forms (emit-safepoint))
+  #!-sb-safepoint-strictly
   (with-unique-names (label)
     `(let ((,label (gen-label)))
        (inst mov (make-ea :dword :disp (* 4 thread-pseudo-atomic-bits-slot))
@@ -363,7 +422,13 @@
        ;; if PAI was set, interrupts were disabled at the same time
        ;; using the process signal mask.
        (inst break pending-interrupt-trap)
-       (emit-label ,label))))
+       (emit-label ,label)
+       #!+sb-safepoint
+       ;; In this case, when allocation thinks a GC should be done, it
+       ;; does not mark PA as interrupted, but schedules a safepoint
+       ;; trap instead.  Let's take the opportunity to trigger that
+       ;; safepoint right now.
+       (emit-safepoint))))
 
 #!-sb-thread
 (defmacro pseudo-atomic (&rest forms)
@@ -540,7 +605,7 @@ Useful for e.g. foreign calls where another thread may trigger
 collection."
   (if objects
       (let ((pins (make-gensym-list (length objects)))
-            (wpo (block-gensym "WPO")))
+            (wpo (gensym "WITH-PINNED-OBJECTS-THUNK")))
         ;; BODY is stuffed in a function to preserve the lexical
         ;; environment.
         `(flet ((,wpo () (progn ,@body)))
@@ -560,3 +625,73 @@ collection."
                            `(touch-object ,pin))
                          pins)))))
       `(progn ,@body)))
+
+;;; Helper to hide the fact that thread access on Windows needs one more
+;;; instruction, needs the FS prefix in that instruction _instead_ of
+;;; the actual load/store, and partially hide the resulting need for a
+;;; temporary TN when the non-windows might have have dereferenced an EA
+;;; without a TN as a base.
+
+(defmacro with-tls-ea ((ea-var &key base
+                                    base-already-live-p
+                                    (disp-type :constant)
+                                    (disp 0))
+                       &body body)
+  "Execute BODY with various magic.  BODY is expected to emit instructions.
+
+   In the body, EA-VAR will be an alias for an EA which BODY can use to
+   perform a thread-local load or store.
+
+   Within the body, :MAYBE-FS will be replaced with :FS or NIL,
+   depending on the target, and needs to be included in any instruction
+   performing an access through the EA.
+
+   DISP-TYPE must be :INDEX, or :CONSTANT, and DISP must be an EA/TN,
+   or an expression returning an integer, respectively.
+
+   BASE must be a temporary TN, except in the following situation: BASE
+   will be unused when DISP-TYPE is constant, BASE-ALREADY-LIVE-P is
+   true, _and_ we're on POSIX.  This is an intentional optimization, and
+   the caller needs to take care to ignore the TN in this case, or can
+   omit this parameter.
+
+   BASE-ALREADY-LIVE-P means that at run-time, the BASE register already
+   holds an offset that we should add to instead of overwriting it.
+   The value of the BASE register is undefined following the macro invocation."
+  (check-type base-already-live-p boolean)
+  (check-type disp-type (member :index :constant))
+  #!-(and win32 sb-thread)
+  (let ((body (subst :fs :maybe-fs body)))
+    (ecase disp-type
+      (:constant
+       `(progn
+          ,@(subst (if base-already-live-p
+                       ;; use BASE and DISP
+                       `(make-ea :dword :base ,base :disp ,disp)
+                       ;; BASE not live and not needed, just use DISP
+                       `(make-ea :dword :disp ,disp))
+                   ea-var
+                   body)))
+      (:index
+       ;; need to use BASE in any case; and DISP is an EA
+       `(progn
+          (inst ,(if base-already-live-p 'add 'mov) ,base ,disp)
+          ,@(subst `(make-ea :dword :base ,base)
+                   ea-var
+                   body)))))
+  #!+(and win32 sb-thread)
+  ;; goes through a temporary register to add the thread address into it
+  (multiple-value-bind (constant-disp ea-disp)
+      (ecase disp-type
+        (:constant (values disp nil))
+        (:index    (values 0 disp)))
+    `(progn
+       ,@(when ea-disp
+           `((inst ,(if base-already-live-p 'add 'mov) ,base ,ea-disp)))
+       (inst ,(if (or base-already-live-p ea-disp) 'add 'mov)
+             ,base
+             (make-ea :dword :disp +win32-tib-arbitrary-field-offset+)
+             :fs)
+       ,@(subst `(make-ea :dword :base ,base :disp ,constant-disp)
+                ea-var
+                (subst nil :maybe-fs body)))))

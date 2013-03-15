@@ -44,10 +44,15 @@
  #+linux (:integer so-passcred "SO_PASSCRED")
  (:integer so-rcvbuf "SO_RCVBUF")
  (:integer so-keepalive "SO_KEEPALIVE"
-           "Send periodic keepalives: if peer does not respond, we get SIGPIPE")
+           "Send periodic keepalives.  If peer does not respond, we get SIGPIPE.")
+ #+linux (:integer tcp-keepcnt "TCP_KEEPCNT"
+                   "Number of unacknowledged probes before the connection is considered dead.")
+ #+linux (:integer tcp-keepidle "TCP_KEEPIDLE"
+                   "Seconds between the last data packet sent and the first keepalive probe.")
+ #+linux (:integer tcp-keepintvl "TCP_KEEPINTVL" "Seconds between keepalive probes.")
  (:integer so-oobinline "SO_OOBINLINE"
            "Put out-of-band data into the normal input queue when received")
- #-freebsd
+ #+linux
  (:integer so-no-check "SO_NO_CHECK")
  #+linux (:integer so-priority "SO_PRIORITY")
  (:integer so-linger "SO_LINGER"
@@ -74,6 +79,7 @@
  (:integer EOPNOTSUPP "EOPNOTSUPP")
  (:integer EPERM "EPERM")
  (:integer EPROTONOSUPPORT "EPROTONOSUPPORT")
+ (:integer ERANGE "ERANGE")
  (:integer ESOCKTNOSUPPORT "ESOCKTNOSUPPORT")
  (:integer ENETUNREACH "ENETUNREACH")
  (:integer ENOTCONN "ENOTCONN")
@@ -85,7 +91,7 @@
  (:integer NO-RECOVERY "NO_RECOVERY" "Non recoverable errors, FORMERR, REFUSED, NOTIMP.")
  (:integer NO-DATA "NO_DATA" "Valid name, no data record of requested type.")
  (:integer NO-ADDRESS "NO_ADDRESS" "No address, look for MX record.")
- #-hpux (:function h-strerror ("hstrerror" c-string (errno int)))
+ #-(or hpux sunos) (:function h-strerror ("hstrerror" c-string (errno int)))
 
  (:integer O-NONBLOCK "O_NONBLOCK")
  (:integer f-getfl "F_GETFL")
@@ -98,7 +104,7 @@
  (:integer msg-eor "MSG_EOR")
  (:integer msg-dontroute "MSG_DONTROUTE")
  (:integer msg-dontwait "MSG_DONTWAIT")
- (:integer msg-nosignal "MSG_NOSIGNAL")
+ #+linux (:integer msg-nosignal "MSG_NOSIGNAL")
  #+linux (:integer msg-confirm "MSG_CONFIRM")
  #+linux (:integer msg-more "MSG_MORE")
 
@@ -123,8 +129,30 @@
                        (integer proto "int" "p_proto")))
  (:function getprotobyname ("getprotobyname" (* protoent)
                                              (name c-string)))
+
+;; getprotobyname_r is a thread-safe reentrant version of getprotobyname
+ #+os-provides-getprotoby-r
+ (:function getprotobyname-r ("getprotobyname_r" int
+                                                 (name c-string)
+                                                 (result_buf (* protoent))
+                                                 (buffer (* char))
+                                                 (buffer-len size-t)
+                                                 #-solaris
+                                                 (result (* (* protoent)))))
+
+
  (:function getprotobynumber ("getprotobynumber" (* protoent)
                                                  (proto int)))
+ ;;ditto, save for the getprotobynumber part
+ #+os-provides-getprotoby-r
+ (:function getprotobynumber-r ("getprotobynumber_r" int
+                                                 (proto int)
+                                                 (result_buf (* protoent))
+                                                 (buffer (* char))
+                                                 (buffer-len size-t)
+                                                 #-solaris
+                                                 (result (* (* protoent)))))
+
  (:integer inaddr-any "INADDR_ANY")
  (:structure in-addr ("struct in_addr"
                       ((array (unsigned 8)) addr "u_int32_t" "s_addr")))

@@ -87,11 +87,6 @@
 ;;;;
 ;;;; KLUDGE: In SBCL, we only really use variant (1), and any generality
 ;;;; for the other variants is wasted. -- WHN 20000121
-
-;;;; FIXME: the STEP-FUNCTION stuff in the code seems to've been
-;;;; intended to support code which was conditionalized with
-;;;; LOOP-PREFER-POP (not true on CMU CL) and which has since been
-;;;; removed. Thus, STEP-FUNCTION stuff could probably be removed too.
 
 ;;;; list collection macrology
 
@@ -103,7 +98,7 @@
 
 (sb!int:defmacro-mundanely loop-collect-rplacd
     (&environment env (head-var tail-var &optional user-head-var) form)
-  (setq form (sb!xc:macroexpand form env))
+  (setq form (sb!int:%macroexpand form env))
   (flet ((cdr-wrap (form n)
            (declare (fixnum n))
            (do () ((<= n 4) (setq form `(,(case n
@@ -281,18 +276,10 @@ code to be loaded.
   path-keywords        ; hash table, value = (fn-name . extra-data)
   type-symbols         ; hash table of type SYMBOLS, test EQ,
                        ; value = CL type specifier
-  type-keywords        ; hash table of type STRINGS, test EQUAL,
+  type-keywords)       ; hash table of type STRINGS, test EQUAL,
                        ; value = CL type spec
-  ansi                 ; NIL, T, or :EXTENDED
-  implicit-for-required) ; see loop-hack-iteration
 (sb!int:def!method print-object ((u loop-universe) stream)
-  (let ((string (case (loop-universe-ansi u)
-                  ((nil) "non-ANSI")
-                  ((t) "ANSI")
-                  (:extended "extended-ANSI")
-                  (t (loop-universe-ansi u)))))
-    (print-unreadable-object (u stream :type t)
-      (write-string string stream))))
+  (print-unreadable-object (u stream :type t :identity t)))
 
 ;;; This is the "current" loop context in use when we are expanding a
 ;;; loop. It gets bound on each invocation of LOOP.
@@ -300,8 +287,7 @@ code to be loaded.
 
 (defun make-standard-loop-universe (&key keywords for-keywords
                                          iteration-keywords path-keywords
-                                         type-keywords type-symbols ansi)
-  (declare (type (member nil t :extended) ansi))
+                                         type-keywords type-symbols)
   (flet ((maketable (entries)
            (let* ((size (length entries))
                   (ht (make-hash-table :size (if (< size 10) 10 size)
@@ -314,8 +300,6 @@ code to be loaded.
       :for-keywords (maketable for-keywords)
       :iteration-keywords (maketable iteration-keywords)
       :path-keywords (maketable path-keywords)
-      :ansi ansi
-      :implicit-for-required (not (null ansi))
       :type-keywords (maketable type-keywords)
       :type-symbols (let* ((size (length type-symbols))
                            (ht (make-hash-table :size (if (< size 10) 10 size)
@@ -365,7 +349,7 @@ code to be loaded.
                                  (and (consp x)
                                       (or (not (eq (car x) 'car))
                                           (not (symbolp (cadr x)))
-                                          (not (symbolp (setq x (sb!xc:macroexpand x env)))))
+                                          (not (symbolp (setq x (sb!int:%macroexpand x env)))))
                                       (cons x nil)))
                                (cdr val))
                        `(,val))))
@@ -673,7 +657,7 @@ code to be loaded.
     ;;@@@@ ???? (declare (function list-size (list) fixnum))
     (cond ((constantp x) 1)
           ((symbolp x) (multiple-value-bind (new-form expanded-p)
-                           (sb!xc:macroexpand-1 x env)
+                           (sb!int:%macroexpand-1 x env)
                          (if expanded-p
                              (estimate-code-size-1 new-form env)
                              1)))
@@ -719,7 +703,7 @@ code to be loaded.
                           (member fn *estimate-code-size-punt*))
                       (throw 'estimate-code-size nil))
                      (t (multiple-value-bind (new-form expanded-p)
-                            (sb!xc:macroexpand-1 x env)
+                            (sb!int:%macroexpand-1 x env)
                           (if expanded-p
                               (estimate-code-size-1 new-form env)
                               (f 3))))))))
@@ -938,8 +922,11 @@ code to be loaded.
         ((sb!xc:subtypep data-type 'vector)
          (let ((ctype (sb!kernel:specifier-type data-type)))
            (when (sb!kernel:array-type-p ctype)
-             (let ((etype (sb!kernel:array-type-element-type ctype)))
+             (let ((etype (sb!kernel:type-*-to-t
+                           (sb!kernel:array-type-specialized-element-type ctype))))
                (make-array 0 :element-type (sb!kernel:type-specifier etype))))))
+        ((sb!xc:typep #\x data-type)
+         #\x)
         (t
          nil)))
 
@@ -1036,9 +1023,8 @@ code to be loaded.
   (cond ((null name)
          (setq name (gensym "LOOP-IGNORE-"))
          (push (list name initialization) *loop-vars*)
-         (if (null initialization)
-             (push `(ignore ,name) *loop-declarations*)
-             (loop-declare-var name dtype)))
+         (push `(ignore ,name) *loop-declarations*)
+         (loop-declare-var name dtype))
         ((atom name)
          (when (or (assoc name *loop-vars*)
                    (loop-var-p name))
@@ -1177,7 +1163,6 @@ code to be loaded.
 
 (defun loop-get-collection-info (collector class default-type)
   (let ((form (loop-get-form))
-        (dtype (and (not (loop-universe-ansi *loop-universe*)) (loop-optional-type)))
         (name (when (loop-tequal (car *loop-source-code*) 'into)
                 (loop-pop-source)
                 (loop-pop-source))))
@@ -1185,9 +1170,8 @@ code to be loaded.
       (loop-error "The value accumulation recipient name, ~S, is not a symbol." name))
     (unless name
       (loop-disallow-aggregate-booleans))
-    (unless dtype
-      (setq dtype (or (loop-optional-type) default-type)))
-    (let ((cruft (find (the symbol name) *loop-collection-cruft*
+    (let ((dtype (or (loop-optional-type) default-type))
+          (cruft (find (the symbol name) *loop-collection-cruft*
                        :key #'loop-collector-name)))
       (cond ((not cruft)
              (when (and name (loop-var-p name))
@@ -1393,16 +1377,7 @@ code to be loaded.
                      *loop-after-body*))
         (loop-bind-block)
         (return nil))
-      (loop-pop-source)                         ; Flush the "AND".
-      (when (and (not (loop-universe-implicit-for-required *loop-universe*))
-                 (setq tem
-                       (loop-lookup-keyword
-                        (car *loop-source-code*)
-                        (loop-universe-iteration-keywords *loop-universe*))))
-        ;; The latest ANSI clarification is that the FOR/AS after the AND must
-        ;; NOT be supplied.
-        (loop-pop-source)
-        (setq entry tem)))))
+      (loop-pop-source)))) ; Flush the "AND".
 
 ;;;; main iteration drivers
 
@@ -1945,7 +1920,7 @@ code to be loaded.
 
 ;;;; ANSI LOOP
 
-(defun make-ansi-loop-universe (extended-p)
+(defun make-ansi-loop-universe ()
   (let ((w (make-standard-loop-universe
              :keywords '((named (loop-do-named))
                          (initially (loop-do-initially))
@@ -2006,8 +1981,7 @@ code to be loaded.
                              simple-bit-vector simple-string simple-vector
                              single-float standard-char stream string
                              base-char symbol t vector)
-             :type-keywords nil
-             :ansi (if extended-p :extended t))))
+             :type-keywords nil)))
     (add-loop-path '(hash-key hash-keys) 'loop-hash-table-iteration-path w
                    :preposition-groups '((:of :in))
                    :inclusive-permitted nil
@@ -2036,7 +2010,7 @@ code to be loaded.
     w))
 
 (defparameter *loop-ansi-universe*
-  (make-ansi-loop-universe nil))
+  (make-ansi-loop-universe))
 
 (defun loop-standard-expansion (keywords-and-forms environment universe)
   (if (and keywords-and-forms (symbolp (car keywords-and-forms)))

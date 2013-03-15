@@ -42,7 +42,10 @@ otherwise evaluate ELSE and return its values. ELSE defaults to NIL."
     ;; IR1-CONVERT-MAYBE-PREDICATE requires DEST to be CIF, so the
     ;; order of the following two forms is important
     (setf (lvar-dest pred-lvar) node)
-    (ir1-convert start pred-ctran pred-lvar test)
+    (multiple-value-bind (context count) (possible-rest-arg-context test)
+      (if context
+          (ir1-convert start pred-ctran pred-lvar `(%rest-true ,test ,context ,count))
+          (ir1-convert start pred-ctran pred-lvar test)))
     (link-node-to-previous-ctran node pred-ctran)
 
     (let ((start-block (ctran-block pred-ctran)))
@@ -75,9 +78,14 @@ otherwise evaluate ELSE and return its values. ELSE defaults to NIL."
       nil
       (labels ((sub (form)
                  (or (get-source-path form)
-                     (and (consp form)
-                          (some #'sub form)))))
-        (or (sub form)))))
+                     (when (consp form)
+                       (unless (eq 'quote (car form))
+                         (somesub form)))))
+               (somesub (forms)
+                 (when (consp forms)
+                   (or (sub (car forms))
+                       (somesub (cdr forms))))))
+        (sub form))))
 
 ;;;; BLOCK and TAGBODY
 
@@ -193,11 +201,11 @@ extent of the block."
   #!+sb-doc
   "TAGBODY {tag | statement}*
 
-Define tags for use with GO. The STATEMENTS are evaluated in order ,skipping
+Define tags for use with GO. The STATEMENTS are evaluated in order, skipping
 TAGS, and NIL is returned. If a statement contains a GO to a defined TAG
 within the lexical scope of the form, then control is transferred to the next
-statement following that tag. A TAG must an integer or a symbol. A STATEMENT
-must be a list. Other objects are illegal within the body."
+statement following that tag. A TAG must be an integer or a symbol. A
+STATEMENT must be a list. Other objects are illegal within the body."
   (start-block start)
   (ctran-starts-block next)
   (let* ((dummy (make-ctran))
@@ -347,7 +355,7 @@ Evaluate the FORMS in the specified SITUATIONS (any of :COMPILE-TOPLEVEL,
   "MACROLET ({(name lambda-list form*)}*) body-form*
 
 Evaluate the BODY-FORMS in an environment with the specified local macros
-defined. Name is the local macro name, LAMBDA-LIST is a DEFMACRO style
+defined. NAME is the local macro name, LAMBDA-LIST is a DEFMACRO style
 destructuring lambda list, and the FORMS evaluate to the expansion."
   (funcall-in-macrolet-lexenv
    definitions
@@ -471,22 +479,47 @@ body, references to a NAME will effectively be replaced with the EXPANSION."
 Return VALUE without evaluating it."
   (reference-constant start next result thing))
 
+(defun name-context ()
+  ;; Name of the outermost non-NIL BLOCK, or the source namestring
+  ;; of the source file.
+  (let ((context
+          (or (car (find-if (lambda (b)
+                              (let ((name (pop b)))
+                                (and name
+                                     ;; KLUDGE: High debug adds this block on
+                                     ;; some platforms.
+                                     #!-unwind-to-frame-and-call-vop
+                                     (neq 'return-value-tag name)
+                                     ;; KLUDGE: CATCH produces blocks whose
+                                     ;; cleanup is :CATCH.
+                                     (neq :catch (cleanup-kind (entry-cleanup (pop b)))))))
+                            (lexenv-blocks *lexenv*) :from-end t))
+              *source-namestring*
+              (let ((p (or *compile-file-truename* *load-truename*)))
+                (when p (namestring p))))))
+    (when context
+      (list :in context))))
+
 ;;;; FUNCTION and NAMED-LAMBDA
 (defun name-lambdalike (thing)
-  (ecase (car thing)
+  (case (car thing)
     ((named-lambda)
      (or (second thing)
-         `(lambda ,(third thing))))
-    ((lambda instance-lambda)
-     `(lambda ,(second thing)))
+         `(lambda ,(third thing) ,(name-context))))
+    ((lambda)
+     `(lambda ,(second thing) ,@(name-context)))
     ((lambda-with-lexenv)
-     `(lambda ,(fifth thing)))))
+     ;; FIXME: Get the original DEFUN name here.
+     `(lambda ,(fifth thing)))
+    (otherwise
+     (compiler-error "Not a valid lambda expression:~%  ~S"
+                     thing))))
 
 (defun fun-name-leaf (thing)
   (if (consp thing)
       (cond
         ((member (car thing)
-                 '(lambda named-lambda instance-lambda lambda-with-lexenv))
+                 '(lambda named-lambda lambda-with-lexenv))
          (values (ir1-convert-lambdalike
                   thing
                   :debug-name (name-lambdalike thing))
@@ -571,7 +604,7 @@ be a lambda expression."
         (cond (cname
                `(global-function ,cname))
               (give-up
-               (give-up-ir1-transform give-up))
+               (give-up-ir1-transform "not known to be a function"))
               (t
                `(%coerce-callable-to-fun ,lvar-name))))))
 
@@ -587,13 +620,20 @@ be a lambda expression."
        `(%funcall ,(ensure-lvar-fun-form function 'function) ,@arg-names))))
 
 (def-ir1-translator %funcall ((function &rest args) start next result)
-  (let ((op (when (consp function) (car function))))
+  ;; MACROEXPAND so that (LAMBDA ...) forms arriving here don't get an
+  ;; extra cast inserted for them.
+  (let* ((function (%macroexpand function *lexenv*))
+         (op (when (consp function) (car function))))
     (cond ((eq op 'function)
-           (with-fun-name-leaf (leaf (second function) start)
-             (ir1-convert start next result `(,leaf ,@args))))
+           (compiler-destructuring-bind (thing) (cdr function)
+               function
+             (with-fun-name-leaf (leaf thing start)
+               (ir1-convert start next result `(,leaf ,@args)))))
           ((eq op 'global-function)
-           (with-fun-name-leaf (leaf (second function) start :global-function t)
-             (ir1-convert start next result `(,leaf ,@args))))
+           (compiler-destructuring-bind (thing) (cdr function)
+               global-function
+             (with-fun-name-leaf (leaf thing start :global-function t)
+               (ir1-convert start next result `(,leaf ,@args)))))
           (t
            (let ((ctran (make-ctran))
                  (fun-lvar (make-lvar)))
@@ -607,8 +647,9 @@ be a lambda expression."
 (define-source-transform funcall (function &rest args)
   `(%funcall ,(ensure-source-fun-form function) ,@args))
 
-(deftransform %coerce-callable-to-fun ((thing) * *)
-  (ensure-lvar-fun-form thing 'thing "optimize away possible call to FDEFINITION at runtime"))
+(deftransform %coerce-callable-to-fun ((thing) * * :node node)
+  "optimize away possible call to FDEFINITION at runtime"
+  (ensure-lvar-fun-form thing 'thing t))
 
 (define-source-transform %coerce-callable-to-fun (thing)
   (ensure-source-fun-form thing t))
@@ -636,7 +677,8 @@ be a lambda expression."
              (varify-lambda-arg name
                                 (if (eq context 'let*)
                                     nil
-                                    (names)))))
+                                    (names))
+                                context)))
       (dolist (spec bindings)
         (cond ((atom spec)
                (let ((var (get-var spec)))
@@ -798,10 +840,11 @@ lexically apparent function definition in the enclosing environment."
     (multiple-value-bind (names defs)
         (extract-flet-vars definitions 'flet)
       (let ((fvars (mapcar (lambda (n d)
-                             (ir1-convert-lambda d
-                                                 :source-name n
-                                                 :maybe-add-debug-catch t
-                                                 :debug-name (debug-name 'flet n)))
+                             (ir1-convert-lambda
+                              d :source-name n
+                                :maybe-add-debug-catch t
+                                :debug-name
+                                (debug-name 'flet n t)))
                            names defs)))
         (processing-decls (decls nil fvars next result)
           (let ((*lexenv* (make-lexenv :funs (pairlis names fvars))))
@@ -836,7 +879,7 @@ other."
                           (ir1-convert-lambda def
                                               :source-name name
                                               :maybe-add-debug-catch t
-                                              :debug-name (debug-name 'labels name)))
+                                              :debug-name (debug-name 'labels name t)))
                         names defs))))
 
         ;; Modify all the references to the dummy function leaves so
@@ -900,6 +943,12 @@ is unable to derive from other declared types."
 ;;; whatever you tell it. It will never generate a type check, but
 ;;; will cause a warning if the compiler can prove the assertion is
 ;;; wrong.
+;;;
+;;; For the benefit of code-walkers we also add a macro-expansion. (Using INFO
+;;; directly to get around safeguards for adding a macro-expansion for special
+;;; operator.) Because :FUNCTION :KIND remains :SPECIAL-FORM, the compiler
+;;; never uses the macro -- but manually calling its MACRO-FUNCTION or
+;;; MACROEXPANDing TRULY-THE forms does.
 (def-ir1-translator truly-the ((value-type form) start next result)
   #!+sb-doc
   "Specifies that the values returned by FORM conform to the
@@ -910,6 +959,12 @@ Consequences are undefined if any result is not of the declared type
 -- typical symptoms including memory corruptions. Use with great
 care."
   (the-in-policy value-type form '((type-check . 0)) start next result))
+
+#-sb-xc-host
+(setf (info :function :macro-function 'truly-the)
+      (lambda (whole env)
+        (declare (ignore env))
+        `(the ,@(cdr whole))))
 
 ;;;; SETQ
 
@@ -966,7 +1021,8 @@ care."
         (dest-lvar (make-lvar))
         (type (or (lexenv-find var type-restrictions)
                   (leaf-type var))))
-    (ir1-convert start dest-ctran dest-lvar `(the ,type ,value))
+    (ir1-convert start dest-ctran dest-lvar `(the ,(type-specifier type)
+                                                  ,value))
     (let ((res (make-set :var var :value dest-lvar)))
       (setf (lvar-dest dest-lvar) res)
       (setf (leaf-ever-used var) t)
@@ -1083,6 +1139,7 @@ due to normal completion or a non-local exit such as THROW)."
         ;; ,CLEANUP-FUN should probably be declared DYNAMIC-EXTENT,
         ;; and something can be done to make %ESCAPE-FUN have
         ;; dynamic extent too.
+        (declare (dynamic-extent #',cleanup-fun))
         (block ,drop-thru-tag
           (multiple-value-bind (,next ,start ,count)
               (block ,exit-tag

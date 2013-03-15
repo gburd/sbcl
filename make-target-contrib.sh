@@ -18,10 +18,11 @@ echo //entering make-target-contrib.sh
 
 LANG=C
 LC_ALL=C
-export LANG LC_ALL
+CC=${CC:-gcc}
+export CC LANG LC_ALL
 
-. ./find-gnumake.sh
-find_gnumake
+# Load our build configuration
+. output/build-config
 
 . ./sbcl-pwd.sh
 sbcl_pwd
@@ -57,7 +58,19 @@ find contrib/ \( -name '*.fasl' -o \
 
 find output -name 'building-contrib.*' -print | xargs rm -f
 
-for i in contrib/*; do
+# Ignore all source registries.
+CL_SOURCE_REGISTRY='(:source-registry :ignore-inherited-configuration)'
+export CL_SOURCE_REGISTRY
+
+if [ -z "$*" ]; then
+    contribs_to_build=contrib/*
+else
+    for name in $*; do
+        contribs_to_build="contrib/$name $contribs_to_build"
+    done
+fi
+
+for i in $contribs_to_build; do
     test -d $i && test -f $i/Makefile || continue;
     # export INSTALL_DIR=$SBCL_HOME/`basename $i `
     test -f $i/test-passed && rm $i/test-passed
@@ -67,6 +80,24 @@ for i in contrib/*; do
     else
 	exit $?
     fi | tee output/building-contrib.`basename $i` 
+done
+
+# Otherwise report expected failures:
+HEADER_HAS_BEEN_PRINTED=false
+for dir in contrib/*; do
+  f="$dir/test-passed"
+  if test -f "$f" && grep -i fail "$f" >/dev/null; then
+      if ! $HEADER_HAS_BEEN_PRINTED; then
+          cat <<EOF
+
+Note: Test suite failures which are expected for this combination of
+platform and features have been ignored:
+EOF
+          HEADER_HAS_BEEN_PRINTED=true
+      fi
+      echo "  $dir"
+      (unset IFS; while read line; do echo "    $line"; done <"$f")
+  fi
 done
 
 # Sometimes people used to see the "No tests failed." output from the last

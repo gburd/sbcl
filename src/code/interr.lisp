@@ -393,6 +393,23 @@
           (/show0 "trapped DEBUG-CONDITION")
           (values "<error finding interrupted name -- trapped debug-condition>"
                   nil)))))
+
+(defun find-caller-of-named-frame (name)
+  (unless *finding-name*
+    (handler-case
+        (let ((*finding-name* t))
+          (do ((frame (sb!di:top-frame) (sb!di:frame-down frame)))
+              ((null frame))
+            (when (and (sb!di::compiled-frame-p frame)
+                       (eq name (sb!di:debug-fun-name
+                                 (sb!di:frame-debug-fun frame))))
+              (let ((caller (sb!di:frame-down frame)))
+                (sb!di:flush-frames-above caller)
+                (return caller)))))
+      ((or error sb!di:debug-condition) ()
+        nil)
+      (sb!di:debug-condition ()
+        nil))))
 
 
 ;;;; INTERNAL-ERROR signal handler
@@ -496,7 +513,7 @@
   (error 'undefined-alien-function-error))
 
 #!-win32
-(define-alien-variable current-memory-fault-address unsigned-long)
+(define-alien-variable current-memory-fault-address unsigned)
 
 #!-win32
 (defun memory-fault-error ()

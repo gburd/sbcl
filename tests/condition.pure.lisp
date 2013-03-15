@@ -13,6 +13,8 @@
 
 (cl:in-package :cl-user)
 
+(load "test-util.lisp")
+
 ;;; Until 0.7.7.21, (MAKE-CONDITION 'FILE-ERROR :PATHNAME "FOO")
 ;;; wasn't printable, because the REPORT function for FILE-ERROR
 ;;; referred to unbound slots. This was reported and fixed by Antonio
@@ -151,3 +153,39 @@
                             :format-arguments nil)
             'cerror (get-universal-time))
     (assert (= x 1))))
+
+(with-test (:name :malformed-restart-case-clause)
+  (assert (eq :ok
+              (handler-case
+                  (macroexpand `(restart-case (error "foo")
+                                  (foo :report "quux" (quux))))
+                (simple-error (e)
+                  (assert (equal '(restart-case (foo :report "quux" (quux)))
+                                 (simple-condition-format-arguments e)))
+                  :ok)))))
+
+(with-test (:name :simple-condition-without-args)
+  (let ((sc (make-condition 'simple-condition)))
+    (assert (not (simple-condition-format-control sc)))
+    (assert (not (simple-condition-format-arguments sc)))
+    (assert (stringp (prin1-to-string sc)))
+    (assert
+     (eq :ok
+         (handler-case
+             (princ-to-string sc)
+           (simple-error (c)
+             (when (and (equal "No format-control for ~S"
+                               (simple-condition-format-control c))
+                        (eq sc (car
+                                (simple-condition-format-arguments c))))
+               :ok)))))))
+
+(with-test (:name :malformed-simple-condition-printing-type-error)
+  (assert (eq :type-error
+              (handler-case
+                  (princ-to-string
+                   (make-condition 'simple-error :format-control "" :format-arguments 8))
+                (type-error (e)
+                  (when (and (eq 'list (type-error-expected-type e))
+                             (eql 8 (type-error-datum e)))
+                    :type-error))))))

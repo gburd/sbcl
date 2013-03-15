@@ -143,6 +143,7 @@
 ;;; !DEF-VM-SUPPORT-ROUTINE and DEFUN-CACHED.
 (/show0 "primtype.lisp 188")
 (!def-vm-support-routine primitive-type (type)
+  (sb!kernel::maybe-reparse-specifier! type)
   (primitive-type-aux type))
 (/show0 "primtype.lisp 191")
 (defun-cached (primitive-type-aux
@@ -355,8 +356,8 @@
                               (setq res new-ptype)
                               (return (any)))))
                       (setf res ptype))))
-              type))
-           res))
+              type)
+             res)))
         (named-type
          (ecase (named-type-name type)
            ((t *) (values *backend-t-primitive-type* t))

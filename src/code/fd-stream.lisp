@@ -52,25 +52,16 @@
   #!+sb-doc
   "List of available buffers.")
 
-(defvar *available-buffers-spinlock* (sb!thread::make-spinlock
-                                      :name "lock for *AVAILABLE-BUFFERS*")
+(defvar *available-buffers-lock* (sb!thread:make-mutex
+                                  :name "lock for *AVAILABLE-BUFFERS*")
   #!+sb-doc
   "Mutex for access to *AVAILABLE-BUFFERS*.")
 
 (defmacro with-available-buffers-lock ((&optional) &body body)
-  ;; CALL-WITH-SYSTEM-SPINLOCK because
-  ;;
-  ;; 1. streams are low-level enough to be async signal safe, and in
-  ;;    particular a C-c that brings up the debugger while holding the
-  ;;    mutex would lose badly
-  ;;
-  ;; 2. this can potentially be a fairly busy (but also probably
-  ;;    uncontended) lock, so we don't want to pay the syscall per
-  ;;    release -- hence a spinlock.
-  ;;
-  ;; ...again, once we have smarted locks the spinlock here can become
-  ;; a mutex.
-  `(sb!thread::with-system-spinlock (*available-buffers-spinlock*)
+  ;; CALL-WITH-SYSTEM-MUTEX because streams are low-level enough to be
+  ;; async signal safe, and in particular a C-c that brings up the
+  ;; debugger while holding the mutex would lose badly.
+  `(sb!thread::with-system-mutex (*available-buffers-lock*)
      ,@body))
 
 (defconstant +bytes-per-buffer+ (* 4 1024)
@@ -156,7 +147,9 @@
   ;; the type of element being transfered
   (element-type 'base-char)
   ;; the Unix file descriptor
-  (fd -1 :type fixnum)
+  (fd -1 :type #!-win32 fixnum #!+win32 sb!vm:signed-word)
+  ;; What do we know about the FD?
+  (fd-type :unknown :type keyword)
   ;; controls when the output buffer is flushed
   (buffering :full :type (member :full :line :none))
   ;; controls whether the input buffer must be cleared before output
@@ -169,6 +162,8 @@
   (char-pos nil :type (or unsigned-byte null))
   ;; T if input is waiting on FD. :EOF if we hit EOF.
   (listen nil :type (member nil t :eof))
+  ;; T if serve-event is allowed when this stream blocks
+  (serve-events nil :type boolean)
 
   ;; the input buffer
   (instead (make-array 0 :element-type 'character :adjustable t :fill-pointer t) :type (array character (*)))
@@ -185,7 +180,8 @@
   (timeout nil :type (or single-float null))
   ;; pathname of the file this stream is opened to (returned by PATHNAME)
   (pathname nil :type (or pathname null))
-  (external-format :default)
+  ;; Not :DEFAULT, because we want to match CHAR-SIZE!
+  (external-format :latin-1)
   ;; fixed width, or function to call with a character
   (char-size 1 :type (or fixnum function))
   (output-bytes #'ill-out :type function)
@@ -262,32 +258,47 @@
                (aver (< head tail))
                (%queue-and-replace-output-buffer stream))
               (t
-               ;; Try a non-blocking write, queue whatever is left over.
+               ;; Try a non-blocking write, if SERVE-EVENT is allowed, queue
+               ;; whatever is left over. Otherwise wait until we can write.
                (aver (< head tail))
                (synchronize-stream-output stream)
-               (let ((length (- tail head)))
-                 (multiple-value-bind (count errno)
-                     (sb!unix:unix-write (fd-stream-fd stream) (buffer-sap obuf)
-                                         head length)
-                   (cond ((eql count length)
-                          ;; Complete write -- we can use the same buffer.
-                          (reset-buffer obuf))
-                         (count
-                          ;; Partial write -- update buffer status and queue.
-                          ;; Do not use INCF! Another thread might have moved
-                          ;; head...
-                          (setf (buffer-head obuf) (+ count head))
-                          (%queue-and-replace-output-buffer stream))
-                         #!-win32
-                         ((eql errno sb!unix:ewouldblock)
-                          ;; Blocking, queue.
-                          (%queue-and-replace-output-buffer stream))
-                         (t
-                          (simple-stream-perror "Couldn't write to ~s"
-                                                stream errno)))))))))))
+               (loop
+                 (let ((length (- tail head)))
+                   (multiple-value-bind (count errno)
+                       (sb!unix:unix-write (fd-stream-fd stream) (buffer-sap obuf)
+                                           head length)
+                     (flet ((queue-or-wait ()
+                              (if (fd-stream-serve-events stream)
+                                  (return (%queue-and-replace-output-buffer stream))
+                                  (or (wait-until-fd-usable (fd-stream-fd stream) :output
+                                                            (fd-stream-timeout stream)
+                                                            nil)
+                                      (signal-timeout 'io-timeout
+                                                      :stream stream
+                                                      :direction :output
+                                                      :seconds (fd-stream-timeout stream))))))
+                        (cond ((eql count length)
+                               ;; Complete write -- we can use the same buffer.
+                               (return (reset-buffer obuf)))
+                              (count
+                               ;; Partial write -- update buffer status and
+                               ;; queue or wait.
+                               (incf head count)
+                               (setf (buffer-head obuf) head)
+                               (queue-or-wait))
+                              #!-win32
+                              ((eql errno sb!unix:ewouldblock)
+                               ;; Blocking, queue or wair.
+                               (queue-or-wait))
+                              ;; if interrupted on win32, just try again
+                              #!+win32 ((eql errno sb!unix:eintr))
+                              (t
+                               (simple-stream-perror "Couldn't write to ~s"
+                                                     stream errno)))))))))))))
 
 ;;; Helper for FLUSH-OUTPUT-BUFFER -- returns the new buffer.
 (defun %queue-and-replace-output-buffer (stream)
+  (aver (fd-stream-serve-events stream))
   (let ((queue (fd-stream-output-queue stream))
         (later (list (or (fd-stream-obuf stream) (bug "Missing obuf."))))
         (new (get-buffer)))
@@ -312,6 +323,7 @@
 ;;; This is called by the FD-HANDLER for the stream when output is
 ;;; possible.
 (defun write-output-from-queue (stream)
+  (aver (fd-stream-serve-events stream))
   (synchronize-stream-output stream)
   (let (not-first-p)
     (tagbody
@@ -390,14 +402,10 @@
 ;;; this is not something we want to export. Nikodemus thinks the
 ;;; right thing is to support a low-level non-stream like IO layer,
 ;;; akin to java.nio.
-(defun output-raw-bytes (stream thing &optional start end)
+(declaim (inline output-raw-bytes))
+(define-deprecated-function :late "1.0.8.16" output-raw-bytes write-sequence
+    (stream thing &optional start end)
   (write-or-buffer-output stream thing (or start 0) (or end (length thing))))
-
-(define-compiler-macro output-raw-bytes (stream thing &optional start end)
-  (deprecation-warning 'output-raw-bytes)
-  (let ((x (gensym "THING")))
-    `(let ((,x ,thing))
-       (write-or-buffer-output ,stream ,x (or ,start 0) (or ,end (length ,x))))))
 
 ;;;; output routines and related noise
 
@@ -420,39 +428,26 @@
          :format-arguments
          (list note-format (list pathname) (strerror errno))))
 
-(defun stream-decoding-error (stream octets)
-  (error 'stream-decoding-error
-         :external-format (stream-external-format stream)
-         :stream stream
-         ;; FIXME: dunno how to get at OCTETS currently, or even if
-         ;; that's the right thing to report.
-         :octets octets))
-(defun stream-encoding-error (stream code)
-  (error 'stream-encoding-error
-         :external-format (stream-external-format stream)
-         :stream stream
-         :code code))
-
 (defun c-string-encoding-error (external-format code)
   (error 'c-string-encoding-error
          :external-format external-format
          :code code))
-
-(defun c-string-decoding-error (external-format octets)
+(defun c-string-decoding-error (external-format sap offset count)
   (error 'c-string-decoding-error
          :external-format external-format
-         :octets octets))
+         :octets (sap-ref-octets sap offset count)))
 
 ;;; Returning true goes into end of file handling, false will enter another
 ;;; round of input buffer filling followed by re-entering character decode.
 (defun stream-decoding-error-and-handle (stream octet-count)
   (restart-case
-      (stream-decoding-error stream
-                             (let* ((buffer (fd-stream-ibuf stream))
-                                    (sap (buffer-sap buffer))
-                                    (head (buffer-head buffer)))
-                               (loop for i from 0 below octet-count
-                                     collect (sap-ref-8 sap (+ head i)))))
+      (error 'stream-decoding-error
+             :external-format (stream-external-format stream)
+             :stream stream
+             :octets (let ((buffer (fd-stream-ibuf stream)))
+                       (sap-ref-octets (buffer-sap buffer)
+                                       (buffer-head buffer)
+                                       octet-count)))
     (attempt-resync ()
       :report (lambda (stream)
                 (format stream
@@ -484,7 +479,10 @@
 
 (defun stream-encoding-error-and-handle (stream code)
   (restart-case
-      (stream-encoding-error stream code)
+      (error 'stream-encoding-error
+             :external-format (stream-external-format stream)
+             :stream stream
+             :code code)
     (output-nothing ()
       :report (lambda (stream)
                 (format stream "~@<Skip output of this character.~@:>"))
@@ -775,6 +773,11 @@
   (octets-to-string-fun (missing-arg) :type function)
   (string-to-octets-fun (missing-arg) :type function))
 
+(defun ef-char-size (ef-entry)
+  (if (variable-width-external-format-p ef-entry)
+      (bytes-for-char-fun ef-entry)
+      (funcall (bytes-for-char-fun ef-entry) #\x)))
+
 (defun wrap-external-format-functions (external-format fun)
   (let ((result (%copy-external-format external-format)))
     (macrolet ((frob (accessor)
@@ -835,7 +838,7 @@
 
 (defun get-external-format-or-lose (external-format)
   (or (get-external-format external-format)
-      (error "Undefined external-format ~A" external-format)))
+      (error "Undefined external-format: ~S" external-format)))
 
 (defun external-format-keyword (external-format)
   (typecase external-format
@@ -855,17 +858,17 @@
 ;;; number of bytes per element.
 (defun pick-output-routine (type buffering &optional external-format)
   (when (subtypep type 'character)
-    (let ((entry (get-external-format external-format)))
-      (when entry
-        (return-from pick-output-routine
-          (values (ecase buffering
-                    (:none (ef-write-char-none-buffered-fun entry))
-                    (:line (ef-write-char-line-buffered-fun entry))
-                    (:full (ef-write-char-full-buffered-fun entry)))
-                  'character
-                  1
-                  (ef-write-n-bytes-fun entry)
-                  (canonize-external-format external-format entry))))))
+    (let ((entry (get-external-format-or-lose external-format)))
+      (return-from pick-output-routine
+        (values (ecase buffering
+                  (:none (ef-write-char-none-buffered-fun entry))
+                  (:line (ef-write-char-line-buffered-fun entry))
+                  (:full (ef-write-char-full-buffered-fun entry)))
+                'character
+                1
+                (ef-write-n-bytes-fun entry)
+                (ef-char-size entry)
+                (canonize-external-format external-format entry)))))
   (dolist (entry *output-routines*)
     (when (and (subtypep type (first entry))
                (eq buffering (second entry))
@@ -941,20 +944,7 @@
   ;; This answers T at EOF on win32, I think.
   (not (sb!win32:fd-listen (fd-stream-fd stream)))
   #!-win32
-  (sb!unix:with-restarted-syscall (count errno)
-    (sb!alien:with-alien ((read-fds (sb!alien:struct sb!unix:fd-set)))
-      (sb!unix:fd-zero read-fds)
-      (sb!unix:fd-set (fd-stream-fd stream) read-fds)
-      (sb!unix:unix-fast-select (1+ (fd-stream-fd stream))
-                                (sb!alien:addr read-fds)
-                                nil nil 0 0))
-    (case count
-      ((1) nil)
-      ((0) t)
-      (otherwise
-       (simple-stream-perror "couldn't check whether ~S is readable"
-                             stream
-                             errno)))))
+  (not (sb!unix:unix-simple-poll (fd-stream-fd stream) :input 0)))
 
 ;;; If the read would block wait (using SERVE-EVENT) till input is available,
 ;;; then fill the input buffer, and return the number of bytes read. Throws
@@ -964,10 +954,14 @@
            (errno 0)
            (count 0))
     (tagbody
-       ;; Check for blocking input before touching the stream, as if
-       ;; we happen to wait we are liable to be interrupted, and the
-       ;; interrupt handler may use the same stream.
-       (if (sysread-may-block-p stream)
+       #!+win32
+       (go :main)
+
+       ;; Check for blocking input before touching the stream if we are to
+       ;; serve events: if the FD is blocking, we don't want to try an uninterruptible
+       ;; read(). Regular files should never block, so we can elide the check.
+       (if (and (neq :regular (fd-stream-fd-type stream))
+                (sysread-may-block-p stream))
            (go :wait-for-input)
            (go :main))
        ;; These (:CLOSED-FLAME and :READ-ERROR) tags are here so what
@@ -979,8 +973,11 @@
      :wait-for-input
        ;; This tag is here so we can unwind outside the WITHOUT-INTERRUPTS
        ;; to wait for input if read tells us EWOULDBLOCK.
-       (unless (wait-until-fd-usable fd :input (fd-stream-timeout stream))
-         (signal-timeout 'io-timeout :stream stream :direction :read
+       (unless (wait-until-fd-usable fd :input (fd-stream-timeout stream)
+                                     (fd-stream-serve-events stream))
+         (signal-timeout 'io-timeout
+                         :stream stream
+                         :direction :input
                          :seconds (fd-stream-timeout stream)))
      :main
        ;; Since the read should not block, we'll disable the
@@ -991,8 +988,8 @@
        ;; resulting thunk is stack-allocatable.
        ((lambda (return-reason)
           (ecase return-reason
-            ((nil))             ; fast path normal cases
-            ((:wait-for-input) (go :wait-for-input))
+            ((nil))                     ; fast path normal cases
+            ((:wait-for-input) (go #!-win32 :wait-for-input #!+win32 :main))
             ((:closed-flame)   (go :closed-flame))
             ((:read-error)     (go :read-error))))
         (without-interrupts
@@ -1028,10 +1025,9 @@
                 (setf (values count errno)
                       (sb!unix:unix-read fd (sap+ sap tail) (- length tail)))
                 (cond ((null count)
-                       #!+win32
-                       (return :read-error)
-                       #!-win32
-                       (if (eql errno sb!unix:ewouldblock)
+                       (if (eql errno
+                                #!+win32 sb!unix:eintr
+                                #!-win32 sb!unix:ewouldblock)
                            (return :wait-for-input)
                            (return :read-error)))
                       ((zerop count)
@@ -1087,12 +1083,17 @@
                      (catch 'eof-input-catcher
                        (setf decode-break-reason
                              (block decode-break-reason
-                               (input-at-least ,stream-var 1)
-                               (let* ((byte (sap-ref-8 (buffer-sap ibuf)
-                                                       (buffer-head ibuf))))
+                               (input-at-least ,stream-var ,(if (consp bytes)
+                                                                (car bytes)
+                                                                `(setq size ,bytes)))
+                               (let* ((byte (sap-ref-8 (buffer-sap ibuf) (buffer-head ibuf))))
                                  (declare (ignorable byte))
-                                 (setq size ,bytes)
-                                 (input-at-least ,stream-var size)
+                                 ,@(when (consp bytes)
+                                     `((let ((sap (buffer-sap ibuf))
+                                             (head (buffer-head ibuf)))
+                                         (declare (ignorable sap head))
+                                         (setq size ,(cadr bytes))
+                                         (input-at-least ,stream-var size))))
                                  (setq ,element-var (locally ,@read-forms))
                                  (setq ,retry-var nil))
                                nil))
@@ -1209,14 +1210,14 @@
 ;;; bytes per element (and for character types string input routine).
 (defun pick-input-routine (type &optional external-format)
   (when (subtypep type 'character)
-    (let ((entry (get-external-format external-format)))
-      (when entry
-        (return-from pick-input-routine
-          (values (ef-read-char-fun entry)
-                  'character
-                  1
-                  (ef-read-n-chars-fun entry)
-                  (canonize-external-format external-format entry))))))
+    (let ((entry (get-external-format-or-lose external-format)))
+      (return-from pick-input-routine
+        (values (ef-read-char-fun entry)
+                'character
+                1
+                (ef-read-n-chars-fun entry)
+                (ef-char-size entry)
+                (canonize-external-format external-format entry)))))
   (dolist (entry *input-routines*)
     (when (and (subtypep type (first entry))
                (or (not (fourth entry))
@@ -1501,9 +1502,12 @@
                 ((or (= tail head) (= requested total-copied)))
               (setf decode-break-reason
                     (block decode-break-reason
+                      ,@(when (consp in-size-expr)
+                          `((when (> ,(car in-size-expr) (- tail head))
+                              (return))))
                       (let ((byte (sap-ref-8 sap head)))
                         (declare (ignorable byte))
-                        (setq size ,in-size-expr)
+                        (setq size ,(if (consp in-size-expr) (cadr in-size-expr) in-size-expr))
                         (when (> size (- tail head))
                           (return))
                         (setf (aref buffer (+ start total-copied)) ,in-expr)
@@ -1531,8 +1535,8 @@
                 (return-from ,in-function total-copied)))
             (setf (buffer-head ibuf) head)
             ;; Maybe we need to refill the stream buffer.
-            (cond ( ;; If there were enough data in the stream buffer, we're done.
-                   (= total-copied requested)
+            (cond ( ;; If was data in the stream buffer, we're done.
+                   (plusp total-copied)
                    (return total-copied))
                   ( ;; If EOF, we're done in another way.
                    (or (eq decode-break-reason 'eof)
@@ -1552,18 +1556,20 @@
           (declare (ignorable byte))
           ,in-expr))
       (defun ,resync-function (stream)
-        (let ((ibuf (fd-stream-ibuf stream)))
+        (let ((ibuf (fd-stream-ibuf stream))
+              size)
           (catch 'eof-input-catcher
             (loop
                (incf (buffer-head ibuf))
-               (input-at-least stream 1)
+               (input-at-least stream ,(if (consp in-size-expr) (car in-size-expr) `(setq size ,in-size-expr)))
                (unless (block decode-break-reason
                          (let* ((sap (buffer-sap ibuf))
                                 (head (buffer-head ibuf))
-                                (byte (sap-ref-8 sap head))
-                                (size ,in-size-expr))
+                                (byte (sap-ref-8 sap head)))
                            (declare (ignorable byte))
-                           (input-at-least stream size)
+                           ,@(when (consp in-size-expr)
+                               `((setq size ,(cadr in-size-expr))
+                                 (input-at-least stream size)))
                            (setf head (buffer-head ibuf))
                            ,in-expr)
                          nil)
@@ -1579,12 +1585,15 @@
                            (setf decode-break-reason
                                  (block decode-break-reason
                                    (setf byte (sap-ref-8 sap head)
-                                         size ,in-size-expr
+                                         size ,(if (consp in-size-expr)
+                                                   (cadr in-size-expr)
+                                                   in-size-expr)
                                          char ,in-expr)
                                    (incf head size)
                                    nil))
                            (when decode-break-reason
-                             (c-string-decoding-error ,name decode-break-reason))
+                             (c-string-decoding-error
+                              ,name sap head decode-break-reason))
                            (when (zerop (char-code char))
                              (return count))))
                  (string (make-string length :element-type element-type)))
@@ -1598,12 +1607,15 @@
               (setf decode-break-reason
                     (block decode-break-reason
                       (setf byte (sap-ref-8 sap head)
-                            size ,in-size-expr
+                            size ,(if (consp in-size-expr)
+                                      (cadr in-size-expr)
+                                      in-size-expr)
                             char ,in-expr)
                       (incf head size)
                       nil))
               (when decode-break-reason
-                (c-string-decoding-error ,name decode-break-reason))
+                (c-string-decoding-error
+                 ,name sap head decode-break-reason))
               (setf (aref string index) char)))))
 
       (defun ,output-c-string-function (string)
@@ -1685,6 +1697,7 @@
          (character-stream-p (subtypep target-type 'character))
          (bivalent-stream-p (eq element-type :default))
          normalized-external-format
+         char-size
          (bin-routine #'ill-bin)
          (bin-type nil)
          (bin-size nil)
@@ -1728,24 +1741,23 @@
     (when output-p
       (setf (fd-stream-char-pos fd-stream) 0))
 
-    (when (and character-stream-p
-               (eq external-format :default))
+    (when (and character-stream-p (eq external-format :default))
       (/show0 "/getting default external format")
       (setf external-format (default-external-format)))
 
     (when input-p
       (when (or (not character-stream-p) bivalent-stream-p)
-        (multiple-value-setq (bin-routine bin-type bin-size read-n-characters
-                                          normalized-external-format)
-          (pick-input-routine (if bivalent-stream-p '(unsigned-byte 8)
-                                  target-type)
-                              external-format))
+        (setf (values bin-routine bin-type bin-size read-n-characters
+                      char-size normalized-external-format)
+              (pick-input-routine (if bivalent-stream-p '(unsigned-byte 8)
+                                      target-type)
+                                  external-format))
         (unless bin-routine
           (error "could not find any input routine for ~S" target-type)))
       (when character-stream-p
-        (multiple-value-setq (cin-routine cin-type cin-size read-n-characters
-                                          normalized-external-format)
-          (pick-input-routine target-type external-format))
+        (setf (values cin-routine cin-type cin-size read-n-characters
+                      char-size normalized-external-format)
+              (pick-input-routine target-type external-format))
         (unless cin-routine
           (error "could not find any input routine for ~S" target-type)))
       (setf (fd-stream-in fd-stream) cin-routine
@@ -1754,8 +1766,8 @@
       (setf input-size (or cin-size bin-size))
       (setf input-type (or cin-type bin-type))
       (when normalized-external-format
-        (setf (fd-stream-external-format fd-stream)
-              normalized-external-format))
+        (setf (fd-stream-external-format fd-stream) normalized-external-format
+              (fd-stream-char-size fd-stream) char-size))
       (when (= (or cin-size 1) (or bin-size 1) 1)
         (setf (fd-stream-n-bin fd-stream) ;XXX
               (if (and character-stream-p (not bivalent-stream-p))
@@ -1782,30 +1794,33 @@
 
     (when output-p
       (when (or (not character-stream-p) bivalent-stream-p)
-        (multiple-value-setq (bout-routine bout-type bout-size output-bytes
-                                           normalized-external-format)
-          (pick-output-routine (if bivalent-stream-p
-                                   '(unsigned-byte 8)
-                                   target-type)
-                               (fd-stream-buffering fd-stream)
-                               external-format))
+        (setf (values bout-routine bout-type bout-size output-bytes
+                      char-size normalized-external-format)
+              (let ((buffering (fd-stream-buffering fd-stream)))
+                (if bivalent-stream-p
+                    (pick-output-routine '(unsigned-byte 8)
+                                         (if (eq :line buffering)
+                                             :full
+                                             buffering)
+                                         external-format)
+                    (pick-output-routine target-type buffering external-format))))
         (unless bout-routine
           (error "could not find any output routine for ~S buffered ~S"
                  (fd-stream-buffering fd-stream)
                  target-type)))
       (when character-stream-p
-        (multiple-value-setq (cout-routine cout-type cout-size output-bytes
-                                           normalized-external-format)
-          (pick-output-routine target-type
-                               (fd-stream-buffering fd-stream)
-                               external-format))
+        (setf (values cout-routine cout-type cout-size output-bytes
+                      char-size normalized-external-format)
+              (pick-output-routine target-type
+                                   (fd-stream-buffering fd-stream)
+                                   external-format))
         (unless cout-routine
           (error "could not find any output routine for ~S buffered ~S"
                  (fd-stream-buffering fd-stream)
                  target-type)))
       (when normalized-external-format
-        (setf (fd-stream-external-format fd-stream)
-              normalized-external-format))
+        (setf (fd-stream-external-format fd-stream) normalized-external-format
+              (fd-stream-char-size fd-stream) char-size))
       (when character-stream-p
         (setf (fd-stream-output-bytes fd-stream) output-bytes))
       (setf (fd-stream-out fd-stream) cout-routine
@@ -2011,8 +2026,8 @@
     (:external-format
      (fd-stream-external-format fd-stream))
     (:interactive-p
-     (= 1 (the (member 0 1)
-            (sb!unix:unix-isatty (fd-stream-fd fd-stream)))))
+     (plusp (the (integer 0)
+              (sb!unix:unix-isatty (fd-stream-fd fd-stream)))))
     (:line-length
      80)
     (:charpos
@@ -2028,6 +2043,7 @@
               :expected-type 'fd-stream
               :format-control "~S is not a stream associated with a file."
               :format-arguments (list fd-stream)))
+     #!-win32
      (multiple-value-bind (okay dev ino mode nlink uid gid rdev size
                                 atime mtime ctime blksize blocks)
          (sb!unix:unix-fstat (fd-stream-fd fd-stream))
@@ -2037,7 +2053,21 @@
          (simple-stream-perror "failed Unix fstat(2) on ~S" fd-stream dev))
        (if (zerop mode)
            nil
-           (truncate size (fd-stream-element-size fd-stream)))))
+           (truncate size (fd-stream-element-size fd-stream))))
+     #!+win32
+     (let* ((handle (fd-stream-fd fd-stream))
+            (element-size (fd-stream-element-size fd-stream)))
+       (multiple-value-bind (got native-size)
+           (sb!win32:get-file-size-ex handle 0)
+         (if (zerop got)
+             ;; Might be a block device, in which case we fall back to
+             ;; a non-atomic workaround:
+             (let* ((here (sb!unix:unix-lseek handle 0 sb!unix:l_incr))
+                    (there (sb!unix:unix-lseek handle 0 sb!unix:l_xtnd)))
+               (when (and here there)
+                 (sb!unix:unix-lseek handle here sb!unix:l_set)
+                 (truncate there element-size)))
+             (truncate native-size element-size)))))
     (:file-string-length
      (etypecase arg1
        (character (fd-stream-character-size fd-stream arg1))
@@ -2064,13 +2094,14 @@
   (flush-output-buffer stream)
   (do ()
       ((null (fd-stream-output-queue stream)))
+    (aver (fd-stream-serve-events stream))
     (serve-all-events)))
 
 (defun fd-stream-get-file-position (stream)
   (declare (fd-stream stream))
   (without-interrupts
     (let ((posn (sb!unix:unix-lseek (fd-stream-fd stream) 0 sb!unix:l_incr)))
-      (declare (type (or (alien sb!unix:off-t) null) posn))
+      (declare (type (or (alien sb!unix:unix-offset) null) posn))
       ;; We used to return NIL for errno==ESPIPE, and signal an error
       ;; in other failure cases. However, CLHS says to return NIL if
       ;; the position cannot be determined -- so that's what we do.
@@ -2099,7 +2130,7 @@
 (defun fd-stream-set-file-position (stream position-spec)
   (declare (fd-stream stream))
   (check-type position-spec
-              (or (alien sb!unix:off-t) (member nil :start :end))
+              (or (alien sb!unix:unix-offset) (member nil :start :end))
               "valid file position designator")
   (tagbody
    :again
@@ -2131,7 +2162,7 @@
                (t
                 (values (* position-spec (fd-stream-element-size stream))
                         sb!unix:l_set)))
-           (declare (type (alien sb!unix:off-t) offset))
+           (declare (type (alien sb!unix:unix-offset) offset))
            (let ((posn (sb!unix:unix-lseek (fd-stream-fd stream)
                                            offset origin)))
              ;; CLHS says to return true if the file-position was set
@@ -2143,7 +2174,7 @@
              ;; FIXME: We are still liable to signal an error if flushing
              ;; output fails.
              (return-from fd-stream-set-file-position
-               (typep posn '(alien sb!unix:off-t))))))))
+               (typep posn '(alien sb!unix:unix-offset))))))))
 
 
 ;;;; creation routines (MAKE-FD-STREAM and OPEN)
@@ -2165,6 +2196,9 @@
 ;;; FILE is the name of the file (will be returned by PATHNAME).
 ;;;
 ;;; NAME is used to identify the stream when printed.
+;;;
+;;; If SERVE-EVENTS is true, SERVE-EVENT machinery is used to
+;;; handle blocking IO on the stream.
 (defun make-fd-stream (fd
                        &key
                        (input nil input-p)
@@ -2172,6 +2206,7 @@
                        (element-type 'base-char)
                        (buffering :full)
                        (external-format :default)
+                       serve-events
                        timeout
                        file
                        original
@@ -2190,6 +2225,12 @@
         ((not (or input output))
          (error "File descriptor must be opened either for input or output.")))
   (let ((stream (%make-fd-stream :fd fd
+                                 :fd-type (progn
+                                            #!-win32 (sb!unix:fd-type fd)
+                                            ;; KLUDGE.
+                                            #!+win32 (if serve-events
+                                                         :unknown
+                                                         :regular))
                                  :name name
                                  :file file
                                  :original original
@@ -2197,9 +2238,8 @@
                                  :pathname pathname
                                  :buffering buffering
                                  :dual-channel-p dual-channel-p
-                                 :external-format external-format
                                  :bivalent-p (eq element-type :default)
-                                 :char-size (external-format-char-size external-format)
+                                 :serve-events serve-events
                                  :timeout
                                  (if timeout
                                      (coerce timeout 'single-float)
@@ -2392,6 +2432,10 @@
             (cond ((numberp fd)
                    (case direction
                      ((:input :output :io)
+                      ;; For O_APPEND opened files, lseek returns 0 until first write.
+                      ;; So we jump ahead here.
+                      (when (eq if-exists :append)
+                        (sb!unix:unix-lseek fd 0 sb!unix:l_xtnd))
                       (make-fd-stream fd
                                       :input input
                                       :output output
@@ -2402,6 +2446,7 @@
                                       :delete-original delete-original
                                       :pathname pathname
                                       :dual-channel-p nil
+                                      :serve-events nil
                                       :input-buffer-p t
                                       :auto-close t))
                      (:probe
@@ -2458,9 +2503,15 @@
     (without-package-locks
         (makunbound '*available-buffers*))))
 
-(defun stdstream-external-format (outputp)
-  (declare (ignorable outputp))
-  (let* ((keyword #!+win32 (if outputp (sb!win32::console-output-codepage) (sb!win32::console-input-codepage))
+(defun stdstream-external-format (fd outputp)
+  #!-win32 (declare (ignore fd outputp))
+  (let* ((keyword #!+win32 (if (and (/= fd -1)
+                                    (logbitp 0 fd)
+                                    (logbitp 1 fd))
+                               :ucs-2
+                               (if outputp
+                                   (sb!win32::console-output-codepage)
+                                   (sb!win32::console-input-codepage)))
                   #!-win32 (default-external-format))
          (ef (get-external-format keyword))
          (replacement (ef-default-replacement-character ef)))
@@ -2473,22 +2524,34 @@
       (aver (not (boundp '*available-buffers*)))
       (setf *available-buffers* nil)))
   (with-output-to-string (*error-output*)
-    (setf *stdin*
-          (make-fd-stream 0 :name "standard input" :input t :buffering :line
-                            :external-format (stdstream-external-format nil)))
-    (setf *stdout*
-          (make-fd-stream 1 :name "standard output" :output t :buffering :line
-                            :external-format (stdstream-external-format t)))
-    (setf *stderr*
-          (make-fd-stream 2 :name "standard error" :output t :buffering :line
-                            :external-format (stdstream-external-format t)))
+    (multiple-value-bind (in out err)
+        #!-win32 (values 0 1 2)
+        #!+win32 (sb!win32::get-std-handles)
+      (flet ((stdio-stream (handle name inputp outputp)
+               (make-fd-stream
+                handle
+                :name name
+                :input inputp
+                :output outputp
+                :buffering :line
+                :element-type :default
+                :serve-events inputp
+                :external-format (stdstream-external-format handle outputp))))
+        (setf *stdin*  (stdio-stream in  "standard input"    t nil))
+        (setf *stdout* (stdio-stream out "standard output" nil   t))
+        (setf *stderr* (stdio-stream err "standard error"  nil   t))))
+    #!+win32
+    (setf *tty* (make-two-way-stream *stdin* *stdout*))
+    #!-win32
     (let* ((ttyname #.(coerce "/dev/tty" 'simple-base-string))
            (tty (sb!unix:unix-open ttyname sb!unix:o_rdwr #o666)))
       (if tty
           (setf *tty*
                 (make-fd-stream tty :name "the terminal"
                                 :input t :output t :buffering :line
-                                :external-format (stdstream-external-format t)
+                                :external-format (stdstream-external-format
+                                                  tty t)
+                                :serve-events (or #!-win32 t)
                                 :auto-close t))
           (setf *tty* (make-two-way-stream *stdin* *stdout*))))
     (princ (get-output-stream-string *error-output*) *stderr*))

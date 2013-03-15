@@ -213,7 +213,7 @@
   (inst jmp (make-ea-for-object-slot eax closure-fun-slot fun-pointer-lowtag)))
 
 (define-assembly-routine (throw
-                          (:return-style :none))
+                          (:return-style :raw))
                          ((:arg target (descriptor-reg any-reg) edx-offset)
                           (:arg start any-reg ebx-offset)
                           (:arg count any-reg ecx-offset)
@@ -225,8 +225,18 @@
 
   LOOP
 
-  (let ((error (generate-error-code nil 'unseen-throw-tag-error target)))
-    (inst or catch catch)               ; check for NULL pointer
+  (let ((error (gen-label)))
+    (assemble (*elsewhere*)
+      (emit-label error)
+
+      ;; Fake up a stack frame so that backtraces come out right.
+      (inst push ebp-tn)
+      (inst mov ebp-tn esp-tn)
+
+      (emit-error-break nil error-trap
+                        (error-number-or-lose 'unseen-throw-tag-error)
+                        (list target)))
+    (inst test catch catch)             ; check for NULL pointer
     (inst jmp :z error))
 
   (inst cmp target (make-ea-for-object-slot catch catch-block-tag-slot 0))
@@ -254,7 +264,7 @@
   (declare (ignore start count))
 
   (let ((error (generate-error-code nil 'invalid-unwind-error)))
-    (inst or block block)               ; check for NULL pointer
+    (inst test block block)             ; check for NULL pointer
     (inst jmp :z error))
 
   (load-tl-symbol-value uwp *current-unwind-protect-block*)
@@ -299,7 +309,7 @@
   (declare (ignore start count))
 
   (let ((error (generate-error-code nil 'invalid-unwind-error)))
-    (inst or block block)               ; check for NULL pointer
+    (inst test block block)             ; check for NULL pointer
     (inst jmp :z error))
 
   ;; Save all our registers, as we're about to clobber them.
@@ -328,7 +338,7 @@
   (inst push 0)
   (inst push 0)
   (inst push ecx-tn)
-  (inst call (make-fixup "RtlUnwind@16" :foreign)))
+  (inst call (make-fixup "RtlUnwind" :foreign)))
 
 ;; We want no VOP for this one and for it to only happen on Win32
 ;; targets.  Hence the following disaster.

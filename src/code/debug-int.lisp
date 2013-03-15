@@ -205,12 +205,13 @@
 (defstruct (compiled-debug-var
             (:include debug-var)
             (:constructor make-compiled-debug-var
-                          (symbol id alive-p sc-offset save-sc-offset))
+                (symbol id alive-p sc-offset save-sc-offset info))
             (:copier nil))
   ;; storage class and offset (unexported)
   (sc-offset nil :type sb!c:sc-offset)
   ;; storage class and offset when saved somewhere
-  (save-sc-offset nil :type (or sb!c:sc-offset null)))
+  (save-sc-offset nil :type (or sb!c:sc-offset null))
+  (info nil))
 
 ;;;; frames
 
@@ -309,7 +310,7 @@
 ;;; and retains roots to functions that might otherwise be collected.
 (defun make-compiled-debug-fun (compiler-debug-fun component)
   (let ((table *compiled-debug-funs*))
-    (with-locked-hash-table (table)
+    (with-locked-system-table (table)
       (or (gethash compiler-debug-fun table)
           (setf (gethash compiler-debug-fun table)
                 (%make-compiled-debug-fun compiler-debug-fun component))))))
@@ -479,7 +480,7 @@
   ;; valid value at this code-location. (unexported).
   (%live-set :unparsed :type (or simple-bit-vector (member :unparsed)))
   ;; (unexported) To see SB!C::LOCATION-KIND, do
-  ;; (SB!KERNEL:TYPE-EXPAND 'SB!C::LOCATION-KIND).
+  ;; (SB!KERNEL:TYPEXPAND 'SB!C::LOCATION-KIND).
   (kind :unparsed :type (or (member :unparsed) sb!c::location-kind))
   (step-info :unparsed :type (or (member :unparsed :foo) simple-string)))
 
@@ -526,17 +527,19 @@
     #!-stack-grows-downward-not-upward
     (and (sap< x (current-sp))
          (sap<= control-stack-start x)
-         (or (not aligned) (zerop (logand (sap-int x) sb!vm:fixnum-tag-mask))))
+         (or (not aligned) (zerop (logand (sap-int x)
+                                          (1- (ash 1 sb!vm:word-shift))))))
     #!+stack-grows-downward-not-upward
     (and (sap>= x (current-sp))
          (sap> control-stack-end x)
-         (or (not aligned) (zerop (logand (sap-int x) sb!vm:fixnum-tag-mask))))))
+         (or (not aligned) (zerop (logand (sap-int x)
+                                          (1- (ash 1 sb!vm:word-shift))))))))
 
 (declaim (inline component-ptr-from-pc))
 (sb!alien:define-alien-routine component-ptr-from-pc (system-area-pointer)
   (pc system-area-pointer))
 
-#!+(or x86 x86-64)
+(declaim (inline valid-lisp-pointer-p))
 (sb!alien:define-alien-routine valid-lisp-pointer-p sb!alien:int
   (pointer system-area-pointer))
 
@@ -633,7 +636,8 @@
     (when saved-fp
       (compute-calling-frame (descriptor-sap saved-fp)
                              (descriptor-sap saved-pc)
-                             up-frame))))
+                             up-frame
+                             t))))
 
 ;;; Return the frame immediately below FRAME on the stack; or when
 ;;; FRAME is the bottom of the stack, return NIL.
@@ -787,13 +791,14 @@
                                  escaped))))))
 
 #!+(or x86 x86-64)
-(defun compute-calling-frame (caller ra up-frame)
+(defun compute-calling-frame (caller ra up-frame &optional savedp)
   (declare (type system-area-pointer caller ra))
   (/noshow0 "entering COMPUTE-CALLING-FRAME")
   (when (control-stack-pointer-valid-p caller)
     (/noshow0 "in WHEN")
     ;; First check for an escaped frame.
-    (multiple-value-bind (code pc-offset escaped) (find-escaped-frame caller)
+    (multiple-value-bind (code pc-offset escaped off-stack)
+        (find-escaped-frame caller)
       (/noshow0 "at COND")
       (cond (code
              ;; If it's escaped it may be a function end breakpoint trap.
@@ -827,7 +832,11 @@
                              (code-location-from-pc d-fun pc-offset
                                                     escaped)
                              (if up-frame (1+ (frame-number up-frame)) 0)
-                             escaped)))))
+                             ;; If we have an interrupt-context that's not on
+                             ;; our stack at all, and we're computing the
+                             ;; from from a saved FP, we're probably looking
+                             ;; at an interrupted syscall.
+                             (or escaped (and savedp off-stack)))))))
 
 (defun nth-interrupt-context (n)
   (declare (type (unsigned-byte 32) n)
@@ -838,106 +847,130 @@
                           #!+alpha (* 2 n)))
                       (* os-context-t)))
 
+;;;; Perform the lookup which FOREIGN-SYMBOL-ADDRESS would do if the
+;;;; linkage table were disabled, i.e. always return the actual symbol
+;;;; address, not the linkage table trampoline, even if the symbol would
+;;;; ordinarily go through the linkage table.  Important when
+;;;; SB-DYNAMIC-CORE is enabled and our caller assumes `name' to be a
+;;;; "static" symbol; a concept which doesn't exist in such builds.
+(defun true-foreign-symbol-address (name)
+  #!+linkage-table  ;we have dlsym -- let's use it.
+  (find-dynamic-foreign-symbol-address name)
+  #!-linkage-table  ;possibly no dlsym, but hence no indirection anyway.
+  (foreign-symbol-address))
+
+;;;; See above.
+(defun true-foreign-symbol-sap (name)
+  (int-sap (true-foreign-symbol-address name)))
+
 #!+(or x86 x86-64)
 (defun find-escaped-frame (frame-pointer)
   (declare (type system-area-pointer frame-pointer))
   (/noshow0 "entering FIND-ESCAPED-FRAME")
   (dotimes (index *free-interrupt-context-index* (values nil 0 nil))
-      (/noshow0 "at head of WITH-ALIEN")
-    (let ((context (nth-interrupt-context index)))
-        (/noshow0 "got CONTEXT")
-        (when (= (sap-int frame-pointer)
-                 (sb!vm:context-register context sb!vm::cfp-offset))
-          (without-gcing
-           (/noshow0 "in WITHOUT-GCING")
-           (let* ((component-ptr (component-ptr-from-pc
-                                  (sb!vm:context-pc context)))
-                  (code (unless (sap= component-ptr (int-sap #x0))
-                          (component-from-component-ptr component-ptr))))
-             (/noshow0 "got CODE")
-             (when (null code)
-               (return (values code 0 context)))
-             (let* ((code-header-len (* (get-header-data code)
-                                        sb!vm:n-word-bytes))
-                    (pc-offset
+    (let* ((context (nth-interrupt-context index))
+           (cfp (int-sap (sb!vm:context-register context sb!vm::cfp-offset))))
+      (/noshow0 "got CONTEXT")
+      (unless (control-stack-pointer-valid-p cfp)
+        (return (values nil nil nil t)))
+      (when (sap= frame-pointer cfp)
+        (without-gcing
+          (/noshow0 "in WITHOUT-GCING")
+          (let* ((component-ptr (component-ptr-from-pc
+                                 (sb!vm:context-pc context)))
+                 (code (unless (sap= component-ptr (int-sap #x0))
+                         (component-from-component-ptr component-ptr))))
+            (/noshow0 "got CODE")
+            (when (null code)
+              ;; KLUDGE: Detect undefined functions by a range-check
+              ;; against the trampoline address and the following
+              ;; function in the runtime.
+              (if (< (true-foreign-symbol-address "undefined_tramp")
+                     (sap-int (sb!vm:context-pc context))
+                     (true-foreign-symbol-address #!+x86 "closure_tramp"
+                                                    #!+x86-64 "alloc_tramp"))
+                  (return (values :undefined-function 0 context))
+                  (return (values code 0 context))))
+            (let* ((code-header-len (* (get-header-data code)
+                                       sb!vm:n-word-bytes))
+                   (pc-offset
                      (- (sap-int (sb!vm:context-pc context))
                         (- (get-lisp-obj-address code)
                            sb!vm:other-pointer-lowtag)
                         code-header-len)))
-               (/noshow "got PC-OFFSET")
-               (unless (<= 0 pc-offset
-                           (* (code-header-ref code sb!vm:code-code-size-slot)
-                              sb!vm:n-word-bytes))
-                 ;; We were in an assembly routine. Therefore, use the
-                 ;; LRA as the pc.
-                 ;;
-                 ;; FIXME: Should this be WARN or ERROR or what?
-                 (format t "** pc-offset ~S not in code obj ~S?~%"
-                         pc-offset code))
-               (/noshow0 "returning from FIND-ESCAPED-FRAME")
-               (return
-               (values code pc-offset context)))))))))
+              (/noshow "got PC-OFFSET")
+              (unless (<= 0 pc-offset
+                          (* (code-header-ref code sb!vm:code-code-size-slot)
+                             sb!vm:n-word-bytes))
+                ;; We were in an assembly routine. Therefore, use the
+                ;; LRA as the pc.
+                ;;
+                ;; FIXME: Should this be WARN or ERROR or what?
+                (format t "** pc-offset ~S not in code obj ~S?~%"
+                        pc-offset code))
+              (/noshow0 "returning from FIND-ESCAPED-FRAME")
+              (return
+                (values code pc-offset context)))))))))
 
 #!-(or x86 x86-64)
 (defun find-escaped-frame (frame-pointer)
   (declare (type system-area-pointer frame-pointer))
   (/noshow0 "entering FIND-ESCAPED-FRAME")
   (dotimes (index *free-interrupt-context-index* (values nil 0 nil))
-      (/noshow0 "at head of WITH-ALIEN")
     (let ((scp (nth-interrupt-context index)))
-        (/noshow0 "got SCP")
+      (/noshow0 "got SCP")
       (when (= (sap-int frame-pointer)
                (sb!vm:context-register scp sb!vm::cfp-offset))
         (without-gcing
-         (/noshow0 "in WITHOUT-GCING")
-         (let ((code (code-object-from-bits
-                      (sb!vm:context-register scp sb!vm::code-offset))))
-           (/noshow0 "got CODE")
-           (when (symbolp code)
-             (return (values code 0 scp)))
-           (let* ((code-header-len (* (get-header-data code)
-                                      sb!vm:n-word-bytes))
-                  (pc-offset
-                   (- (sap-int (sb!vm:context-pc scp))
-                      (- (get-lisp-obj-address code)
-                         sb!vm:other-pointer-lowtag)
-                      code-header-len)))
-             (let ((code-size (* (code-header-ref code
-                                                  sb!vm:code-code-size-slot)
-                                 sb!vm:n-word-bytes)))
-               (unless (<= 0 pc-offset code-size)
-                 ;; We were in an assembly routine.
-                 (multiple-value-bind (new-pc-offset computed-return)
-                     (find-pc-from-assembly-fun code scp)
-                   (setf pc-offset new-pc-offset)
-                   (unless (<= 0 pc-offset code-size)
-                     (cerror
-                      "Set PC-OFFSET to zero and continue backtrace."
-                      'bug
-                      :format-control
-                      "~@<PC-OFFSET (~D) not in code object. Frame details:~
+          (/noshow0 "in WITHOUT-GCING")
+          (let ((code (code-object-from-bits
+                       (sb!vm:context-register scp sb!vm::code-offset))))
+            (/noshow0 "got CODE")
+            (when (symbolp code)
+              (return (values code 0 scp)))
+            (let* ((code-header-len (* (get-header-data code)
+                                       sb!vm:n-word-bytes))
+                   (pc-offset
+                     (- (sap-int (sb!vm:context-pc scp))
+                        (- (get-lisp-obj-address code)
+                           sb!vm:other-pointer-lowtag)
+                        code-header-len)))
+              (let ((code-size (* (code-header-ref code
+                                                   sb!vm:code-code-size-slot)
+                                  sb!vm:n-word-bytes)))
+                (unless (<= 0 pc-offset code-size)
+                  ;; We were in an assembly routine.
+                  (multiple-value-bind (new-pc-offset computed-return)
+                      (find-pc-from-assembly-fun code scp)
+                    (setf pc-offset new-pc-offset)
+                    (unless (<= 0 pc-offset code-size)
+                      (cerror
+                       "Set PC-OFFSET to zero and continue backtrace."
+                       'bug
+                       :format-control
+                       "~@<PC-OFFSET (~D) not in code object. Frame details:~
                        ~2I~:@_PC: #X~X~:@_CODE: ~S~:@_CODE FUN: ~S~:@_LRA: ~
                        #X~X~:@_COMPUTED RETURN: #X~X.~:>"
-                      :format-arguments
-                      (list pc-offset
-                            (sap-int (sb!vm:context-pc scp))
-                            code
-                            (%code-entry-points code)
-                            (sb!vm:context-register scp sb!vm::lra-offset)
-                            computed-return))
-                     ;; We failed to pinpoint where PC is, but set
-                     ;; pc-offset to 0 to keep the backtrace from
-                     ;; exploding.
-                     (setf pc-offset 0)))))
-             (/noshow0 "returning from FIND-ESCAPED-FRAME")
-             (return
-               (if (eq (%code-debug-info code) :bogus-lra)
-                   (let ((real-lra (code-header-ref code
-                                                    real-lra-slot)))
-                     (values (lra-code-header real-lra)
-                             (get-header-data real-lra)
-                             nil))
-                   (values code pc-offset scp))))))))))
+                       :format-arguments
+                       (list pc-offset
+                             (sap-int (sb!vm:context-pc scp))
+                             code
+                             (%code-entry-points code)
+                             (sb!vm:context-register scp sb!vm::lra-offset)
+                             computed-return))
+                      ;; We failed to pinpoint where PC is, but set
+                      ;; pc-offset to 0 to keep the backtrace from
+                      ;; exploding.
+                      (setf pc-offset 0)))))
+              (/noshow0 "returning from FIND-ESCAPED-FRAME")
+              (return
+                (if (eq (%code-debug-info code) :bogus-lra)
+                    (let ((real-lra (code-header-ref code
+                                                     real-lra-slot)))
+                      (values (lra-code-header real-lra)
+                              (get-header-data real-lra)
+                              nil))
+                    (values code pc-offset scp))))))))))
 
 #!-(or x86 x86-64)
 (defun find-pc-from-assembly-fun (code scp)
@@ -1409,10 +1442,13 @@ register."
                               args (incf i) vars))
                        res))
                 (sb!c::more-arg
-                 ;; Just ignore the fact that the next two args are
-                 ;; the &MORE arg context and count, and act like they
-                 ;; are regular arguments.
-                 nil)
+                 ;; The next two args are the &MORE arg context and count.
+                 (push (list :more
+                             (compiled-debug-fun-lambda-list-var
+                              args (incf i) vars)
+                             (compiled-debug-fun-lambda-list-var
+                              args (incf i) vars))
+                       res))
                 (t
                  ;; &KEY arg
                  (push (list :keyword
@@ -1604,22 +1640,13 @@ register."
       (without-package-locks
         (setf (compiled-debug-var-symbol (svref vars i))
               (intern (format nil "ARG-~V,'0D" width i)
-                      ;; KLUDGE: It's somewhat nasty to have a bare
-                      ;; package name string here. It would be
-                      ;; nicer to have #.(FIND-PACKAGE "SB!DEBUG")
-                      ;; instead, since then at least it would transform
-                      ;; correctly under package renaming and stuff.
-                      ;; However, genesis can't handle dumped packages..
-                      ;; -- WHN 20000129
-                      ;;
-                      ;; FIXME: Maybe this could be fixed by moving the
-                      ;; whole debug-int.lisp file to warm init? (after
-                      ;; which dumping a #.(FIND-PACKAGE ..) expression
-                      ;; would work fine) If this is possible, it would
-                      ;; probably be a good thing, since minimizing the
-                      ;; amount of stuff in cold init is basically good.
-                      (or (find-package "SB-DEBUG")
-                          (find-package "SB!DEBUG"))))))))
+                      ;; The cross-compiler won't dump literal package
+                      ;; references because the target package objects
+                      ;; aren't created until partway through
+                      ;; cold-init. In lieu of adding smarts to the
+                      ;; build framework to handle this, we use an
+                      ;; explicit load-time-value form.
+                      (load-time-value (find-package "SB!DEBUG"))))))))
 
 ;;; Parse the packed representation of DEBUG-VARs from
 ;;; DEBUG-FUN's SB!C::COMPILED-DEBUG-FUN, returning a vector
@@ -1642,6 +1669,8 @@ register."
           (let* ((flags (geti))
                  (minimal (logtest sb!c::compiled-debug-var-minimal-p flags))
                  (deleted (logtest sb!c::compiled-debug-var-deleted-p flags))
+                 (more-context-p (logtest sb!c::compiled-debug-var-more-context-p flags))
+                 (more-count-p (logtest sb!c::compiled-debug-var-more-count-p flags))
                  (live (logtest sb!c::compiled-debug-var-environment-live
                                 flags))
                  (save (logtest sb!c::compiled-debug-var-save-loc-p flags))
@@ -1656,7 +1685,9 @@ register."
                                                          id
                                                          live
                                                          sc-offset
-                                                         save-sc-offset)
+                                                         save-sc-offset
+                                                         (cond (more-context-p :more-context)
+                                                               (more-count-p :more-count)))
                                 buffer)))))))
 
 ;;;; CODE-LOCATIONs
@@ -1966,6 +1997,18 @@ register."
 ;;; (Such values can arise in registers on machines with conservative
 ;;; GC, and might also arise in debug variable locations when
 ;;; those variables are invalid.)
+;;;
+;;; NOTE: this function is not GC-safe in the slightest when creating
+;;; a pointer to an object in dynamic space.  If a GC occurs between
+;;; the start of the call to VALID-LISP-POINTER-P and the end of
+;;; %MAKE-LISP-OBJ then the object could move before the boxed pointer
+;;; is constructed.  This can happen on CHENEYGC if an asynchronous
+;;; interrupt occurs within the window.  This can happen on GENCGC
+;;; under the same circumstances, but is more likely due to all GENCGC
+;;; platforms supporting threaded operation.  This is somewhat
+;;; mitigated on x86oids due to the conservative stack and interrupt
+;;; context "scavenging" on such platforms, but there still may be a
+;;; vulnerable window.
 (defun make-lisp-obj (val &optional (errorp t))
   (if (or
        ;; fixnum
@@ -1978,22 +2021,17 @@ register."
             (= (logand val #xff) sb!vm:character-widetag)) ; char tag
        ;; unbound marker
        (= val sb!vm:unbound-marker-widetag)
+       ;; undefined_tramp doesn't validate properly as a pointer, and
+       ;; the actual value can vary by backend (x86oids need not
+       ;; apply)
+       #!+(or alpha hppa mips ppc)
+       (= val (+ (- (foreign-symbol-address "undefined_tramp")
+                    (* sb!vm:n-word-bytes sb!vm:simple-fun-code-offset))
+                 sb!vm:fun-pointer-lowtag))
+       #!+sparc
+       (= val (foreign-symbol-address "undefined_tramp"))
        ;; pointer
-       #!+(or x86 x86-64)
-       (not (zerop (valid-lisp-pointer-p (int-sap val))))
-       ;; FIXME: There is no fundamental reason not to use the above
-       ;; function on other platforms as well, but I didn't have
-       ;; others available while doing this. --NS 2007-06-21
-       #!-(or x86 x86-64)
-       (and (logbitp 0 val)
-            (or (< sb!vm:read-only-space-start val
-                   (* sb!vm:*read-only-space-free-pointer*
-                      sb!vm:n-word-bytes))
-                (< sb!vm:static-space-start val
-                   (* sb!vm:*static-space-free-pointer*
-                      sb!vm:n-word-bytes))
-                (< (current-dynamic-space-start) val
-                   (sap-int (dynamic-space-free-pointer))))))
+       (not (zerop (valid-lisp-pointer-p (int-sap val)))))
       (values (%make-lisp-obj val) t)
       (if errorp
           (error "~S is not a valid argument to ~S"
@@ -2380,12 +2418,10 @@ register."
 ;;; :unknown. Once we've called CODE-LOCATION-UNKNOWN-P, we know the
 ;;; live-set information has been cached in the code-location.
 (defun debug-var-validity (debug-var basic-code-location)
-  (etypecase debug-var
-    (compiled-debug-var
-     (compiled-debug-var-validity debug-var basic-code-location))
-    ;; (There used to be more cases back before sbcl-0.7.0, when
-    ;; we did special tricks to debug the IR1 interpreter.)
-    ))
+  (compiled-debug-var-validity debug-var basic-code-location))
+
+(defun debug-var-info (debug-var)
+  (compiled-debug-var-info debug-var))
 
 ;;; This is the method for DEBUG-VAR-VALIDITY for COMPILED-DEBUG-VARs.
 ;;; For safety, make sure basic-code-location is what we think.
@@ -2505,6 +2541,70 @@ register."
                        (nconc (subseq form 0 n)
                               (cons res (nthcdr (1+ n) form))))))))
       (frob form path context))))
+
+;;; Given a code location, return the associated form-number
+;;; translations and the actual top level form.
+(defun get-toplevel-form (location)
+  (let ((d-source (code-location-debug-source location)))
+    (let* ((offset (code-location-toplevel-form-offset location))
+           (res
+             (cond ((debug-source-form d-source)
+                    (debug-source-form d-source))
+                   ((debug-source-namestring d-source)
+                    (get-file-toplevel-form location))
+                   (t (bug "Don't know how to use a DEBUG-SOURCE without ~
+                               a namestring or a form.")))))
+      (values (form-number-translations res offset) res))))
+
+;;; To suppress the read-time evaluation #. macro during source read,
+;;; *READTABLE* is modified.
+;;;
+;;; FIXME: This breaks #+#.(cl:if ...) Maybe we need a SAFE-READ-EVAL, which
+;;; this code can use for side- effect free #. calls?
+;;;
+;;; FIXME: This also knows nothing of custom readtables. The assumption
+;;; is that the current readtable is a decent approximation for what
+;;; we want, but that's lossy.
+(defun safe-readtable ()
+  (let ((rt (copy-readtable)))
+    (set-dispatch-macro-character
+     #\# #\. (lambda (stream sub-char &rest rest)
+               (declare (ignore rest sub-char))
+               (let ((token (read stream t nil t)))
+                 (format nil "#.~S" token)))
+     rt)
+    rt))
+
+;;; Locate the source file (if it still exists) and grab the top level
+;;; form. If the file is modified, we use the top level form offset
+;;; instead of the recorded character offset.
+(defun get-file-toplevel-form (location)
+  (let* ((d-source (code-location-debug-source location))
+         (tlf-offset (code-location-toplevel-form-offset location))
+         (local-tlf-offset (- tlf-offset
+                              (debug-source-root-number d-source)))
+         (char-offset
+          (aref (or (sb!di:debug-source-start-positions d-source)
+                    (error "no start positions map"))
+                local-tlf-offset))
+         (namestring (debug-source-namestring d-source)))
+    ;; FIXME: External format?
+    (with-open-file (f namestring :if-does-not-exist nil)
+      (unless f
+        (error "The source file no longer exists:~%  ~A" namestring))
+      (format *debug-io* "~%; file: ~A~%" namestring)
+      (let ((*readtable* (safe-readtable)))
+        (cond ((eql (debug-source-created d-source) (file-write-date f))
+               (file-position f char-offset))
+              (t
+               (format *debug-io*
+                       "~%; File has been modified since compilation:~%;   ~A~@
+                          ; Using form offset instead of character position.~%"
+                       namestring)
+               (let ((*read-suppress* t))
+                 (loop repeat local-tlf-offset
+                       do (read f)))))
+        (read f)))))
 
 ;;;; PREPROCESS-FOR-EVAL
 
@@ -2520,7 +2620,9 @@ register."
 (defun preprocess-for-eval (form loc)
   (declare (type code-location loc))
   (let ((n-frame (gensym))
-        (fun (code-location-debug-fun loc)))
+        (fun (code-location-debug-fun loc))
+        (more-context nil)
+        (more-count nil))
     (unless (debug-var-info-available fun)
       (debug-signal 'no-debug-vars :debug-fun fun))
     (sb!int:collect ((binds)
@@ -2528,17 +2630,33 @@ register."
       (do-debug-fun-vars (var fun)
         (let ((validity (debug-var-validity var loc)))
           (unless (eq validity :invalid)
+            (case (debug-var-info var)
+              (:more-context
+               (setf more-context var))
+              (:more-count
+               (setf more-count var)))
             (let* ((sym (debug-var-symbol var))
                    (found (assoc sym (binds))))
               (if found
                   (setf (second found) :ambiguous)
                   (binds (list sym validity var)))))))
+      (when (and more-context more-count)
+        (let ((more (assoc 'sb!debug::more (binds))))
+          (if more
+              (setf (second more) :ambiguous)
+              (binds (list 'sb!debug::more :more more-context more-count)))))
       (dolist (bind (binds))
         (let ((name (first bind))
               (var (third bind)))
           (ecase (second bind)
             (:valid
              (specs `(,name (debug-var-value ',var ,n-frame))))
+            (:more
+             (let ((count-var (fourth bind)))
+               (specs `(,name (multiple-value-list
+                               (sb!c:%more-arg-values (debug-var-value ',var ,n-frame)
+                                                      0
+                                                      (debug-var-value ',count-var ,n-frame)))))))
             (:unknown
              (specs `(,name (debug-signal 'invalid-value
                                           :debug-var ',var
@@ -2900,14 +3018,14 @@ register."
 ;;; which GC is disabled, so that Lisp doesn't move objects around
 ;;; that C is pointing to.
 (sb!alien:define-alien-routine "breakpoint_install" sb!alien:unsigned-int
-  (code-obj sb!alien:unsigned-long)
+  (code-obj sb!alien:unsigned)
   (pc-offset sb!alien:int))
 
 ;;; This removes the break instruction and replaces the original
 ;;; instruction. You must call this in a context in which GC is disabled
 ;;; so Lisp doesn't move objects around that C is pointing to.
 (sb!alien:define-alien-routine "breakpoint_remove" sb!alien:void
-  (code-obj sb!alien:unsigned-long)
+  (code-obj sb!alien:unsigned)
   (pc-offset sb!alien:int)
   (old-inst sb!alien:unsigned-int))
 
@@ -3027,7 +3145,11 @@ register."
             (sb!alien:sap-alien signal-context (* os-context-t))))
          (cfp (int-sap (sb!vm:context-register scp sb!vm::cfp-offset))))
     (compute-calling-frame cfp
-                           (sb!vm:context-pc scp)
+                           ;; KLUDGE: This argument is ignored on
+                           ;; x86oids in this scenario, but is
+                           ;; declared to be a SAP.
+                           #!+(or x86 x86-64) (sb!vm:context-pc scp)
+                           #!-(or x86 x86-64) nil
                            nil)))
 
 (defun handle-fun-end-breakpoint (offset component context)
@@ -3096,9 +3218,9 @@ register."
   (without-gcing
    ;; These are really code labels, not variables: but this way we get
    ;; their addresses.
-   (let* ((src-start (foreign-symbol-sap "fun_end_breakpoint_guts"))
-          (src-end (foreign-symbol-sap "fun_end_breakpoint_end"))
-          (trap-loc (foreign-symbol-sap "fun_end_breakpoint_trap"))
+   (let* ((src-start (true-foreign-symbol-sap "fun_end_breakpoint_guts"))
+          (src-end (true-foreign-symbol-sap "fun_end_breakpoint_end"))
+          (trap-loc (true-foreign-symbol-sap "fun_end_breakpoint_trap"))
           (length (sap- src-end src-start))
           (code-object
            (sb!c:allocate-code-object (1+ bogus-lra-constants) length))
@@ -3124,11 +3246,10 @@ register."
      #!-(or x86 x86-64)
      (let ((new-lra (make-lisp-obj (+ (sap-int dst-start)
                                       sb!vm:other-pointer-lowtag))))
-       (set-header-data
-        new-lra
-        (logandc2 (+ sb!vm:code-constants-offset bogus-lra-constants 1)
-                  1))
-       (sb!vm:sanctify-for-execution code-object)
+       ;; We used to set the header value of the LRA here to the
+       ;; offset from the enclosing component to the LRA header, but
+       ;; MAKE-LISP-OBJ actually checks the value before we get a
+       ;; chance to set it, so it's now done in arch-assem.S.
        (values new-lra code-object (sap- trap-loc src-start))))))
 
 ;;;; miscellaneous

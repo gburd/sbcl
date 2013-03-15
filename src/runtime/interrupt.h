@@ -12,7 +12,7 @@
 #if !defined(_INCLUDE_INTERRUPT_H_)
 #define _INCLUDE_INTERRUPT_H_
 
-#include <signal.h>
+#include "runtime.h"
 #include <string.h>
 
 /*
@@ -24,7 +24,12 @@
  * stack by the kernel, so copying a libc-sized sigset_t into it will
  * overflow and cause other data on the stack to be corrupted */
 /* FIXME: do not rely on NSIG being a multiple of 8 */
-#define REAL_SIGSET_SIZE_BYTES ((NSIG/8))
+
+#ifdef LISP_FEATURE_WIN32
+# define REAL_SIGSET_SIZE_BYTES (4)
+#else
+# define REAL_SIGSET_SIZE_BYTES ((NSIG/8))
+#endif
 
 static inline void
 sigcopyset(sigset_t *new, sigset_t *old)
@@ -113,7 +118,7 @@ struct interrupt_data {
      * and with no pending handler. Both deferrable interrupt handlers
      * and gc are careful not to clobber each other's pending_mask. */
     boolean gc_blocked_deferrables;
-#ifdef LISP_FEATURE_PPC
+#ifdef GENCGC_IS_PRECISE
     /* On PPC when consing wants to turn to alloc(), it does so via a
      * trap. When alloc() wants to save the sigmask it consults
      * allocation_trap_context. It does not look up the most recent
@@ -123,10 +128,15 @@ struct interrupt_data {
 #endif
 };
 
+typedef lispobj (*call_into_lisp_lookalike)(
+    lispobj fun, lispobj *args, int nargs);
+
 extern boolean interrupt_handler_pending_p(void);
 extern void interrupt_init(void);
 extern void fake_foreign_function_call(os_context_t* context);
 extern void undo_fake_foreign_function_call(os_context_t* context);
+extern void arrange_return_to_c_function(
+    os_context_t *, call_into_lisp_lookalike, lispobj);
 extern void arrange_return_to_lisp_function(os_context_t *, lispobj);
 extern void interrupt_handle_now(int, siginfo_t*, os_context_t*);
 extern void interrupt_handle_pending(os_context_t*);
@@ -147,8 +157,9 @@ typedef void (*interrupt_handler_t)(int, siginfo_t *, os_context_t *);
 extern void undoably_install_low_level_interrupt_handler (
                         int signal,
                         interrupt_handler_t handler);
-extern unsigned long install_handler(int signal,
-                                     interrupt_handler_t handler);
+extern uword_t install_handler(int signal,
+                               interrupt_handler_t handler,
+                               int synchronous);
 
 extern union interrupt_handler interrupt_handlers[NSIG];
 
@@ -170,5 +181,11 @@ extern void lisp_memory_fault_error(os_context_t *context,
 
 extern void lower_thread_control_stack_guard_page(struct thread *th);
 extern void reset_thread_control_stack_guard_page(struct thread *th);
+
+#if defined(LISP_FEATURE_SB_SAFEPOINT) && !defined(LISP_FEATURE_WIN32)
+# ifdef LISP_FEATURE_SB_THRUPTION
+void thruption_handler(int signal, siginfo_t *info, os_context_t *context);
+# endif
+#endif
 
 #endif

@@ -14,7 +14,18 @@
            nil)
 
 #!+stack-allocatable-fixed-objects
-(defoptimizer (%make-structure-instance stack-allocate-result) ((&rest args) node dx)
+(defoptimizer (%make-structure-instance stack-allocate-result) ((defstruct-description &rest args) node dx)
+  (aver (constant-lvar-p defstruct-description))
+  ;; A structure instance can be stack-allocated if it has no raw
+  ;; slots, or if we're on a target with a conservatively-scavenged
+  ;; stack.  We have no reader conditional for stack conservation, but
+  ;; it turns out that the only time stack conservation is in play is
+  ;; when we're on GENCGC (since CHENEYGC doesn't have conservation)
+  ;; and C-STACK-IS-CONTROL-STACK (otherwise, the C stack is the
+  ;; number stack, and we precisely-scavenge the control stack).
+  #!-(and :gencgc :c-stack-is-control-stack)
+  (zerop (sb!kernel::dd-raw-length (lvar-value defstruct-description)))
+  #!+(and :gencgc :c-stack-is-control-stack)
   t)
 
 (defoptimizer ir2-convert-reffer ((object) node block name offset lowtag)
@@ -69,7 +80,7 @@
              (macrolet ((make-case ()
                           `(ecase raw-type
                              ((t)
-                              (vop set-slot node block object arg-tn
+                              (vop init-slot node block object arg-tn
                                    name (+ sb!vm:instance-slots-offset slot) lowtag))
                              ,@(mapcar (lambda (rsd)
                                          `(,(sb!kernel::raw-slot-data-raw-type rsd)
@@ -82,11 +93,11 @@
                                        nil))))
                (make-case))))
           (:dd
-           (vop set-slot node block object
+           (vop init-slot node block object
                 (emit-constant (sb!kernel::dd-layout-or-lose slot))
                 name sb!vm:instance-slots-offset lowtag))
           (otherwise
-           (vop set-slot node block object
+           (vop init-slot node block object
                 (ecase kind
                   (:arg
                    (aver args)
@@ -194,7 +205,7 @@
                          ,@(nreverse clauses)))))
                (frob)))
            (tnify (index)
-             (constant-tn (find-constant index))))
+             (emit-constant index)))
       (let ((setter (compute-setter))
             (length (length initial-contents)))
         (dotimes (i length)
@@ -223,15 +234,24 @@
 (progn
   (defoptimizer (allocate-vector stack-allocate-result)
       ((type length words) node dx)
-    (or (eq dx :truly)
-        (zerop (policy node safety))
-        ;; a vector object should fit in one page -- otherwise it might go past
-        ;; stack guard pages.
-        (values-subtypep (lvar-derived-type words)
-                         (load-time-value
-                          (specifier-type `(integer 0 ,(- (/ sb!vm::*backend-page-bytes*
-                                                             sb!vm:n-word-bytes)
-                                                          sb!vm:vector-data-offset)))))))
+    (and
+     ;; Can't put unboxed data on the stack unless we scavenge it
+     ;; conservatively.
+     #!-c-stack-is-control-stack
+     (constant-lvar-p type)
+     #!-c-stack-is-control-stack
+     (member (lvar-value type)
+             '#.(list (sb!vm:saetp-typecode (find-saetp 't))
+                      (sb!vm:saetp-typecode (find-saetp 'fixnum))))
+     (or (eq dx :always-dynamic)
+         (zerop (policy node safety))
+         ;; a vector object should fit in one page -- otherwise it might go past
+         ;; stack guard pages.
+         (values-subtypep (lvar-derived-type words)
+                          (load-time-value
+                           (specifier-type `(integer 0 ,(- (/ sb!vm::*backend-page-bytes*
+                                                              sb!vm:n-word-bytes)
+                                                           sb!vm:vector-data-offset))))))))
 
   (defoptimizer (allocate-vector ltn-annotate) ((type length words) call ltn-policy)
     (let ((args (basic-combination-args call))

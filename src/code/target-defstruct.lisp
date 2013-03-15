@@ -139,6 +139,36 @@
   (/show0 "leaving PROTECT-CL")
   (values))
 
+(defun make-defstruct-predicate (dd layout)
+  (ecase (dd-type dd)
+    ;; structures with LAYOUTs
+    ((structure funcallable-structure)
+     (/show0 "with-LAYOUT case")
+     #'(lambda (object)
+         (locally ; <- to keep SAFETY 0 from affecting arg count checking
+             (declare (optimize (speed 3) (safety 0)))
+           (/noshow0 "in with-LAYOUT structure predicate closure,")
+           (/noshow0 "  OBJECT,LAYOUT=..")
+           (/nohexstr object)
+           (/nohexstr layout)
+           (typep-to-layout object layout))))
+    ;; structures with no LAYOUT (i.e. :TYPE VECTOR or :TYPE LIST)
+    ;;
+    ;; FIXME: should handle the :NAMED T case in these cases
+    (vector
+     (/show0 ":TYPE VECTOR case")
+     #'vectorp)
+    (list
+     (/show0 ":TYPE LIST case")
+     #'listp)))
+
+(defun make-defstruct-copier (dd layout)
+  (ecase (dd-type dd)
+    (structure
+     #'(lambda (instance)
+         (%check-structure-type-from-layout instance layout)
+         (copy-structure instance)))))
+
 ;;; the part of %DEFSTRUCT which makes sense only on the target SBCL
 ;;;
 ;;; (The "static" in the name is because it needs to be done not only
@@ -188,34 +218,14 @@
     ;; (And funcallable instances don't need copiers anyway.)
     (aver (eql (dd-type dd) 'structure))
     (setf (symbol-function (dd-copier-name dd))
-          ;; FIXME: should use a closure which checks arg type before copying
-          #'copy-structure))
+          (make-defstruct-copier dd layout)))
 
   ;; Set FDEFINITION for predicate.
   (when (dd-predicate-name dd)
     (/show0 "doing FDEFINITION for predicate")
     (protect-cl (dd-predicate-name dd))
     (setf (symbol-function (dd-predicate-name dd))
-          (ecase (dd-type dd)
-            ;; structures with LAYOUTs
-            ((structure funcallable-structure)
-             (/show0 "with-LAYOUT case")
-             (lambda (object)
-               (locally ; <- to keep SAFETY 0 from affecting arg count checking
-                 (declare (optimize (speed 3) (safety 0)))
-                 (/noshow0 "in with-LAYOUT structure predicate closure, OBJECT,LAYOUT=..")
-                 (/nohexstr object)
-                 (/nohexstr layout)
-                 (typep-to-layout object layout))))
-            ;; structures with no LAYOUT (i.e. :TYPE VECTOR or :TYPE LIST)
-            ;;
-            ;; FIXME: should handle the :NAMED T case in these cases
-            (vector
-             (/show0 ":TYPE VECTOR case")
-             #'vectorp)
-            (list
-             (/show0 ":TYPE LIST case")
-             #'listp))))
+          (make-defstruct-predicate dd layout)))
 
   (when (dd-doc dd)
     (setf (fdocumentation (dd-name dd) 'structure)
@@ -351,9 +361,9 @@
   #!+sb-doc
   "Return a copy of STRUCTURE with the same (EQL) slot values."
   (declare (type structure-object structure))
-  (let* ((len (%instance-length structure))
-         (res (%make-instance len))
-         (layout (%instance-layout structure))
+  (let* ((layout (%instance-layout structure))
+         (res (%make-instance (%instance-length structure)))
+         (len (layout-length layout))
          (nuntagged (layout-n-untagged-slots layout)))
 
     (declare (type index len))
@@ -511,28 +521,25 @@
   (/nohexstr obj)
   (/nohexstr layout)
   (when (layout-invalid layout)
-    (error "An obsolete structure accessor function was called."))
+    (error "An obsolete structure typecheck function was called."))
   (/noshow0 "back from testing LAYOUT-INVALID LAYOUT")
   (and (%instancep obj)
        (let ((obj-layout (%instance-layout obj)))
-         (cond ((eq obj-layout layout)
-                ;; (In this case OBJ-LAYOUT can't be invalid, because
-                ;; we determined LAYOUT is valid in the test above.)
-                (/noshow0 "EQ case")
-                t)
-               ((layout-invalid obj-layout)
-                (/noshow0 "LAYOUT-INVALID case")
-                (error 'layout-invalid
-                       :expected-type (layout-classoid obj-layout)
-                       :datum obj))
-               (t
-                (let ((depthoid (layout-depthoid layout)))
-                  (/noshow0 "DEPTHOID case, DEPTHOID,LAYOUT-INHERITS=..")
-                  (/nohexstr depthoid)
-                  (/nohexstr layout-inherits)
-                  (and (> (layout-depthoid obj-layout) depthoid)
-                       (eq (svref (layout-inherits obj-layout) depthoid)
-                           layout))))))))
+         (when (eq obj-layout layout)
+           ;; (In this case OBJ-LAYOUT can't be invalid, because
+           ;; we determined LAYOUT is valid in the test above.)
+           (/noshow0 "EQ case")
+           (return-from typep-to-layout t))
+         (when (layout-invalid obj-layout)
+           (/noshow0 "LAYOUT-INVALID case")
+           (setf obj-layout (update-object-layout-or-invalid obj layout)))
+         (let ((depthoid (layout-depthoid layout)))
+           (/noshow0 "DEPTHOID case, DEPTHOID,LAYOUT-INHERITS=..")
+           (/nohexstr depthoid)
+           (/nohexstr layout-inherits)
+           (and (> (layout-depthoid obj-layout) depthoid)
+                (eq (svref (layout-inherits obj-layout) depthoid)
+                    layout))))))
 
 ;;;; checking structure types
 

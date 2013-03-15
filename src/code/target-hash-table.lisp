@@ -258,16 +258,25 @@ Examples:
     HASH-FUNCTION is expected to return a non-negative fixnum hash code.
 
   :WEAKNESS
-    If NIL (the default) it is a normal non-weak hash table. If one
-    of :KEY, :VALUE, :KEY-AND-VALUE, :KEY-OR-VALUE it is a weak hash table.
-    Depending on the type of weakness the lack of references to the key and
-    the value may allow for removal of the entry. If WEAKNESS is :KEY and the
-    key would otherwise be garbage the entry is eligible for removal from the
-    hash table. Similarly, if WEAKNESS is :VALUE the life of an entry depends
-    on its value's references. If WEAKNESS is :KEY-AND-VALUE and either the
-    key or the value would otherwise be garbage the entry can be removed. If
-    WEAKNESS is :KEY-OR-VALUE and both the key and the value would otherwise
-    be garbage the entry can be removed.
+    When :WEAKNESS is not NIL, garbage collection may remove entries from the
+    hash table. The value of :WEAKNESS specifies how the presence of a key or
+    value in the hash table preserves their entries from garbage collection.
+
+    Valid values are:
+
+      :KEY means that the key of an entry must be live to guarantee that the
+        entry is preserved.
+
+      :VALUE means that the value of an entry must be live to guarantee that
+        the entry is preserved.
+
+      :KEY-AND-VALUE means that both the key and the value must be live to
+        guarantee that the entry is preserved.
+
+      :KEY-OR-VALUE means that either the key or the value must be live to
+        guarantee that the entry is preserved.
+
+      NIL (the default) means that entries are always preserved.
 
   :SYNCHRONIZED
     If NIL (the default), the hash-table may have multiple concurrent readers,
@@ -619,19 +628,19 @@ multiple threads accessing the same hash-table without locking."
            (hash-table-needs-rehash-p hash-table)))
     (declare (inline rehash-p rehash-without-growing-p))
     (cond ((rehash-p)
-           ;; Use recursive spinlocks since for weak tables the
-           ;; spinlock has already been acquired. GC must be inhibited
-           ;; to prevent the GC from seeing a rehash in progress.
-           (sb!thread::with-recursive-system-spinlock
-               ((hash-table-spinlock hash-table) :without-gcing t)
+           ;; Use recursive locks since for weak tables the lock has
+           ;; already been acquired. GC must be inhibited to prevent
+           ;; the GC from seeing a rehash in progress.
+           (sb!thread::with-recursive-system-lock
+               ((hash-table-lock hash-table) :without-gcing t)
              ;; Repeat the condition inside the lock to ensure that if
              ;; two reader threads enter MAYBE-REHASH at the same time
              ;; only one rehash is performed.
              (when (rehash-p)
                (rehash hash-table))))
           ((rehash-without-growing-p)
-           (sb!thread::with-recursive-system-spinlock
-               ((hash-table-spinlock hash-table) :without-gcing t)
+           (sb!thread::with-recursive-system-lock
+               ((hash-table-lock hash-table) :without-gcing t)
              (when (rehash-without-growing-p)
                (rehash-without-growing hash-table)))))))
 
@@ -651,15 +660,16 @@ multiple threads accessing the same hash-table without locking."
                 (locally (declare (inline ,@inline))
                   ,@body))))
        (if (hash-table-weakness ,hash-table)
-           (sb!thread::with-recursive-system-spinlock
-               ((hash-table-spinlock ,hash-table) :without-gcing t)
+           (sb!thread::with-recursive-system-lock
+               ((hash-table-lock ,hash-table) :without-gcing t)
              (,body-fun))
            (with-pinned-objects ,pin
              (if ,synchronized
-                 ;; We use a "system" spinlock here because it is very
-                 ;; slightly faster, as it doesn't re-enable interrupts.
-                 (sb!thread::with-recursive-system-spinlock
-                     ((hash-table-spinlock ,hash-table))
+                 ;; We use a "system" lock here because it is very
+                 ;; slightly faster, as it doesn't re-enable
+                 ;; interrupts.
+                 (sb!thread::with-recursive-system-lock
+                     ((hash-table-lock ,hash-table))
                    (,body-fun))
                  (,body-fun)))))))
 

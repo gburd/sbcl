@@ -113,18 +113,18 @@ ldso_stub__ ## fct: ;                           \\
 #!+(and darwin ppc) "
 #define LDSO_STUBIFY(fct)                       @\\
 .text                                           @\\
-.globl  _ldso_stub___ ## fct                     @\\
-_ldso_stub___ ## fct:                            @\\
-        b ldso_stub__ ## fct ## stub            @\\
-.symbol_stub ldso_stub__ ## fct ## stub:        @\\
+.globl  _ldso_stub__ ## fct                      @\\
+_ldso_stub__ ## fct:                             @\\
+        b _ldso_stub__ ## fct ## stub            @\\
+.symbol_stub _ldso_stub__ ## fct ## stub:        @\\
 .indirect_symbol _ ## fct                       @\\
-        lis     r11,ha16(ldso_stub__ ## fct ## $lazy_ptr)       @\\
-        lwz     r12,lo16(ldso_stub__ ## fct ## $lazy_ptr)(r11)  @\\
+        lis     r11,ha16(_ldso_stub__ ## fct ## $lazy_ptr)       @\\
+        lwz     r12,lo16(_ldso_stub__ ## fct ## $lazy_ptr)(r11)  @\\
         mtctr   r12                             @\\
-        addi    r11,r11,lo16(ldso_stub__ ## fct ## $lazy_ptr)   @\\
+        addi    r11,r11,lo16(_ldso_stub__ ## fct ## $lazy_ptr)   @\\
         bctr                                    @\\
 .lazy_symbol_pointer                            @\\
-ldso_stub__ ## fct ## $lazy_ptr:                @\\
+_ldso_stub__ ## fct ## $lazy_ptr:                @\\
         .indirect_symbol _ ## fct               @\\
         .long dyld_stub_binding_helper"
 
@@ -133,8 +133,8 @@ ldso_stub__ ## fct ## $lazy_ptr:                @\\
 #define LDSO_STUBIFY(fct)                       \\
 .text                           ;               \\
         .align 4 ;                              \\
-.globl _ldso_stub___ ## fct ;                    \\
-_ldso_stub___ ## fct: ;                          \\
+.globl _ldso_stub__ ## fct ;                    \\
+_ldso_stub__ ## fct: ;                          \\
         jmp L ## fct ## $stub ;                 \\
         .section __IMPORT,__jump_table,symbol_stubs,self_modifying_code+pure_instructions,5 ;   \\
 L ## fct ## $stub: ;                    \\
@@ -150,8 +150,8 @@ L ## fct ## $stub: ;                    \\
 #!+(and darwin x86-64) "
 #define LDSO_STUBIFY(fct)                       \\
         .align 4 ;                              \\
-.globl _ldso_stub___ ## fct ;                    \\
-_ldso_stub___ ## fct: ;                          \\
+.globl _ldso_stub__ ## fct ;                    \\
+_ldso_stub__ ## fct: ;                          \\
         jmp _ ## fct ;                          \\
 .L ## fct ## e1: ;                            "
 
@@ -191,7 +191,8 @@ ldso_stub__ ## fct: ;                  \\
         .size   ldso_stub__ ## fct,.-ldso_stub__ ## fct ;"))
 
 (defvar *stubs* (append
-                 '("accept"
+                 '("_exit"
+                   "accept"
                    "access"
                    "acos"
                    "acosh"
@@ -220,6 +221,7 @@ ldso_stub__ ## fct: ;                  \\
                    "fork"
                    "free"
                    "fstat"
+                   #!+inode64 "fstat$INODE64"
                    "fsync"
                    "ftruncate"
                    "getcwd"
@@ -250,6 +252,7 @@ ldso_stub__ ## fct: ;                  \\
                    "log1p"
                    "lseek"
                    "lstat"
+                   #!+inode64 "lstat$INODE64"
                    "malloc"
                    "memmove"
                    "mkdir"
@@ -258,6 +261,7 @@ ldso_stub__ ## fct: ;                  \\
                    "open"
                    "opendir"
                    "pipe"
+                   "poll"
                    "pow"
                    "read"
                    "readdir"
@@ -274,6 +278,7 @@ ldso_stub__ ## fct: ;                  \\
                    "sinh"
                    "socket"
                    "stat"
+                   #!+inode64 "stat$INODE64"
                    "strerror"
                    "strlen"
                    "symlink"
@@ -291,6 +296,7 @@ ldso_stub__ ## fct: ;                  \\
                    "unlink"
                    "utimes"
                    "wait3"
+                   "waitpid"
                    "write")
                  ;; These aren't needed on the X86 because they're microcoded into the
                  ;; FPU, so the Lisp VOPs can implement them directly without having to
@@ -321,13 +327,14 @@ ldso_stub__ ## fct: ;                  \\
                    "unlockpt")
                  #!+openbsd
                  '("openpty")
-                 #!-darwin
                  '("dlclose"
                    "dlerror"
                    "dlopen"
                    "dlsym")
                  #!+bsd
                  '("sysctl")
+                 #!+darwin
+                 '("sysctlbyname")
                  #!+os-provides-dladdr
                  '("dladdr")
                  #!-sunos ;; !defined(SVR4)

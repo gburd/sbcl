@@ -28,6 +28,10 @@
 #include "gencgc-alloc-region.h"
 #endif
 
+#ifdef LISP_FEATURE_SB_THREAD
+#include "pseudo-atomic.h"
+#endif
+
   /* The header files may not define PT_DAR/PT_DSISR.  This definition
      is correct for all versions of ppc linux >= 2.0.30
 
@@ -51,6 +55,9 @@
 #endif
 #endif
 
+/* Magic encoding for the instruction used for traps. */
+#define TRAP_INSTRUCTION(trap) ((3<<26) | (6 << 21) | (trap))
+
 void arch_init() {
 }
 
@@ -59,7 +66,7 @@ arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
 {
     os_vm_address_t addr;
 
-#if defined(LISP_FEATURE_NETBSD)
+#if defined(LISP_FEATURE_NETBSD) || defined(LISP_FEATURE_OPENBSD)
     addr = (os_vm_address_t) (code->si_addr);
 #else
     addr = (os_vm_address_t) (*os_context_register_addr(context,PT_DAR));
@@ -86,6 +93,13 @@ arch_internal_error_arguments(os_context_t *context)
 boolean
 arch_pseudo_atomic_atomic(os_context_t *context)
 {
+#ifdef LISP_FEATURE_SB_THREAD
+    struct thread *thread = arch_os_get_current_thread();
+
+    if (foreign_function_call_active_p(thread)) {
+        return get_pseudo_atomic_atomic(thread);
+    } else return
+#else
     /* FIXME: this foreign_function_call_active test is dubious at
      * best. If a foreign call is made in a pseudo atomic section
      * (?) or more likely a pseudo atomic section is in a foreign
@@ -96,20 +110,37 @@ arch_pseudo_atomic_atomic(os_context_t *context)
      * The foreign_function_call_active used to live at each call-site
      * to arch_pseudo_atomic_atomic, but this seems clearer.
      * --NS 2007-05-15 */
-    return (!foreign_function_call_active)
-        && ((*os_context_register_addr(context,reg_ALLOC)) & 4);
+    return (!foreign_function_call_active_p(arch_os_get_current_thread())) &&
+#endif
+        ((*os_context_register_addr(context,reg_ALLOC)) & flag_PseudoAtomic);
 }
 
 void
 arch_set_pseudo_atomic_interrupted(os_context_t *context)
 {
-    *os_context_register_addr(context,reg_ALLOC) |= 1;
+#ifdef LISP_FEATURE_SB_THREAD
+    struct thread *thread = arch_os_get_current_thread();
+
+    if (foreign_function_call_active_p(thread)) {
+        set_pseudo_atomic_interrupted(thread);
+    } else
+#endif
+        *os_context_register_addr(context,reg_ALLOC)
+            |= flag_PseudoAtomicInterrupted;
 }
 
 void
 arch_clear_pseudo_atomic_interrupted(os_context_t *context)
 {
-    *os_context_register_addr(context,reg_ALLOC) &= ~1;
+#ifdef LISP_FEATURE_SB_THREAD
+    struct thread *thread = arch_os_get_current_thread();
+
+    if (foreign_function_call_active_p(thread)) {
+        clear_pseudo_atomic_interrupted(thread);
+    } else
+#endif
+        *os_context_register_addr(context,reg_ALLOC)
+            &= ~flag_PseudoAtomicInterrupted;
 }
 
 unsigned int
@@ -117,7 +148,7 @@ arch_install_breakpoint(void *pc)
 {
     unsigned int *ptr = (unsigned int *)pc;
     unsigned int result = *ptr;
-    *ptr = (3<<26) | (5 << 21) | trap_Breakpoint;
+    *ptr = TRAP_INSTRUCTION(trap_Breakpoint);
     os_flush_icache((os_vm_address_t) pc, sizeof(unsigned int));
     return result;
 }
@@ -149,12 +180,33 @@ arch_remove_breakpoint(void *pc, unsigned int orig_inst)
 static unsigned int *skipped_break_addr, displaced_after_inst;
 static sigset_t orig_sigmask;
 
+static boolean
+should_branch(os_context_t *context, unsigned int orig_inst)
+{
+    /* orig_inst is a conditional branch instruction.  We need to
+     * know if the branch will be taken if executed in context. */
+    int ctr = *os_context_ctr_addr(context);
+    int cr = *os_context_cr_addr(context);
+    int bo_field = (orig_inst >> 21) & 0x1f;
+    int bi_field = (orig_inst >> 16) & 0x1f;
+    int ctr_ok;
+
+    if (!(bo_field & 4)) ctr--; /* Decrement CTR if necessary. */
+
+    ctr_ok = (bo_field & 4) || ((ctr == 0) == ((bo_field & 2) == 2));
+    return ctr_ok && ((bo_field & 0x10) ||
+                      !(((cr >> (31-bi_field)) ^ (bo_field >> 3)) & 1));
+}
+
 void
 arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
 {
     /* not sure how we ensure that we get the breakpoint reinstalled
      * after doing this -dan */
     unsigned int *pc = (unsigned int *)(*os_context_pc_addr(context));
+    unsigned int *next_pc;
+    int op = orig_inst >> 26;
+    int sub_op = (orig_inst & 0x7fe) >> 1;  /* XL-form sub-opcode */
 
     orig_sigmask = *os_context_sigmask_addr(context);
     sigaddset_blockable(os_context_sigmask_addr(context));
@@ -163,9 +215,53 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
     os_flush_icache((os_vm_address_t) pc, sizeof(unsigned int));
     skipped_break_addr = pc;
 
-    /* FIXME: we should apparently be installing the after-breakpoint
-     * here, but would need to find the next instruction address for
-     * it first. alpha-arch.c shows how to do it. --NS 2007-04-02 */
+    /* Figure out where we will end up after running the displaced
+     * instruction by defaulting to the next instruction in the stream
+     * and then checking for branch instructions.  FIXME: This will
+     * probably screw up if it attempts to step a trap instruction. */
+    next_pc = pc + 1;
+
+    if (op == 18) {
+        /* Branch  I-form */
+        unsigned int displacement = orig_inst & 0x03fffffc;
+        /* Sign extend */
+        if (displacement & 0x02000000) {
+            displacement |= 0xc0000000;
+        }
+        if (orig_inst & 2) { /* Absolute Address */
+            next_pc = (unsigned int *)displacement;
+        } else {
+            next_pc = (unsigned int *)(((unsigned int)pc) + displacement);
+        }
+    } else if ((op == 16)
+               && should_branch(context, orig_inst)) {
+        /* Branch Conditional  B-form */
+        unsigned int displacement = orig_inst & 0x0000fffc;
+        /* Sign extend */
+        if (displacement & 0x00008000) {
+            displacement |= 0xffff0000;
+        }
+        if (orig_inst & 2) { /* Absolute Address */
+            next_pc = (unsigned int *)displacement;
+        } else {
+            next_pc = (unsigned int *)(((unsigned int)pc) + displacement);
+        }
+    } else if ((op == 19) && (sub_op == 16)
+               && should_branch(context, orig_inst)) {
+        /* Branch Conditional to Link Register  XL-form */
+        next_pc = (unsigned int *)
+            ((*os_context_lr_addr(context)) & ~3);
+    } else if ((op == 19) && (sub_op == 528)
+               && should_branch(context, orig_inst)) {
+        /* Branch Conditional to Count Register  XL-form */
+        next_pc = (unsigned int *)
+            ((*os_context_ctr_addr(context)) & ~3);
+    }
+
+    /* Set the "after" breakpoint. */
+    displaced_after_inst = *next_pc;
+    *next_pc = TRAP_INSTRUCTION(trap_AfterBreakpoint);
+    os_flush_icache((os_vm_address_t)next_pc, sizeof(unsigned int));
 }
 
 #ifdef LISP_FEATURE_GENCGC
@@ -204,15 +300,15 @@ allocation_trap_p(os_context_t * context)
         && (4 == ((inst >> 1) & 0x3ff))) {
         /*
          * We got the instruction.  Now, look back to make sure it was
-         * proceeded by what we expected.  2 instructions back should be
-         * an ADD or ADDI instruction.
+         * proceeded by what we expected.  The previous instruction
+         * should be an ADD or ADDI instruction.
          */
         unsigned int add_inst;
 
-        add_inst = pc[-3];
+        add_inst = pc[-1];
 #if 0
         fprintf(stderr, "   add inst at %p:  inst = 0x%08x\n",
-                pc - 3, add_inst);
+                pc - 1, add_inst);
 #endif
         opcode = add_inst >> 26;
         if ((opcode == 31) && (266 == ((add_inst >> 1) & 0x1ff))) {
@@ -250,7 +346,7 @@ handle_allocation_trap(os_context_t * context)
 
     /* I don't think it's possible for us NOT to be in lisp when we get
      * here.  Remove this later? */
-    were_in_lisp = !foreign_function_call_active;
+    were_in_lisp = !foreign_function_call_active_p(arch_os_get_current_thread());
 
     if (were_in_lisp) {
         fake_foreign_function_call(context);
@@ -293,7 +389,7 @@ handle_allocation_trap(os_context_t * context)
      * is the size of the allocation.  Get it and call alloc to allocate
      * new space.
      */
-    inst = pc[-3];
+    inst = pc[-1];
     opcode = inst >> 26;
 #if 0
     fprintf(stderr, "  add inst  = 0x%08x, opcode = %d\n", inst, opcode);
@@ -382,15 +478,28 @@ handle_allocation_trap(os_context_t * context)
 #endif
 
     *os_context_register_addr(context, target) = (unsigned long) memory;
+#ifndef LISP_FEATURE_SB_THREAD
+    /* This is handled by the fake_foreign_function_call machinery on
+     * threaded targets. */
     *os_context_register_addr(context, reg_ALLOC) =
       (unsigned long) dynamic_space_free_pointer
       | (*os_context_register_addr(context, reg_ALLOC)
          & LOWTAG_MASK);
+#endif
 
     if (were_in_lisp) {
         undo_fake_foreign_function_call(context);
     }
 
+    /* Skip the allocation trap and the write of the updated free
+     * pointer back to the allocation region.  This is two
+     * instructions when threading is enabled and four instructions
+     * otherwise. */
+#ifdef LISP_FEATURE_SB_THREAD
+    (*os_context_pc_addr(context)) = pc + 2;
+#else
+    (*os_context_pc_addr(context)) = pc + 4;
+#endif
 
 }
 #endif
@@ -411,7 +520,9 @@ arch_handle_fun_end_breakpoint(os_context_t *context)
 void
 arch_handle_after_breakpoint(os_context_t *context)
 {
-    *skipped_break_addr = trap_Breakpoint;
+    *skipped_break_addr = TRAP_INSTRUCTION(trap_Breakpoint);
+    os_flush_icache((os_vm_address_t) skipped_break_addr,
+                    sizeof(unsigned int));
     skipped_break_addr = NULL;
     *(unsigned int *)*os_context_pc_addr(context)
         = displaced_after_inst;
@@ -448,7 +559,6 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     /* Is this an allocation trap? */
     if (allocation_trap_p(context)) {
         handle_allocation_trap(context);
-        arch_skip_instruction(context);
         return;
     }
 #endif
@@ -562,9 +672,6 @@ arch_write_linkage_table_jmp(void* reloc_addr, void *target_addr)
    */
 
   inst = (19 << 26) | (20 << 21) | (528 << 1);
-  *inst_ptr++ = inst;
-
-
   *inst_ptr++ = inst;
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - (char*) reloc_addr);

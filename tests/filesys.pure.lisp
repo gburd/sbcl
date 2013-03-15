@@ -32,8 +32,7 @@
   ;; We know a little bit about the structure of this result;
   ;; let's test to make sure that this test file is in it.
   (assert (find-if (lambda (pathname)
-                     (search #-win32 "tests/filesys.pure.lisp"
-                             #+win32 "tests\\filesys.pure.lisp"
+                     (search "tests/filesys.pure.lisp"
                              (namestring pathname)))
                    dir)))
 ;;; In sbcl-0.9.7 DIRECTORY failed on pathnames with character-set
@@ -93,6 +92,15 @@
   (assert (equal "C:\\FOO" (native-namestring "C:/FOO")))
   (assert (equal "C:\\FOO\\BAR" (native-namestring "C:\\FOO\\BAR")))
   (assert (equal "C:\\FOO\\BAR" (native-namestring "C:\\FOO\\BAR\\" :as-file t))))
+
+(with-test (:name (:parse-native-pathname :as-directory :junk-allowed))
+  (assert
+   (equal
+    (parse-native-namestring "foo.lisp" nil *default-pathname-defaults*
+                             :as-directory t)
+    (parse-native-namestring "foo.lisp" nil *default-pathname-defaults*
+                             :as-directory t
+                             :junk-allowed t))))
 
 ;;; Test for NATIVE-PATHNAME / NATIVE-NAMESTRING stuff
 ;;;

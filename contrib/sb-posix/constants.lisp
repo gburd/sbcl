@@ -43,46 +43,46 @@
  (:type dev-t "dev_t")
 
  ;; signals
- (:integer SIGHUP "SIGHUP" #+sb-doc "terminal line hangup." t)
- (:integer SIGINT "SIGINT" #+sb-doc "interrupt program." t)
- (:integer SIGQUIT "SIGQUIT" #+sb-doc "quit program." t)
- (:integer SIGILL "SIGILL" #+sb-doc "illegal instruction." t)
- (:integer SIGTRAP "SIGTRAP" #+sb-doc "trace trap." t)
- (:integer SIGABRT "SIGABRT" #+sb-doc "abort program (formerly SIGIOT)." t)
- (:integer SIGEMT "SIGEMT" #+sb-doc "emulate instruction executed." t)
- (:integer SIGFPE "SIGFPE" #+sb-doc "floating-point exception." t)
- (:integer SIGKILL "SIGKILL" #+sb-doc "kill program." t)
- (:integer SIGBUS "SIGBUS" #+sb-doc "bus error." t)
- (:integer SIGSEGV "SIGSEGV" #+sb-doc "segmentation violation." t)
- (:integer SIGSYS "SIGSYS" #+sb-doc "non-existent system call invoked." t)
- (:integer SIGPIPE "SIGPIPE" #+sb-doc "write on a pipe with no reader." t)
- (:integer SIGALRM "SIGALRM" #+sb-doc "real-time timer expired." t)
- (:integer SIGTERM "SIGTERM" #+sb-doc "software termination signal." t)
- (:integer SIGURG "SIGURG" #+sb-doc "urgent condition present on socket." t)
- (:integer SIGSTOP "SIGSTOP" #+sb-doc "stop (cannot be caught or ignored)." t)
- (:integer SIGTSTP "SIGTSTP" #+sb-doc "stop signal generated from keyboard." t)
- (:integer SIGCONT "SIGCONT" #+sb-doc "continue after stop." t)
- (:integer SIGCHLD "SIGCHLD" #+sb-doc "child status has changed." t)
+ (:integer SIGHUP "SIGHUP" "terminal line hangup." t)
+ (:integer SIGINT "SIGINT" "interrupt program." t)
+ (:integer SIGQUIT "SIGQUIT" "quit program." t)
+ (:integer SIGILL "SIGILL" "illegal instruction." t)
+ (:integer SIGTRAP "SIGTRAP" "trace trap." t)
+ (:integer SIGABRT "SIGABRT" "abort program (formerly SIGIOT)." t)
+ (:integer SIGEMT "SIGEMT" "emulate instruction executed." t)
+ (:integer SIGFPE "SIGFPE" "floating-point exception." t)
+ (:integer SIGKILL "SIGKILL" "kill program." t)
+ (:integer SIGBUS "SIGBUS" "bus error." t)
+ (:integer SIGSEGV "SIGSEGV" "segmentation violation." t)
+ (:integer SIGSYS "SIGSYS" "non-existent system call invoked." t)
+ (:integer SIGPIPE "SIGPIPE" "write on a pipe with no reader." t)
+ (:integer SIGALRM "SIGALRM" "real-time timer expired." t)
+ (:integer SIGTERM "SIGTERM" "software termination signal." t)
+ (:integer SIGURG "SIGURG" "urgent condition present on socket." t)
+ (:integer SIGSTOP "SIGSTOP" "stop (cannot be caught or ignored)." t)
+ (:integer SIGTSTP "SIGTSTP" "stop signal generated from keyboard." t)
+ (:integer SIGCONT "SIGCONT" "continue after stop." t)
+ (:integer SIGCHLD "SIGCHLD" "child status has changed." t)
  (:integer SIGTTIN "SIGTTIN"
-           #+sb-doc "background read attempted from control terminal." t)
+           "background read attempted from control terminal." t)
  (:integer SIGTTOU "SIGTTOU"
-           #+sb-doc "background write attempted to control terminal." t)
+           "background write attempted to control terminal." t)
  (:integer SIGIO "SIGIO"
-           #+sb-doc "I/O is possible on a descriptor (see fcntl(2))." t)
+           "I/O is possible on a descriptor (see fcntl(2))." t)
  (:integer SIGXCPU "SIGXCPU"
-           #+sb-doc "cpu time limit exceeded (see setrlimit(2))." t)
+           "cpu time limit exceeded (see setrlimit(2))." t)
  (:integer SIGXFSZ "SIGXFSZ"
-           #+sb-doc "file size limit exceeded (see setrlimit(2))." t)
+           "file size limit exceeded (see setrlimit(2))." t)
  (:integer SIGVTALRM "SIGVTALRM"
-           #+sb-doc "virtual time alarm (see setitimer(2))." t)
+           "virtual time alarm (see setitimer(2))." t)
  (:integer SIGPROF "SIGPROF"
-           #+sb-doc "profiling timer alarm (see setitimer(2))." t)
- (:integer SIGWINCH "SIGWINCH" #+sb-doc "Window size change." t)
- (:integer SIGPWR "SIGPWR" #+sb-doc "Power failure." t)
- (:integer SIGUSR1 "SIGUSR1" #+sb-doc "User defined signal 1." t)
- (:integer SIGUSR2 "SIGUSR2" #+sb-doc "User defined signal 2." t)
- (:integer SIGRTMIN "SIGRTMIN" #+sb-doc "Smallest real-time signal number." t)
- (:integer SIGRTMAX "SIGRTMAX" #+sb-doc "Largest real-time signal number." t)
+           "profiling timer alarm (see setitimer(2))." t)
+ (:integer SIGWINCH "SIGWINCH" "Window size change." t)
+ (:integer SIGPWR "SIGPWR" "Power failure." t)
+ (:integer SIGUSR1 "SIGUSR1" "User defined signal 1." t)
+ (:integer SIGUSR2 "SIGUSR2" "User defined signal 2." t)
+ (:integer SIGRTMIN "SIGRTMIN" "Smallest real-time signal number." t)
+ (:integer SIGRTMAX "SIGRTMAX" "Largest real-time signal number." t)
 
  ;; error numbers
  (:errno eperm "EPERM" nil t)
@@ -157,7 +157,7 @@
  (:errno ecomm "ECOMM" nil t)
  (:errno eproto "EPROTO" nil t)
  (:errno emultihop "EMULTIHOP" nil t)
- (:errno edotdot "EDOTDOT" nil t)
+#-sunos (:errno edotdot "EDOTDOT" nil t)
  (:errno ebadmsg "EBADMSG" nil t)
  (:errno eoverflow "EOVERFLOW" nil t)
  (:errno enotuniq "ENOTUNIQ" nil t)
@@ -201,17 +201,17 @@
  (:errno ealready "EALREADY" nil t)
  (:errno einprogress "EINPROGRESS" nil t)
  (:errno estale "ESTALE" nil t)
- (:errno euclean "EUCLEAN" nil t)
- (:errno enotnam "ENOTNAM" nil t)
- (:errno enavail "ENAVAIL" nil t)
- (:errno eremoteio "EREMOTEIO" nil t)
- (:errno edquot "EDQUOT" nil t)
- (:errno enomedium "ENOMEDIUM" nil t)
- (:errno emediumtype "EMEDIUMTYPE" nil t)
+#-sunos (:errno euclean "EUCLEAN" nil t)
+#-sunos (:errno enotnam "ENOTNAM" nil t)
+#-sunos (:errno enavail "ENAVAIL" nil t)
+#-sunos (:errno eremoteio "EREMOTEIO" nil t)
+#-sunos (:errno edquot "EDQUOT" nil t)
+#-sunos (:errno enomedium "ENOMEDIUM" nil t)
+#-sunos (:errno emediumtype "EMEDIUMTYPE" nil t)
 
  ;; wait
- (:integer wnohang "WNOHANG")
- (:integer wuntraced "WUNTRACED")
+ (:integer wnohang "WNOHANG" nil t)
+ (:integer wuntraced "WUNTRACED" nil t)
 
  ;; mode_t
  (:type mode-t "mode_t")
@@ -223,7 +223,7 @@
  (:integer s-ifreg "S_IFREG" nil t)
  (:integer s-iflnk "S_IFLNK" nil t)
  (:integer s-ifsock "S_IFSOCK" nil t)
- (:integer s-ifwht "S_IFWHT" nil t)
+#-sunos (:integer s-ifwht "S_IFWHT" nil t)
  (:integer s-isuid "S_ISUID" nil t)
  (:integer s-isgid "S_ISGID" nil t)
  (:integer s-isvtx "S_ISVTX" nil t)
@@ -248,30 +248,34 @@
 
  ;; mmap()
  (:type off-t "off_t")
- (:integer prot-none "PROT_NONE" #+sb-doc "mmap: no protection" t)
- (:integer prot-read "PROT_READ" #+sb-doc "mmap: read protection" t)
- (:integer prot-write "PROT_WRITE" #+sb-doc "mmap: write protection" t)
- (:integer prot-exec "PROT_EXEC" #+sb-doc "mmap: execute protection" t)
- (:integer map-shared "MAP_SHARED" #+sb-doc "mmap: shared memory" t)
- (:integer map-private "MAP_PRIVATE" #+sb-doc "mmap: private mapping" t)
- (:integer map-fixed "MAP_FIXED" #+sb-doc "mmap: map at given location" t)
+ (:integer prot-none "PROT_NONE" "mmap: no protection" t)
+ (:integer prot-read "PROT_READ" "mmap: read protection" t)
+ (:integer prot-write "PROT_WRITE" "mmap: write protection" t)
+ (:integer prot-exec "PROT_EXEC" "mmap: execute protection" t)
+ (:integer map-shared "MAP_SHARED" "mmap: shared memory" t)
+ (:integer map-private "MAP_PRIVATE" "mmap: private mapping" t)
+ (:integer map-fixed "MAP_FIXED" "mmap: map at given location" t)
+ (:integer map-anon "MAP_ANON" "mmap: anonymous mapping not associated with any file" t)
 
  ;; msync()
- (:integer ms-async "MS_ASYNC" #+sb-doc "msync: return immediately" t)
- (:integer ms-sync "MS_SYNC" #+sb-doc "msync: perform synchronous writes" t)
+ (:integer ms-async "MS_ASYNC" "msync: return immediately" t)
+ (:integer ms-sync "MS_SYNC" "msync: perform synchronous writes" t)
  (:integer ms-invalidate "MS_INVALIDATE"
-           #+sb-doc "msync: invalidate all cached data" t)
+           "msync: invalidate all cached data" t)
 
  ;; mlockall()
- (:integer mcl-current "MCL_CURRENT" #+sb-doc "mlockall: lock all pages which are currently mapped into the address space of the process." t)
- (:integer mcl-future "MCL_FUTURE" #+sb-doc "mlockall: lock all pages which will become mapped into the address space of the process in the future." t)
+ (:integer mcl-current "MCL_CURRENT" "mlockall: lock all pages which are currently mapped into the address space of the process." t)
+ (:integer mcl-future "MCL_FUTURE" "mlockall: lock all pages which will become mapped into the address space of the process in the future." t)
 
  ;; opendir()
  (:structure dirent
              (#+(and linux largefile) "struct dirent64"
               #-(and linux largefile) "struct dirent"
+              #-win32 (:ino-t ino "ino_t" "d_ino")
               (:c-string name "char *" "d_name"
-                         :distrust-length #+sunos t #-sunos nil)) t)
+                         ;; FIXME: sunos should really have :distrust-length
+                         ;; t, but this is currently broken. -- Jim Wise 2010-08-31
+                         :distrust-length nil)) t)
 
  ;; password database
  #-win32
@@ -314,6 +318,8 @@
               ((unsigned 32) dev "dev_t" "st_dev")
               (nlink-t nlink "nlink_t" "st_nlink")
               (uid-t uid "uid_t" "st_uid")
+              #-mips
+              (dev-t rdev "dev_t" "st_rdev")
               (gid-t gid "gid_t" "st_gid")
               (off-t size "off_t" "st_size")
               (time-t atime "time_t" "st_atime")
@@ -339,9 +345,9 @@
  (:integer o-ndelay "O_NDELAY" nil t)
  (:integer o-sync "O_SYNC" nil t)
  (:integer o-nofollow "O_NOFOLLOW" nil t)
- (:integer o-directory "O_DIRECTORY" nil t)
- (:integer o-direct "O_DIRECT" nil t)
- (:integer o-async "O_ASYNC" nil t)
+#-sunos (:integer o-directory "O_DIRECTORY" nil t)
+#-sunos (:integer o-direct "O_DIRECT" nil t)
+#-sunos (:integer o-async "O_ASYNC" nil t)
  (:integer o-largefile "O_LARGEFILE" nil t)     ; hmm...
  (:integer o-dsync "O_DSYNC" nil t)
  (:integer o-rsync "O_RSYNC" nil t)
@@ -426,6 +432,7 @@
  (:integer vstop "VSTOP" nil t)
  (:integer vsusp "VSUSP" nil t)
  (:integer vtime "VTIME" nil t)
+ (:integer vdisable "_POSIX_VDISABLE" nil t)
 
  (:integer brkint "BRKINT" nil t)
  (:integer icrnl "ICRNL" nil t)
@@ -445,7 +452,9 @@
  #+xsi
  (:integer onlcr "ONLCR" nil t)
  (:integer ocrnl "OCRNL" nil t)
+ (:integer onocr "ONOCR" nil t)
  (:integer onlret "ONLRET" nil t)
+ (:integer ofdel "OFDEL" nil t)
  (:integer ofill "OFILL" nil t)
  (:integer nldly "NLDLY" nil t)
  (:integer nl0 "NL0" nil t)
@@ -549,7 +558,7 @@
  ;; Additional, non-standard openlog() facilities (most of which
  ;; probably won't be needed by Lisp programs, but here for
  ;; completeness).
- #-win32
+ #-(or win32 sunos)
  (:integer
   log-authpriv "LOG_AUTHPRIV" "openlog() facility for authorization messages" t)
  #-win32
@@ -558,7 +567,7 @@
  #-win32
  (:integer
   log-daemon "LOG_DAEMON" "openlog() facility for arbitrary daemons" t)
- #-win32
+ #-(or win32 sunos)
  (:integer
   log-ftp "LOG_FTP" "openlog() facility for FTP daemons" t)
  #-win32
@@ -607,7 +616,7 @@
   "If supplied to openlog(), do not wait for child processes created by calls to syslog()."
   t)
  ;; Not in SUSv3, but at least Glibc and BSD libc have this
- #-win32
+ #-(or win32 sunos)
  (:integer
   log-perror "LOG_PERROR"
   "If supplied to openlog(), write log messages to the process's standard error descriptor in addition to the logging facility."

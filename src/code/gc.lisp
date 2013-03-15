@@ -13,22 +13,19 @@
 
 ;;;; DYNAMIC-USAGE and friends
 
-(eval-when (:compile-toplevel :execute)
-  (sb!xc:defmacro def-c-var-fun (lisp-fun c-var-name)
-    `(defun ,lisp-fun ()
-       (sb!alien:extern-alien ,c-var-name (sb!alien:unsigned 32)))))
-
 #!-sb-fluid
 (declaim (inline current-dynamic-space-start))
 #!+gencgc
 (defun current-dynamic-space-start () sb!vm:dynamic-space-start)
 #!-gencgc
-(def-c-var-fun current-dynamic-space-start "current_dynamic_space")
+(defun current-dynamic-space-start ()
+  (sb!alien:extern-alien "current_dynamic_space" sb!alien:unsigned-long))
 
 #!-sb-fluid
 (declaim (inline dynamic-usage))
 #!+gencgc
-(def-c-var-fun dynamic-usage "bytes_allocated")
+(defun dynamic-usage ()
+  (sb!alien:extern-alien "bytes_allocated" os-vm-size-t))
 #!-gencgc
 (defun dynamic-usage ()
   (the (unsigned-byte 32)
@@ -36,11 +33,11 @@
           (current-dynamic-space-start))))
 
 (defun static-space-usage ()
-  (- (* sb!vm:*static-space-free-pointer* sb!vm:n-word-bytes)
+  (- (ash sb!vm:*static-space-free-pointer* sb!vm:n-fixnum-tag-bits)
      sb!vm:static-space-start))
 
 (defun read-only-space-usage ()
-  (- (* sb!vm::*read-only-space-free-pointer* sb!vm:n-word-bytes)
+  (- (ash sb!vm::*read-only-space-free-pointer* sb!vm:n-fixnum-tag-bits)
      sb!vm:read-only-space-start))
 
 (defun control-stack-usage ()
@@ -156,6 +153,32 @@ run in any thread.")
   (defun gc-stop-the-world ())
   (defun gc-start-the-world ()))
 
+#!+gencgc
+(progn
+  (sb!alien:define-alien-variable ("gc_logfile" %gc-logfile) (* char))
+  (defun (setf gc-logfile) (pathname)
+    (let ((new (when pathname
+                 (sb!alien:make-alien-string
+                  (native-namestring (translate-logical-pathname pathname)
+                                     :as-file t))))
+          (old %gc-logfile))
+      (setf %gc-logfile new)
+      (when old
+        (sb!alien:free-alien old))
+      pathname))
+  (defun gc-logfile ()
+    #!+sb-doc
+    "Return the pathname used to log garbage collections. Can be SETF.
+Default is NIL, meaning collections are not logged. If non-null, the
+designated file is opened before and after each collection, and generation
+statistics are appended to it."
+    (let ((val (cast %gc-logfile c-string)))
+      (when val
+        (native-pathname val))))
+  (declaim (inline dynamic-space-size))
+  (defun dynamic-space-size ()
+    "Size of the dynamic space in bytes."
+    (sb!alien:extern-alien "dynamic_space_size" os-vm-size-t)))
 
 ;;;; SUB-GC
 
@@ -212,34 +235,42 @@ run in any thread.")
            ;; Now, if GET-MUTEX did not cons, that would be enough.
            ;; Because it does, we need the :IN-PROGRESS bit above to
            ;; tell the runtime not to trigger gcs.
-           (let ((sb!impl::*in-without-gcing* t)
-                 (sb!impl::*deadline* nil)
-                 (sb!impl::*deadline-seconds* nil))
-             (sb!thread:with-mutex (*already-in-gc*)
-               (let ((*gc-inhibit* t))
-                 (let ((old-usage (dynamic-usage))
-                       (new-usage 0))
-                   (unsafe-clear-roots)
-                   (gc-stop-the-world)
-                   (let ((start-time (get-internal-run-time)))
-                     (collect-garbage gen)
-                     (setf *gc-epoch* (cons nil nil))
-                     (incf *gc-run-time*
-                           (- (get-internal-run-time) start-time)))
-                   (setf *gc-pending* nil
-                         new-usage (dynamic-usage))
-                   #!+sb-thread
-                   (assert (not *stop-for-gc-pending*))
-                   (gc-start-the-world)
-                   ;; In a multithreaded environment the other threads
-                   ;; will see *n-b-f-o-p* change a little late, but
-                   ;; that's OK.
-                   (let ((freed (- old-usage new-usage)))
-                     ;; GENCGC occasionally reports negative here, but
-                     ;; the current belief is that it is part of the
-                     ;; normal order of things and not a bug.
-                     (when (plusp freed)
-                       (incf *n-bytes-freed-or-purified* freed)))))))
+           (sb!thread::without-thread-waiting-for (:already-without-interrupts t)
+             (let* ((sb!impl::*in-without-gcing* t)
+                    (sb!impl::*deadline* nil)
+                    (sb!impl::*deadline-seconds* nil))
+               (sb!thread:with-mutex (*already-in-gc*)
+                 (let ((*gc-inhibit* t))
+                   (let ((old-usage (dynamic-usage))
+                         (new-usage 0))
+                     (unsafe-clear-roots gen)
+                     (gc-stop-the-world)
+                     (let ((start-time (get-internal-run-time)))
+                       (collect-garbage gen)
+                       (setf *gc-epoch* (cons nil nil))
+                       (let ((run-time (- (get-internal-run-time) start-time)))
+                         ;; KLUDGE: Sometimes we see the second getrusage() call
+                         ;; return a smaller value than the first, which can
+                         ;; lead to *GC-RUN-TIME* to going negative, which in
+                         ;; turn is a type-error.
+                         (when (plusp run-time)
+                           (incf *gc-run-time* run-time))))
+                     #!+sb-safepoint
+                     (setf *stop-for-gc-pending* nil)
+                     (setf *gc-pending* nil
+                           new-usage (dynamic-usage))
+                     #!+sb-thread
+                     (assert (not *stop-for-gc-pending*))
+                     (gc-start-the-world)
+                     ;; In a multithreaded environment the other threads
+                     ;; will see *n-b-f-o-p* change a little late, but
+                     ;; that's OK.
+                     (let ((freed (- old-usage new-usage)))
+                       ;; GENCGC occasionally reports negative here, but
+                       ;; the current belief is that it is part of the
+                       ;; normal order of things and not a bug.
+                       (when (plusp freed)
+                         (incf *n-bytes-freed-or-purified* freed))))))))
            ;; While holding the mutex we were protected from
            ;; SIG_STOP_FOR_GC and recursive GCs. Now, in order to
            ;; preserve the invariant (*GC-PENDING* ->
@@ -270,24 +301,41 @@ run in any thread.")
   ;; finalizers and after-gc hooks.
   (when (sb!thread:thread-alive-p sb!thread:*current-thread*)
     (when *allow-with-interrupts*
-      (with-interrupts
-        (run-pending-finalizers)
-        (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))))
+      (sb!thread::without-thread-waiting-for ()
+        (with-interrupts
+          (run-pending-finalizers)
+          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))))))
 
 ;;; This is the user-advertised garbage collection function.
-(defun gc (&key (gen 0) (full nil) &allow-other-keys)
+(defun gc (&key (full nil) (gen 0) &allow-other-keys)
   #!+(and sb-doc gencgc)
-  "Initiate a garbage collection. GEN controls the number of generations
-  to garbage collect."
+  "Initiate a garbage collection.
+
+The default is to initiate a nursery collection, which may in turn
+trigger a collection of one or more older generations as well. If FULL
+is true, all generations are collected. If GEN is provided, it can be
+used to specify the oldest generation guaranteed to be collected.
+
+On CheneyGC platforms arguments FULL and GEN take no effect: a full
+collection is always preformed."
   #!+(and sb-doc (not gencgc))
-  "Initiate a garbage collection. GEN may be provided for compatibility with
-  generational garbage collectors, but is ignored in this implementation."
+  "Initiate a garbage collection.
+
+The collection is always a full collection.
+
+Arguments FULL and GEN can be used for compatibility with GENCGC
+platforms: there the default is to initiate a nursery collection,
+which may in turn trigger a collection of one or more older
+generations as well. If FULL is true, all generations are collected.
+If GEN is provided, it can be used to specify the oldest generation
+guaranteed to be collected."
   (when (sub-gc :gen (if full 6 gen))
     (post-gc)))
 
 (define-alien-routine scrub-control-stack sb!alien:void)
 
-(defun unsafe-clear-roots ()
+(defun unsafe-clear-roots (gen)
+  #!-gencgc (declare (ignore gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
   ;; as having these cons more then we have space left leads to huge
   ;; badness.
@@ -295,24 +343,32 @@ run in any thread.")
   ;; Power cache of the bignum printer: drops overly large bignums and
   ;; removes duplicate entries.
   (scrub-power-cache)
-  ;; FIXME: CTYPE-OF-CACHE-CLEAR isn't thread-safe.
-  #!-sb-thread
-  (ctype-of-cache-clear))
-
+  ;; Clear caches depending on the generation being collected.
+  #!+gencgc
+  (cond ((eql 0 gen))
+        ((eql 1 gen)
+         (ctype-of-cache-clear))
+        (t
+         (drop-all-hash-caches)))
+  #!-gencgc
+  (drop-all-hash-caches))
 
 ;;;; auxiliary functions
 
 (defun bytes-consed-between-gcs ()
   #!+sb-doc
   "The amount of memory that will be allocated before the next garbage
-collection is initiated. This can be set with SETF."
-  (sb!alien:extern-alien "bytes_consed_between_gcs"
-                         (sb!alien:unsigned 32)))
+collection is initiated. This can be set with SETF.
+
+On GENCGC platforms this is the nursery size, and defaults to 5% of dynamic
+space size.
+
+Note: currently changes to this value are lost when saving core."
+  (sb!alien:extern-alien "bytes_consed_between_gcs" os-vm-size-t))
 
 (defun (setf bytes-consed-between-gcs) (val)
   (declare (type index val))
-  (setf (sb!alien:extern-alien "bytes_consed_between_gcs"
-                               (sb!alien:unsigned 32))
+  (setf (sb!alien:extern-alien "bytes_consed_between_gcs" os-vm-size-t)
         val))
 
 (declaim (inline maybe-handle-pending-gc))
@@ -340,12 +396,12 @@ collection is initiated. This can be set with SETF."
             (alloc-unboxed-start-page page-index-t)
             (alloc-large-start-page page-index-t)
             (alloc-large-unboxed-start-page page-index-t)
-            (bytes-allocated unsigned-long)
-            (gc-trigger unsigned-long)
-            (bytes-consed-between-gcs unsigned-long)
+            (bytes-allocated os-vm-size-t)
+            (gc-trigger os-vm-size-t)
+            (bytes-consed-between-gcs os-vm-size-t)
             (number-of-gcs int)
             (number-of-gcs-before-promotion int)
-            (cum-sum-bytes-allocated unsigned-long)
+            (cum-sum-bytes-allocated os-vm-size-t)
             (minimum-age-before-gc double)))
 
 #!+gencgc
@@ -358,29 +414,32 @@ collection is initiated. This can be set with SETF."
                 (defun ,(symbolicate "GENERATION-" slot) (generation)
                   #!+sb-doc
                   ,doc
+                  #!+gencgc
                   (declare (generation-index generation))
                   #!-gencgc
                   (declare (ignore generation))
                   #!-gencgc
                   (error "~S is a GENCGC only function and unavailable in this build"
-                         ',name)
+                         ',slot)
                   #!+gencgc
                   (slot (deref generations generation) ',slot))
                 ,@(when setfp
                         `((defun (setf ,(symbolicate "GENERATION-" slot)) (value generation)
+                            #!+gencgc
                             (declare (generation-index generation))
                             #!-gencgc
                             (declare (ignore value generation))
                             #!-gencgc
                             (error "(SETF ~S) is a GENCGC only function and unavailable in this build"
-                                   ',name)
+                                   ',slot)
                             #!+gencgc
                             (setf (slot (deref generations generation) ',slot) value)))))))
   (def bytes-consed-between-gcs
       "Number of bytes that can be allocated to GENERATION before that
 generation is considered for garbage collection. This value is meaningless for
 generation 0 (the nursery): see BYTES-CONSED-BETWEEN-GCS instead. Default is
-20Mb. Can be assigned to using SETF. Available on GENCGC platforms only.
+5% of the dynamic space size divided by the number of non-nursery generations.
+Can be assigned to using SETF. Available on GENCGC platforms only.
 
 Experimental: interface subject to change."
     t)
@@ -394,8 +453,8 @@ Experimental: interface subject to change."
     t)
   (def number-of-gcs-before-promotion
       "Number of times garbage collection is done on GENERATION before
-automatic promotion to the next generation is triggered. Can be assigned to
-using SETF. Available on GENCGC platforms only.
+automatic promotion to the next generation is triggered. Default is 1. Can be
+assigned to using SETF. Available on GENCGC platforms only.
 
 Experimental: interface subject to change."
     t)
@@ -415,6 +474,7 @@ objects allocated to the generation have seen younger objects promoted to it.
 Available on GENCGC platforms only.
 
 Experimental: interface subject to change."
+    #!+gencgc
     (declare (generation-index generation))
     #!-gencgc (declare (ignore generation))
     #!-gencgc

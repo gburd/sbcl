@@ -6,9 +6,7 @@ test::
 	true
 
 up:
-	test -d asdf-upstream || git clone http://common-lisp.net/project/asdf/asdf.git asdf-upstream
-	cd asdf-upstream && git pull
+	sh pull-asdf.sh
 	cp asdf-upstream/asdf.lisp asdf.lisp
-	cp asdf-upstream/asdf.texinfo asdf.texinfo
+	cp asdf-upstream/doc/asdf.texinfo asdf.texinfo
 	cp asdf-upstream/README README
-	cp asdf-upstream/LICENSE LICENSE 

@@ -59,7 +59,7 @@ run_sbcl <<EOF
   (assert (equal (truename "link-4")     #p"$testdir/link-4"))
   (assert (equal (truename "link-5")     #p"$testdir/link-5"))
   (assert (equal (truename "link-6")     #p"$testdir/link-6"))
-  (sb-ext:quit :unix-status $EXIT_LISP_WIN)
+  (sb-ext:exit :code $EXIT_LISP_WIN)
 EOF
 check_status_maybe_lose "DIRECTORY/TRUENAME part 1" $?
 
@@ -78,7 +78,7 @@ run_sbcl <<EOF
   (assert (equal (truename "$testdir/link-4")     #p"$testdir/link-4"))
   (assert (equal (truename "$testdir/link-5")     #p"$testdir/link-5"))
   (assert (equal (truename "$testdir/link-6")     #p"$testdir/link-6"))
-  (sb-ext:quit :unix-status $EXIT_LISP_WIN)
+  (sb-ext:exit :code $EXIT_LISP_WIN)
 EOF
 check_status_maybe_lose "DIRECTORY/TRUENAME part 2" $?
 cleanup_test_subdirectory
@@ -194,7 +194,7 @@ Lisp filename syntax idiosyncrasies)."
   #+nil
   (need-match "animal/vertebrate/mammal/robot/../**/../**/*.*" nil))
 (need-matches)
-(sb-ext:quit :unix-status $EXIT_LISP_WIN)
+(sb-ext:exit :code $EXIT_LISP_WIN)
 EOF
 check_status_maybe_lose "DIRECTORY/TRUENAME part 3" $?
 cleanup_test_subdirectory
@@ -206,6 +206,7 @@ mkdir foo
 touch foo/aa.txt
 touch foo/aa.tmp
 mkdir foo/x
+
 mkdir far
 touch far/ab.txt
 touch far/ab.tmp
@@ -213,18 +214,29 @@ mkdir far/x
 mkdir far/y
 mkdir far/y/x
 mkdir far/x/x
+
 mkdir qar
 touch qar/ac.txt
 touch qar/ac.tmp
+
 mkdir foo.moose
 touch foo.bar
+
+mkdir -p a/z c
+touch a/z/foo.bar
+touch a/z/foo.dummy
+ln -s ../a/z c/z
+
 run_sbcl <<EOF
+(setf (logical-pathname-translations "foo")
+      (list (list "**;*.txt.*" (merge-pathnames "foo/**/*.txt"))
+            (list "**;*.*.*" (merge-pathnames "**/*.*"))))
+
 (defun test (pattern &rest expected)
   (let ((wanted (sort (mapcar #'truename expected) #'string< :key #'namestring))
         (got (sort (directory pattern) #'string< :key #'namestring)))
     (unless (equal wanted got)
-      (format t "wanted:~%  ~Sgot:~%  ~S" wanted got)
-      (error "wanted:~%  ~Sgot:~%  ~S" wanted got))))                 
+      (error "wanted:~%  ~S~%got:~%  ~S" wanted got))))
 (test "*/a*.txt" "foo/aa.txt" "far/ab.txt" "qar/ac.txt")
 (test "fo*/a*.t*" "foo/aa.txt" "foo/aa.tmp")
 (test "*/*b.*" "far/ab.txt" "far/ab.tmp")
@@ -240,22 +252,120 @@ run_sbcl <<EOF
 (test "*/x" "foo/x/" "far/x/")
 (test "far/*/x" "far/y/x/" "far/x/x/")
 (test "**/x/" "foo/x/" "far/x/" "far/x/x" "far/y/x/")
-(quit :unix-status $EXIT_LISP_WIN)
+(test "foo:*.txt" "foo/aa.txt")
+(test "foo:far;*.txt" "far/ab.txt")
+(test "foo:foo;*.txt" "foo/aa.txt")
+(test "foo:**;*.tmp" "foo/aa.tmp" "far/ab.tmp" "qar/ac.tmp")
+(test "foo:foo;*.tmp" "foo/aa.tmp")
+(test "c/*/*.bar" "a/z/foo.bar")
+(exit :code $EXIT_LISP_WIN)
 EOF
 check_status_maybe_lose "DIRECTORY/PATTERNS" $?
 
 # Test whether ENSURE-DIRECTORIES-EXIST can create a directory whose
 # name contains a wildcard character (it used to get itself confused
 # internally).
-run_sbcl --eval '(ensure-directories-exist "foo\\*bar/baz.txt")' --eval '(sb-ext:quit)'
+run_sbcl --eval '(ensure-directories-exist "foo\\*bar/baz.txt")' --eval '(sb-ext:exit)'
 test -d foo*bar
 check_status_maybe_lose "ENSURE-DIRECTORIES-EXIST part 1" $? \
     0 "(directory exists)"
 
-run_sbcl --eval '(ensure-directories-exist "foo\\?bar/baz.txt")' --eval '(sb-ext:quit)'
+run_sbcl --eval '(ensure-directories-exist "foo\\?bar/baz.txt")' --eval '(sb-ext:exit)'
 test -d foo?bar
 check_status_maybe_lose "ENSURE-DIRECTORIES-EXIST part 2" $? \
     0 "(directory exists)"
+
+# DELETE-FILE
+use_test_subdirectory
+mkdir    sub
+touch    deltest
+touch    sub/deltest
+run_sbcl --eval '(let ((*default-pathname-defaults* (truename "sub")))
+                   (delete-file "deltest")
+                   (sb-ext:exit))'
+test -f deltest && test ! -f sub/deltest
+check_status_maybe_lose "delete-file via d-p-d" $? \
+  0 "ok"
+
+# RENAME-FILE
+use_test_subdirectory
+touch one
+mkdir sub
+touch sub/one
+touch foo
+ln -s foo link
+run_sbcl --eval '(let ((*default-pathname-defaults* (truename "sub")))
+                   (rename-file "one" "two"))' \
+         --eval '(rename-file "one" "three")' \
+         --eval '(rename-file "link" "bar")'
+test -f three
+check_status_maybe_lose "rename-file" $? \
+    0 "ok"
+test -f sub/two
+check_status_maybe_lose "rename-file via d-p-d" $? \
+    0 "ok"
+test -f foo && test -L bar
+check_status_maybe_lose "rename-file + symlink" $? \
+    0 "ok"
+
+# DELETE-DIRECTORY
+use_test_subdirectory
+mkdir    dont_delete_me
+touch    me_neither
+mkdir    simple_test_subdir1
+mkdir    simple_test_subdir2
+mkdir -p deep/1/2/
+touch    deep/a
+touch    deep/b
+touch    deep/1/c
+touch    deep/1/d
+touch    deep/1/2/e
+touch    deep/1/2/f
+ln -s    `pwd`/dont_delete_me deep/linky
+ln -s    `pwd`/me_neither deep/1/another_linky
+mkdir -p one/one
+touch    one/one/two
+touch    one/two
+ln -s dont_delete_me will_fail
+
+run_sbcl --eval '(sb-ext:delete-directory "simple_test_subdir1")' \
+         --eval '(sb-ext:delete-directory "simple_test_subdir2/")' \
+         --eval '(sb-ext:delete-directory "deep" :recursive t)' \
+         --eval '(let ((*default-pathname-defaults* (truename "one")))
+                   (delete-directory "one" :recursive t))' \
+         --eval '(handler-case (delete-directory "will_fail")
+                   (file-error ())
+                   (:no-error (x) (sb-ext:exit :code 1)))' \
+         --eval '(sb-ext:exit)'
+check_status_maybe_lose "delete-directory symlink" $? \
+  0 "ok"
+test -L will_fail && test -d dont_delete_me
+check_status_maybe_lose "delete-directory symlink 2" $? \
+  0 "ok"
+
+test -d simple_test_subdir1
+check_status_maybe_lose "delete-directory 1" $? \
+  1 "deleted"
+
+test -d simple_test_subdir2
+check_status_maybe_lose "delete-directory 2" $? \
+  1 "deleted"
+
+test -d deep
+check_status_maybe_lose "delete-directory 3" $? \
+  1 "deleted"
+
+test -d dont_delete_me
+check_status_maybe_lose "delete-directory 4" $? \
+  0 "didn't follow link"
+
+test -f me_neither
+check_status_maybe_lose "delete-directory 5" $? \
+  0 "didn't follow link"
+
+test -f one/two && test -d one && test ! -d one/one
+check_status_maybe_lose "delete-directory via d-p-d" $? \
+  0 "ok"
 
 # success convention for script
 exit $EXIT_TEST_WIN

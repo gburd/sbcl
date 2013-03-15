@@ -29,22 +29,16 @@
   (apply #'make-instance (find-class class) initargs))
 
 (defmethod make-instance ((class class) &rest initargs)
+  (let ((instance-or-nil (maybe-call-ctor class initargs)))
+    (when instance-or-nil
+      (return-from make-instance instance-or-nil)))
   (unless (class-finalized-p class) (finalize-inheritance class))
   (let ((class-default-initargs (class-default-initargs class)))
     (when class-default-initargs
       (setf initargs (default-initargs initargs class-default-initargs)))
     (when initargs
-      (when (and (eq **boot-state** 'complete)
-                 (not (getf initargs :allow-other-keys)))
-        (let ((class-proto (class-prototype class)))
-          (check-initargs-1
-           class initargs
-           (append (compute-applicable-methods
-                    #'allocate-instance (list class))
-                   (compute-applicable-methods
-                    #'initialize-instance (list class-proto))
-                   (compute-applicable-methods
-                    #'shared-initialize (list class-proto t)))))))
+      (when (eq **boot-state** 'complete)
+        (check-mi-initargs class initargs)))
     (let ((instance (apply #'allocate-instance class initargs)))
       (apply #'initialize-instance instance initargs)
       instance)))
@@ -65,6 +59,55 @@
   (check-ri-initargs instance initargs)
   (apply #'shared-initialize instance nil initargs)
   instance)
+
+(defglobal **typecheck-cache** (make-hash-table :test #'equal :synchronized t))
+(defvar *typecheck-stack* nil)
+
+(defun generate-slotd-typecheck (slotd info)
+  (let* ((type (slot-definition-type slotd))
+         (class (slot-definition-class slotd))
+         (cookie (cons class (slot-definition-name slotd))))
+    (declare (dynamic-extent cookie))
+    (when (and (neq t type) (safe-p class))
+      (or
+       ;; Have one already!
+       (awhen (gethash type **typecheck-cache**)
+         (setf (slot-info-typecheck info) it))
+       ;; It is possible for compilation of a typecheck to trigger class
+       ;; finalization, which in turn may trigger compilation of a
+       ;; slot-typechecking function -- detects and break those cycles.
+       ;;
+       ;; We use the slow function here, but the outer call will replace it
+       ;; with the fast one.
+       (when (member cookie *typecheck-stack* :test #'equal)
+         (setf (slot-info-typecheck info)
+               (named-lambda slow-slot-typecheck (value)
+                       (if (typep value type)
+                           value
+                           (error 'type-error
+                                  :datum value
+                                  :expected-type type)))))
+       ;; The normal, good case: compile an efficient typecheck function.
+       (let ((*typecheck-stack* (cons cookie *typecheck-stack*)))
+         (handler-bind (((or style-warning compiler-note) #'muffle-warning))
+           (let ((fun (compile
+                       nil
+                       `(named-lambda (slot-typecheck ,type) (value)
+                          (declare (optimize (sb-c:store-coverage-data 0)
+                                             (sb-c::type-check 3)
+                                             (sb-c::verify-arg-count 0)))
+                          (the ,type value)))))
+             (setf (gethash type **typecheck-cache**) fun
+                   (slot-info-typecheck info) fun))))))))
+
+(defmethod initialize-instance :after ((slotd effective-slot-definition) &key)
+  (let ((info (make-slot-info :slotd slotd)))
+    (generate-slotd-typecheck slotd info)
+    (setf (slot-definition-info slotd) info)))
+
+;;; FIXME: Do we need (SETF SLOT-DEFINITION-TYPE) at all?
+(defmethod (setf slot-definition-type) :after (new-type (slotd effective-slot-definition))
+  (generate-slotd-typecheck slotd (slot-definition-info slotd)))
 
 (defmethod update-instance-for-different-class
     ((previous standard-object) (current standard-object) &rest initargs)

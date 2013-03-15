@@ -38,7 +38,7 @@
   (let (temp)
     (cond ((symbolp form)
            (multiple-value-bind (expansion expanded)
-               (sb!xc:macroexpand-1 form environment)
+               (%macroexpand-1 form environment)
              (if expanded
                  (sb!xc:get-setf-expansion expansion environment)
                  (let ((new-var (sb!xc:gensym "NEW")))
@@ -70,32 +70,13 @@
           (t
            (expand-or-get-setf-inverse form environment)))))
 
-;;; GET-SETF-METHOD existed in pre-ANSI Common Lisp, and various code inherited
-;;; from CMU CL uses it repeatedly, so rather than rewrite a lot of code to not
-;;; use it, we just define it in terms of ANSI's GET-SETF-EXPANSION (or
-;;; actually, the cross-compiler version of that, i.e.
-;;; SB!XC:GET-SETF-EXPANSION).
-(declaim (ftype (function (t &optional (or null sb!c::lexenv))) get-setf-method))
-(defun get-setf-method (form &optional environment)
-  #!+sb-doc
-  "This is a specialized-for-one-value version of GET-SETF-EXPANSION (and
-a relic from pre-ANSI Common Lisp). Portable ANSI code should use
-GET-SETF-EXPANSION directly."
-  (multiple-value-bind (temps value-forms store-vars store-form access-form)
-      (sb!xc:get-setf-expansion form environment)
-    (when (cdr store-vars)
-      (error "GET-SETF-METHOD used for a form with multiple store ~
-              variables:~%  ~S"
-             form))
-    (values temps value-forms store-vars store-form access-form)))
-
 ;;; If a macro, expand one level and try again. If not, go for the
 ;;; SETF function.
 (declaim (ftype (function (t (or null sb!c::lexenv)))
                 expand-or-get-setf-inverse))
 (defun expand-or-get-setf-inverse (form environment)
   (multiple-value-bind (expansion expanded)
-      (sb!xc:macroexpand-1 form environment)
+      (%macroexpand-1 form environment)
     (if expanded
         (sb!xc:get-setf-expansion expansion environment)
         (get-setf-method-inverse form
@@ -112,7 +93,7 @@ GET-SETF-EXPANSION directly."
       (cond ((sb!xc:constantp x environment)
              (push x args))
             (t
-             (let ((temp (gensym "TMP")))
+             (let ((temp (gensymify x)))
                (push temp args)
                (push temp vars)
                (push x vals)))))
@@ -212,11 +193,12 @@ GET-SETF-EXPANSION directly."
   "Takes an object and a location holding a list. Conses the object onto
   the list, returning the modified list. OBJ is evaluated before PLACE."
   (multiple-value-bind (dummies vals newval setter getter)
-      (get-setf-method place env)
+      (sb!xc:get-setf-expansion place env)
     (let ((g (gensym)))
       `(let* ((,g ,obj)
               ,@(mapcar #'list dummies vals)
-              (,(car newval) (cons ,g ,getter)))
+              (,(car newval) (cons ,g ,getter))
+              ,@(cdr newval))
          ,setter))))
 
 (defmacro-mundanely pushnew (obj place &rest keys
@@ -228,11 +210,12 @@ GET-SETF-EXPANSION directly."
   is used for the comparison."
   (declare (ignore key test test-not))
   (multiple-value-bind (dummies vals newval setter getter)
-      (get-setf-method place env)
+      (sb!xc:get-setf-expansion place env)
     (let ((g (gensym)))
       `(let* ((,g ,obj)
               ,@(mapcar #'list dummies vals)
-              (,(car newval) (adjoin ,g ,getter ,@keys)))
+              (,(car newval) (adjoin ,g ,getter ,@keys))
+              ,@(cdr newval))
          ,setter))))
 
 (defmacro-mundanely pop (place &environment env)
@@ -240,17 +223,14 @@ GET-SETF-EXPANSION directly."
   "The argument is a location holding a list. Pops one item off the front
   of the list and returns it."
   (multiple-value-bind (dummies vals newval setter getter)
-      (get-setf-method place env)
-    (do* ((d dummies (cdr d))
-          (v vals (cdr v))
-          (let-list nil))
-         ((null d)
-          (push (list (car newval) getter) let-list)
-          `(let* ,(nreverse let-list)
-             (prog1 (car ,(car newval))
-               (setq ,(car newval) (cdr ,(car newval)))
-               ,setter)))
-      (push (list (car d) (car v)) let-list))))
+      (sb!xc:get-setf-expansion place env)
+    (let ((list-head (gensym)))
+      `(let* (,@(mapcar #'list dummies vals)
+              (,list-head ,getter)
+              (,(car newval) (cdr ,list-head))
+              ,@(cdr newval))
+         ,setter
+         (car ,list-head)))))
 
 (defmacro-mundanely remf (place indicator &environment env)
   #!+sb-doc
@@ -259,31 +239,27 @@ GET-SETF-EXPANSION directly."
   remove the property specified by the indicator. Returns T if such a
   property was present, NIL if not."
   (multiple-value-bind (dummies vals newval setter getter)
-      (get-setf-method place env)
-    (do* ((d dummies (cdr d))
-          (v vals (cdr v))
-          (let-list nil)
-          (ind-temp (gensym))
+      (sb!xc:get-setf-expansion place env)
+    (let ((ind-temp (gensym))
           (local1 (gensym))
           (local2 (gensym)))
-         ((null d)
-          ;; See ANSI 5.1.3 for why we do out-of-order evaluation
-          (push (list ind-temp indicator) let-list)
-          (push (list (car newval) getter) let-list)
-          `(let* ,(nreverse let-list)
-             (do ((,local1 ,(car newval) (cddr ,local1))
-                  (,local2 nil ,local1))
-                 ((atom ,local1) nil)
-               (cond ((atom (cdr ,local1))
-                      (error "Odd-length property list in REMF."))
-                     ((eq (car ,local1) ,ind-temp)
-                      (cond (,local2
-                             (rplacd (cdr ,local2) (cddr ,local1))
-                             (return t))
-                            (t (setq ,(car newval) (cddr ,(car newval)))
-                               ,setter
-                               (return t))))))))
-      (push (list (car d) (car v)) let-list))))
+      `(let* (,@(mapcar #'list dummies vals)
+              ;; See ANSI 5.1.3 for why we do out-of-order evaluation
+              (,ind-temp ,indicator)
+              (,(car newval) ,getter)
+              ,@(cdr newval))
+         (do ((,local1 ,(car newval) (cddr ,local1))
+              (,local2 nil ,local1))
+             ((atom ,local1) nil)
+             (cond ((atom (cdr ,local1))
+                    (error "Odd-length property list in REMF."))
+                   ((eq (car ,local1) ,ind-temp)
+                    (cond (,local2
+                           (rplacd (cdr ,local2) (cddr ,local1))
+                           (return t))
+                          (t (setq ,(car newval) (cddr ,(car newval)))
+                             ,setter
+                             (return t))))))))))
 
 ;;; we can't use DEFINE-MODIFY-MACRO because of ANSI 5.1.3
 (defmacro-mundanely incf (place &optional (delta 1) &environment env)
@@ -291,11 +267,12 @@ GET-SETF-EXPANSION directly."
   "The first argument is some location holding a number. This number is
   incremented by the second argument, DELTA, which defaults to 1."
   (multiple-value-bind (dummies vals newval setter getter)
-      (get-setf-method place env)
+      (sb!xc:get-setf-expansion place env)
     (let ((d (gensym)))
       `(let* (,@(mapcar #'list dummies vals)
               (,d ,delta)
-              (,(car newval) (+ ,getter ,d)))
+              (,(car newval) (+ ,getter ,d))
+              ,@(cdr newval))
          ,setter))))
 
 (defmacro-mundanely decf (place &optional (delta 1) &environment env)
@@ -303,11 +280,12 @@ GET-SETF-EXPANSION directly."
   "The first argument is some location holding a number. This number is
   decremented by the second argument, DELTA, which defaults to 1."
   (multiple-value-bind (dummies vals newval setter getter)
-      (get-setf-method place env)
+      (sb!xc:get-setf-expansion place env)
     (let ((d (gensym)))
       `(let* (,@(mapcar #'list dummies vals)
               (,d ,delta)
-              (,(car newval) (- ,getter ,d)))
+              (,(car newval) (- ,getter ,d))
+              ,@(cdr newval))
          ,setter))))
 
 ;;;; DEFINE-MODIFY-MACRO stuff
@@ -346,24 +324,22 @@ GET-SETF-EXPANSION directly."
          ,name (,reference ,@lambda-list &environment ,env)
        ,doc-string
        (multiple-value-bind (dummies vals newval setter getter)
-           (get-setf-method ,reference ,env)
-         (do ((d dummies (cdr d))
-              (v vals (cdr v))
-              (let-list nil (cons (list (car d) (car v)) let-list)))
-             ((null d)
-              (push (list (car newval)
-                          ,(if rest-arg
-                             `(list* ',function getter ,@other-args ,rest-arg)
-                             `(list ',function getter ,@other-args)))
-                    let-list)
-              `(let* ,(nreverse let-list)
-                 ,setter)))))))
+           (sb!xc:get-setf-expansion ,reference ,env)
+         (let ()
+             `(let* (,@(mapcar #'list dummies vals)
+                     (,(car newval)
+                      ,,(if rest-arg
+                          `(list* ',function getter ,@other-args ,rest-arg)
+                          `(list ',function getter ,@other-args)))
+                     ,@(cdr newval))
+                ,setter))))))
 
 ;;;; DEFSETF
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   ;;; Assign SETF macro information for NAME, making all appropriate checks.
-  (defun assign-setf-macro (name expander inverse doc)
+  (defun assign-setf-macro (name expander expander-lambda-list inverse doc)
+    #+sb-xc-host (declare (ignore expander-lambda-list))
     (with-single-package-locked-error
         (:symbol name "defining a setf-expander for ~A"))
     (cond ((gethash name sb!c:*setf-assumed-fboundp*)
@@ -379,6 +355,9 @@ GET-SETF-EXPANSION directly."
            (style-warn "defining setf macro for ~S when ~S is fbound"
                        name `(setf ,name))))
     (remhash name sb!c:*setf-assumed-fboundp*)
+    #-sb-xc-host
+    (when expander
+      (setf (%fun-lambda-list expander) expander-lambda-list))
     ;; FIXME: It's probably possible to join these checks into one form which
     ;; is appropriate both on the cross-compilation host and on the target.
     (when (or inverse (info :setf :inverse name))
@@ -393,9 +372,10 @@ GET-SETF-EXPANSION directly."
   #!+sb-doc
   "Associates a SETF update function or macro with the specified access
   function or macro. The format is complex. See the manual for details."
-  (cond ((not (listp (car rest)))
+  (cond ((and (not (listp (car rest))) (symbolp (car rest)))
          `(eval-when (:load-toplevel :compile-toplevel :execute)
             (assign-setf-macro ',access-fn
+                               nil
                                nil
                                ',(car rest)
                                 ,(when (and (car rest) (stringp (cadr rest)))
@@ -418,6 +398,7 @@ GET-SETF-EXPANSION directly."
                      (%defsetf ,access-form ,(length store-variables)
                                (lambda (,whole)
                                  ,body)))
+                   ',lambda-list
                    nil
                    ',doc))))))
         (t
@@ -468,6 +449,7 @@ GET-SETF-EXPANSION directly."
                             (lambda (,whole ,environment)
                               ,@local-decs
                               ,body)
+                            ',lambda-list
                             nil
                             ',doc)))))
 
@@ -476,14 +458,16 @@ GET-SETF-EXPANSION directly."
                                   &environment env)
   (declare (type sb!c::lexenv env))
   (multiple-value-bind (temps values stores set get)
-      (get-setf-method place env)
+      (sb!xc:get-setf-expansion place env)
     (let ((newval (gensym))
           (ptemp (gensym))
           (def-temp (if default (gensym))))
       (values `(,@temps ,ptemp ,@(if default `(,def-temp)))
               `(,@values ,prop ,@(if default `(,default)))
               `(,newval)
-              `(let ((,(car stores) (%putf ,get ,ptemp ,newval)))
+              `(let ((,(car stores) (%putf ,get ,ptemp ,newval))
+                     ,@(cdr stores))
+                 ,def-temp ;; prevent unused style-warning
                  ,set
                  ,newval)
               `(getf ,get ,ptemp ,@(if default `(,def-temp)))))))
@@ -491,30 +475,32 @@ GET-SETF-EXPANSION directly."
 (sb!xc:define-setf-expander get (symbol prop &optional default)
   (let ((symbol-temp (gensym))
         (prop-temp (gensym))
-        (def-temp (gensym))
+        (def-temp (if default (gensym)))
         (newval (gensym)))
     (values `(,symbol-temp ,prop-temp ,@(if default `(,def-temp)))
             `(,symbol ,prop ,@(if default `(,default)))
             (list newval)
-            `(%put ,symbol-temp ,prop-temp ,newval)
+            `(progn ,def-temp ;; prevent unused style-warning
+                    (%put ,symbol-temp ,prop-temp ,newval))
             `(get ,symbol-temp ,prop-temp ,@(if default `(,def-temp))))))
 
 (sb!xc:define-setf-expander gethash (key hashtable &optional default)
   (let ((key-temp (gensym))
         (hashtable-temp (gensym))
-        (default-temp (gensym))
+        (default-temp (if default (gensym)))
         (new-value-temp (gensym)))
     (values
      `(,key-temp ,hashtable-temp ,@(if default `(,default-temp)))
      `(,key ,hashtable ,@(if default `(,default)))
      `(,new-value-temp)
-     `(%puthash ,key-temp ,hashtable-temp ,new-value-temp)
+     `(progn ,default-temp ;; prevent unused style-warning
+             (%puthash ,key-temp ,hashtable-temp ,new-value-temp))
      `(gethash ,key-temp ,hashtable-temp ,@(if default `(,default-temp))))))
 
 (sb!xc:define-setf-expander logbitp (index int &environment env)
   (declare (type sb!c::lexenv env))
   (multiple-value-bind (temps vals stores store-form access-form)
-      (get-setf-method int env)
+      (sb!xc:get-setf-expansion int env)
     (let ((ind (gensym))
           (store (gensym))
           (stemp (first stores)))
@@ -523,7 +509,8 @@ GET-SETF-EXPANSION directly."
                 ,@vals)
               (list store)
               `(let ((,stemp
-                      (dpb (if ,store 1 0) (byte 1 ,ind) ,access-form)))
+                      (dpb (if ,store 1 0) (byte 1 ,ind) ,access-form))
+                     ,@(cdr stores))
                  ,store-form
                  ,store)
               `(logbitp ,ind ,access-form)))))
@@ -558,7 +545,7 @@ GET-SETF-EXPANSION directly."
   place with bits from the low-order end of the new value."
   (declare (type sb!c::lexenv env))
   (multiple-value-bind (dummies vals newval setter getter)
-      (get-setf-method place env)
+      (sb!xc:get-setf-expansion place env)
     (if (and (consp bytespec) (eq (car bytespec) 'byte))
         (let ((n-size (gensym))
               (n-pos (gensym))
@@ -567,7 +554,8 @@ GET-SETF-EXPANSION directly."
                   (list* (second bytespec) (third bytespec) vals)
                   (list n-new)
                   `(let ((,(car newval) (dpb ,n-new (byte ,n-size ,n-pos)
-                                             ,getter)))
+                                             ,getter))
+                         ,@(cdr newval))
                      ,setter
                      ,n-new)
                   `(ldb (byte ,n-size ,n-pos) ,getter)))
@@ -588,23 +576,30 @@ GET-SETF-EXPANSION directly."
   with bits from the corresponding position in the new value."
   (declare (type sb!c::lexenv env))
   (multiple-value-bind (dummies vals newval setter getter)
-      (get-setf-method place env)
+      (sb!xc:get-setf-expansion place env)
     (let ((btemp (gensym))
           (gnuval (gensym)))
       (values (cons btemp dummies)
               (cons bytespec vals)
               (list gnuval)
-              `(let ((,(car newval) (deposit-field ,gnuval ,btemp ,getter)))
+              `(let ((,(car newval) (deposit-field ,gnuval ,btemp ,getter))
+                     ,@(cdr newval))
                  ,setter
                  ,gnuval)
               `(mask-field ,btemp ,getter)))))
 
-(sb!xc:define-setf-expander the (type place &environment env)
+(defun setf-expand-the (the type place env)
   (declare (type sb!c::lexenv env))
   (multiple-value-bind (temps subforms store-vars setter getter)
       (sb!xc:get-setf-expansion place env)
     (values temps subforms store-vars
             `(multiple-value-bind ,store-vars
-                 (the ,type (values ,@store-vars))
+                 (,the ,type (values ,@store-vars))
                ,setter)
-            `(the ,type ,getter))))
+            `(,the ,type ,getter))))
+
+(sb!xc:define-setf-expander the (type place &environment env)
+  (setf-expand-the 'the type place env))
+
+(sb!xc:define-setf-expander truly-the (type place &environment env)
+  (setf-expand-the 'truly-the type place env))

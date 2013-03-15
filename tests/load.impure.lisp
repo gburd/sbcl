@@ -55,18 +55,17 @@
 
 ;;; As reported by David Tolpin *LOAD-PATHNAME* was not merged.
 (progn
-  (defvar *saved-load-pathname*)
+  (defparameter *saved-load-pathname* nil)
   (with-open-file (s *tmp-filename*
                      :direction :output
                      :if-exists :supersede
                      :if-does-not-exist :create)
     (print '(setq *saved-load-pathname* *load-pathname*) s))
-  (let (tmp-fasl)
-    (unwind-protect
-         (progn
-           (load *tmp-filename*)
-           (assert (equal (merge-pathnames *tmp-filename*) *saved-load-pathname*)))
-      (delete-file *tmp-filename*))))
+  (unwind-protect
+       (progn
+         (load *tmp-filename*)
+         (assert (equal (merge-pathnames *tmp-filename*) *saved-load-pathname*)))
+    (delete-file *tmp-filename*)))
 
 ;;; Test many, many variations on LOAD.
 (defparameter *counter* 0)
@@ -84,8 +83,10 @@
            *loaded-pathname* *loaded-truename*)
        (load ,load-argument :print t :verbose t)
        (assert (and (= (1+ ,before) *counter*)
+                    #-win32 ;kludge
                     (equal ,(if pathname `(merge-pathnames ,pathname))
                            *loaded-pathname*)
+                    #-win32 ;kludge
                     (equal ,(if pathname `(merge-pathnames ,truename))
                            *loaded-truename*))))))
 
@@ -252,9 +253,9 @@
                                        :if-exists :append)
       (write-line ";;comment"))
     (handler-bind ((error (lambda (error)
-                                   (declare (ignore error))
-                                   (when (find-restart 'sb-fasl::source)
-                                     (invoke-restart 'sb-fasl::source)))))
+                            (declare (ignore error))
+                            (when (find-restart 'sb-fasl::source)
+                              (invoke-restart 'sb-fasl::source)))))
       (load-and-assert spec source source))))
 
 ;; Ensure that we can invoke the restart OBJECT in the above case.
@@ -267,14 +268,20 @@
                                        :if-exists :append)
       (write-line ";;comment"))
     (handler-bind ((error (lambda (error)
-                                   (declare (ignore error))
-                                   (when (find-restart 'sb-fasl::object)
-                                     (invoke-restart 'sb-fasl::object)))))
+                            (declare (ignore error))
+                            (when (find-restart 'sb-fasl::object)
+                              (invoke-restart 'sb-fasl::object)))))
       (load-and-assert spec fasl fasl))))
 
 (with-test (:name :bug-332)
   (flet ((stimulate-sbcl ()
-           (let ((filename (format nil "/tmp/~A.lisp" (gensym))))
+           (let ((filename
+                  (format nil "~A/~A.lisp"
+                          (or (posix-getenv "TEST_DIRECTORY")
+                              (posix-getenv "TMPDIR")
+                              "/tmp")
+                          (gensym))))
+             (ensure-directories-exist filename)
              ;; create a file which redefines a structure incompatibly
              (with-open-file (f filename :direction :output :if-exists :supersede)
                (print '(defstruct bug-332 foo) f)
@@ -305,3 +312,49 @@
 
 (with-test (:name (load "empty.fasl"))
   (assert (not (load-empty-file "fasl"))))
+
+(with-test (:name :parallel-fasl-load)
+  #+sb-thread
+  (let ((lisp #p"parallel-fasl-load-test.lisp")
+        (fasl nil)
+        (ready nil))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (compiled warned failed)
+               (compile-file lisp)
+             (setf fasl compiled)
+             (assert (not warned))
+             (assert (not failed))
+             (labels ((load-loop ()
+                        (let* ((*standard-output* (make-broadcast-stream))
+                               (*error-output* *standard-output*))
+                          (sb-ext:wait-for ready)
+                          (handler-case
+                              (progn
+                                (loop repeat 1000
+                                      do (load fasl)
+                                         (test-it))
+                                t)
+                            (error (e) e))))
+                      (test-it ()
+                        (assert (= 1 (one-fun)))
+                        (assert (= 2 (two-fun)))
+                        (assert (= 42 (symbol-value '*var*)))
+                        (assert (= 13 (symbol-value '*quux*)))))
+               (let ((t1 (sb-thread:make-thread #'load-loop))
+                     (t2 (sb-thread:make-thread #'load-loop))
+                     (t3 (sb-thread:make-thread #'load-loop)))
+                 (setf ready t)
+                 (let ((r1 (sb-thread:join-thread t1))
+                       (r2 (sb-thread:join-thread t2))
+                       (r3 (sb-thread:join-thread t3)))
+                   (unless (and (eq t r1) (eq t r2) (eq t r3))
+                     (error "R1: ~A~2%R2: ~A~2%R2: ~A" r1 r2 r3))
+                   ;; These ones cannot be tested while redefinitions are running:
+                   ;; adding a method implies REMOVE-METHOD, so a call would be racy.
+                   (assert (eq :ok (a-slot (make-instance 'a-class :slot :ok))))
+                   (assert (eq 'cons (gen-fun '(foo))))
+                   (assert (eq 'a-class (gen-fun (make-instance 'a-class)))))
+                 (test-it)))))
+      (when fasl
+        (ignore-errors (delete-file fasl))))))

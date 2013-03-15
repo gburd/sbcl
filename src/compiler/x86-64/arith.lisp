@@ -11,6 +11,12 @@
 
 (in-package "SB!VM")
 
+
+;; A fixnum that can be represented in tagged form by a signed 32-bit
+;; value and that can therefore be used as an immediate argument of
+;; arithmetic machine instructions.
+(deftype short-tagged-num () '(signed-byte #.(- 32 n-fixnum-tag-bits)))
+
 ;;;; unary operations
 
 (define-vop (fast-safe-arith-op)
@@ -110,13 +116,13 @@
 
 (define-vop (fast-fixnum-binop-c fast-safe-arith-op)
   (:args (x :target r :scs (any-reg)
-            :load-if (or (not (typep y '(signed-byte 29)))
+            :load-if (or (not (typep y 'short-tagged-num))
                          (not (sc-is x any-reg control-stack)))))
   (:info y)
   (:arg-types tagged-num (:constant fixnum))
   (:results (r :scs (any-reg)
                :load-if (or (not (location= x r))
-                            (not (typep y '(signed-byte 29))))))
+                            (not (typep y 'short-tagged-num)))))
   (:result-types tagged-num)
   (:note "inline fixnum arithmetic"))
 
@@ -157,7 +163,7 @@
                   (:translate ,translate)
                   (:generator 1
                   (move r x)
-                  (inst ,op r (if (typep y '(signed-byte 29))
+                  (inst ,op r (if (typep y 'short-tagged-num)
                                   (fixnumize y)
                                   (register-inline-constant :qword (fixnumize y))))))
                 (define-vop (,(symbolicate "FAST-" translate "/SIGNED=>SIGNED")
@@ -228,20 +234,20 @@
 (define-vop (fast-+-c/fixnum=>fixnum fast-safe-arith-op)
   (:translate +)
   (:args (x :target r :scs (any-reg)
-            :load-if (or (not (typep y '(signed-byte 29)))
+            :load-if (or (not (typep y 'short-tagged-num))
                          (not (sc-is x any-reg control-stack)))))
   (:info y)
   (:arg-types tagged-num (:constant fixnum))
   (:results (r :scs (any-reg)
                :load-if (or (not (location= x r))
-                            (not (typep y '(signed-byte 29))))))
+                            (not (typep y 'short-tagged-num)))))
   (:result-types tagged-num)
   (:note "inline fixnum arithmetic")
   (:generator 1
     (cond ((and (sc-is x any-reg) (sc-is r any-reg) (not (location= x r))
-                (typep y '(signed-byte 29)))
+                (typep y 'short-tagged-num))
            (inst lea r (make-ea :qword :base x :disp (fixnumize y))))
-          ((typep y '(signed-byte 29))
+          ((typep y 'short-tagged-num)
            (move r x)
            (inst add r (fixnumize y)))
           (t
@@ -391,7 +397,7 @@
   (:note "inline fixnum arithmetic")
   (:generator 4
     (move r x)
-    (inst sar r 3)
+    (inst sar r n-fixnum-tag-bits)
     (inst imul r y)))
 
 (define-vop (fast-*-c/fixnum=>fixnum fast-safe-arith-op)
@@ -509,8 +515,11 @@
     (inst cqo)
     (inst idiv eax y)
     (if (location= quo eax)
-        (inst shl eax 3)
-        (inst lea quo (make-ea :qword :index eax :scale 8)))
+        (inst shl eax n-fixnum-tag-bits)
+        (if (= n-fixnum-tag-bits 1)
+            (inst lea quo (make-ea :qword :base eax :index eax))
+            (inst lea quo (make-ea :qword :index eax
+                                   :scale (ash 1 n-fixnum-tag-bits)))))
     (move rem edx)))
 
 (define-vop (fast-truncate-c/fixnum=>fixnum fast-safe-arith-op)
@@ -532,13 +541,16 @@
   (:generator 30
     (move eax x)
     (inst cqo)
-    (if (typep y '(signed-byte 29))
+    (if (typep y 'short-tagged-num)
         (inst mov y-arg (fixnumize y))
         (setf y-arg (register-inline-constant :qword (fixnumize y))))
     (inst idiv eax y-arg)
     (if (location= quo eax)
-        (inst shl eax 3)
-        (inst lea quo (make-ea :qword :index eax :scale 8)))
+        (inst shl eax n-fixnum-tag-bits)
+        (if (= n-fixnum-tag-bits 1)
+            (inst lea quo (make-ea :qword :base eax :index eax))
+            (inst lea quo (make-ea :qword :index eax
+                                   :scale (ash 1 n-fixnum-tag-bits)))))
     (move rem edx)))
 
 (define-vop (fast-truncate/unsigned=>unsigned fast-safe-arith-op)
@@ -665,6 +677,8 @@
                                        (location= number result)))))
   (:result-types tagged-num)
   (:note "inline ASH")
+  (:variant nil)
+  (:variant-vars modularp)
   (:generator 2
     (cond ((and (= amount 1) (not (location= number result)))
            (inst lea result (make-ea :qword :base number :index number)))
@@ -675,17 +689,22 @@
           (t
            (move result number)
            (cond ((< -64 amount 64)
-                  ;; this code is used both in ASH and ASH-SMOD61, so
+                  ;; this code is used both in ASH and ASH-MODFX, so
                   ;; be careful
                   (if (plusp amount)
                       (inst shl result amount)
                       (progn
                         (inst sar result (- amount))
                         (inst and result (lognot fixnum-tag-mask)))))
+                 ;; shifting left (zero fill)
                  ((plusp amount)
+                  (unless modularp
+                    (aver (not "Impossible: fixnum ASH should not be called with
+constant shift greater than word length")))
                   (if (sc-is result any-reg)
-                      (inst xor result result)
+                      (zeroize result)
                       (inst mov result 0)))
+                 ;; shifting right (sign fill)
                  (t (inst sar result 63)
                     (inst and result (lognot fixnum-tag-mask))))))))
 
@@ -827,7 +846,7 @@
   (:generator 5
     (move result number)
     (move ecx amount)
-    (inst or ecx ecx)
+    (inst test ecx ecx)
     (inst jmp :ns POSITIVE)
     (inst neg ecx)
     (inst cmp ecx 63)
@@ -856,7 +875,7 @@
   (:generator 5
     (move result number)
     (move ecx amount)
-    (inst or ecx ecx)
+    (inst test ecx ecx)
     (inst jmp :ns POSITIVE)
     (inst neg ecx)
     (inst cmp ecx 63)
@@ -968,7 +987,7 @@
   (:generator 4
     (move result number)
     (move ecx amount)
-    (inst or ecx ecx)
+    (inst test ecx ecx)
     (inst jmp :ns POSITIVE)
     (inst neg ecx)
     (zeroize zero)
@@ -1101,7 +1120,7 @@
 
 (define-vop (fast-conditional-c/fixnum fast-conditional/fixnum)
   (:args (x :scs (any-reg)
-            :load-if (or (not (typep y '(signed-byte 29)))
+            :load-if (or (not (typep y 'short-tagged-num))
                          (not (sc-is x any-reg control-stack)))))
   (:arg-types tagged-num (:constant fixnum))
   (:info y))
@@ -1153,7 +1172,7 @@
                                     (inst cmp x
                                           ,(case suffix
                                              (-c/fixnum
-                                                `(if (typep y '(signed-byte 29))
+                                                `(if (typep y 'short-tagged-num)
                                                      (fixnumize y)
                                                      (register-inline-constant
                                                       :qword (fixnumize y))))
@@ -1236,7 +1255,7 @@
 
 (define-vop (fast-eql-c/fixnum fast-conditional/fixnum)
   (:args (x :scs (any-reg)
-            :load-if (or (not (typep y '(signed-byte 29)))
+            :load-if (or (not (typep y 'short-tagged-num))
                          (not (sc-is x any-reg descriptor-reg control-stack)))))
   (:arg-types tagged-num (:constant fixnum))
   (:info y)
@@ -1244,7 +1263,7 @@
   (:generator 2
     (cond ((and (sc-is x any-reg descriptor-reg) (zerop y))
            (inst test x x))  ; smaller instruction
-          ((typep y '(signed-byte 29))
+          ((typep y 'short-tagged-num)
            (inst cmp x (fixnumize y)))
           (t
            (inst cmp x (register-inline-constant :qword (fixnumize y)))))))
@@ -1336,18 +1355,19 @@
                    (vop64f (intern (format nil "FAST-~S-MOD64/FIXNUM=>FIXNUM" name)))
                    (vop64cu (intern (format nil "FAST-~S-MOD64-C/WORD=>UNSIGNED" name)))
                    (vop64cf (intern (format nil "FAST-~S-MOD64-C/FIXNUM=>FIXNUM" name)))
-                   (sfun61 (intern (format nil "~S-SMOD61" name)))
-                   (svop61f (intern (format nil "FAST-~S-SMOD61/FIXNUM=>FIXNUM" name)))
-                   (svop61cf (intern (format nil "FAST-~S-SMOD61-C/FIXNUM=>FIXNUM" name))))
+                   (funfx (intern (format nil "~S-MODFX" name)))
+                   (vopfxf (intern (format nil "FAST-~S-MODFX/FIXNUM=>FIXNUM" name)))
+                   (vopfxcf (intern (format nil "FAST-~S-MODFX-C/FIXNUM=>FIXNUM" name))))
                `(progn
                   (define-modular-fun ,fun64 (x y) ,name :untagged nil 64)
-                  (define-modular-fun ,sfun61 (x y) ,name :tagged t 61)
+                  (define-modular-fun ,funfx (x y) ,name :tagged t
+                                      #.(- n-word-bits n-fixnum-tag-bits))
                   (define-mod-binop (,vop64u ,vopu) ,fun64)
                   (define-vop (,vop64f ,vopf) (:translate ,fun64))
-                  (define-vop (,svop61f ,vopf) (:translate ,sfun61))
+                  (define-vop (,vopfxf ,vopf) (:translate ,funfx))
                   ,@(when -c-p
                       `((define-mod-binop-c (,vop64cu ,vopcu) ,fun64)
-                        (define-vop (,svop61cf ,vopcf) (:translate ,sfun61))))))))
+                        (define-vop (,vopfxcf ,vopcf) (:translate ,funfx))))))))
   (def + t)
   (def - t)
   (def * t))
@@ -1363,24 +1383,25 @@
     (sb!c::give-up-ir1-transform))
   '(%primitive fast-ash-left-mod64/unsigned=>unsigned integer count))
 
-(define-vop (fast-ash-left-smod61-c/fixnum=>fixnum
+(define-vop (fast-ash-left-modfx-c/fixnum=>fixnum
              fast-ash-c/fixnum=>fixnum)
-  (:translate ash-left-smod61))
-(define-vop (fast-ash-left-smod61/fixnum=>fixnum
+  (:variant :modular)
+  (:translate ash-left-modfx))
+(define-vop (fast-ash-left-modfx/fixnum=>fixnum
              fast-ash-left/fixnum=>fixnum))
-(deftransform ash-left-smod61 ((integer count)
-                               ((signed-byte 61) (unsigned-byte 6)))
+(deftransform ash-left-modfx ((integer count)
+                              (fixnum (unsigned-byte 6)))
   (when (sb!c::constant-lvar-p count)
     (sb!c::give-up-ir1-transform))
-  '(%primitive fast-ash-left-smod61/fixnum=>fixnum integer count))
+  '(%primitive fast-ash-left-modfx/fixnum=>fixnum integer count))
 
 (in-package "SB!C")
 
 (defknown sb!vm::%lea-mod64 (integer integer (member 1 2 4 8) (signed-byte 64))
   (unsigned-byte 64)
   (foldable flushable movable))
-(defknown sb!vm::%lea-smod61 (integer integer (member 1 2 4 8) (signed-byte 64))
-  (signed-byte 61)
+(defknown sb!vm::%lea-modfx (integer integer (member 1 2 4 8) (signed-byte 64))
+  fixnum
   (foldable flushable movable))
 
 (define-modular-fun-optimizer %lea ((base index scale disp) :untagged nil :width width)
@@ -1391,19 +1412,20 @@
     (cut-to-width index :untagged width nil)
     'sb!vm::%lea-mod64))
 (define-modular-fun-optimizer %lea ((base index scale disp) :tagged t :width width)
-  (when (and (<= width 61)
+  (when (and (<= width (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits))
              (constant-lvar-p scale)
              (constant-lvar-p disp))
     (cut-to-width base :tagged width t)
     (cut-to-width index :tagged width t)
-    'sb!vm::%lea-smod61))
+    'sb!vm::%lea-modfx))
 
 #+sb-xc-host
 (progn
   (defun sb!vm::%lea-mod64 (base index scale disp)
     (ldb (byte 64 0) (%lea base index scale disp)))
-  (defun sb!vm::%lea-smod61 (base index scale disp)
-    (mask-signed-field 61 (%lea base index scale disp))))
+  (defun sb!vm::%lea-modfx (base index scale disp)
+    (mask-signed-field (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits)
+                       (%lea base index scale disp))))
 #-sb-xc-host
 (progn
   (defun sb!vm::%lea-mod64 (base index scale disp)
@@ -1412,21 +1434,22 @@
       ;; can't use modular version of %LEA, as we only have VOPs for
       ;; constant SCALE and DISP.
       (ldb (byte 64 0) (+ base (* index scale) disp))))
-  (defun sb!vm::%lea-smod61 (base index scale disp)
-    (let ((base (mask-signed-field 61 base))
-          (index (mask-signed-field 61 index)))
+  (defun sb!vm::%lea-modfx (base index scale disp)
+    (let* ((fixnum-width (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits))
+           (base (mask-signed-field fixnum-width base))
+           (index (mask-signed-field fixnum-width index)))
       ;; can't use modular version of %LEA, as we only have VOPs for
       ;; constant SCALE and DISP.
-      (mask-signed-field 61 (+ base (* index scale) disp)))))
+      (mask-signed-field fixnum-width (+ base (* index scale) disp)))))
 
 (in-package "SB!VM")
 
 (define-vop (%lea-mod64/unsigned=>unsigned
              %lea/unsigned=>unsigned)
   (:translate %lea-mod64))
-(define-vop (%lea-smod61/fixnum=>fixnum
+(define-vop (%lea-modfx/fixnum=>fixnum
              %lea/fixnum=>fixnum)
-  (:translate %lea-smod61))
+  (:translate %lea-modfx))
 
 ;;; logical operations
 (define-modular-fun lognot-mod64 (x) lognot :untagged nil 64)
@@ -1489,7 +1512,7 @@
   (:arg-types unsigned-num)
   (:conditional :ns)
   (:generator 3
-    (inst or digit digit)))
+    (inst test digit digit)))
 
 
 ;;; For add and sub with carry the sc of carry argument is any-reg so
@@ -1602,6 +1625,42 @@
     (move hi edx)
     (move lo eax)))
 
+#!+multiply-high-vops
+(define-vop (mulhi)
+  (:translate sb!kernel:%multiply-high)
+  (:policy :fast-safe)
+  (:args (x :scs (unsigned-reg) :target eax)
+         (y :scs (unsigned-reg unsigned-stack)))
+  (:arg-types unsigned-num unsigned-num)
+  (:temporary (:sc unsigned-reg :offset eax-offset :from (:argument 0))
+              eax)
+  (:temporary (:sc unsigned-reg :offset edx-offset :from (:argument 1)
+                   :to (:result 0) :target hi) edx)
+  (:results (hi :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 20
+    (move eax x)
+    (inst mul eax y)
+    (move hi edx)))
+
+#!+multiply-high-vops
+(define-vop (mulhi/fx)
+  (:translate sb!kernel:%multiply-high)
+  (:policy :fast-safe)
+  (:args (x :scs (any-reg) :target eax)
+         (y :scs (unsigned-reg unsigned-stack)))
+  (:arg-types positive-fixnum unsigned-num)
+  (:temporary (:sc any-reg :offset eax-offset :from (:argument 0)) eax)
+  (:temporary (:sc any-reg :offset edx-offset :from (:argument 1)
+                   :to (:result 0) :target hi) edx)
+  (:results (hi :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:generator 15
+    (move eax x)
+    (inst mul eax y)
+    (move hi edx)
+    (inst and hi (lognot fixnum-tag-mask))))
+
 (define-vop (bignum-lognot lognot-mod64/unsigned=>unsigned)
   (:translate sb!bignum:%lognot))
 
@@ -1617,10 +1676,10 @@
   (:result-types unsigned-num)
   (:generator 1
     (move digit fixnum)
-    (inst sar digit 3)))
+    (inst sar digit n-fixnum-tag-bits)))
 
 (define-vop (bignum-floor)
-  (:translate sb!bignum:%floor)
+  (:translate sb!bignum:%bigfloor)
   (:policy :fast-safe)
   (:args (div-high :scs (unsigned-reg) :target edx)
          (div-low :scs (unsigned-reg) :target eax)
@@ -1653,7 +1712,7 @@
   (:generator 1
     (move res digit)
     (when (sc-is res any-reg control-stack)
-      (inst shl res 3))))
+      (inst shl res n-fixnum-tag-bits))))
 
 (define-vop (digit-ashr)
   (:translate sb!bignum:%ashr)
@@ -1742,14 +1801,14 @@
     (*-transformer y)))
 
 (deftransform * ((x y)
-                 ((signed-byte 61) (constant-arg (unsigned-byte 64)))
-                 (signed-byte 61))
+                 (fixnum (constant-arg (unsigned-byte 64)))
+                 fixnum)
   "recode as leas, shifts and adds"
   (let ((y (lvar-value y)))
     (*-transformer y)))
-(deftransform sb!vm::*-smod61
-    ((x y) ((signed-byte 61) (constant-arg (unsigned-byte 64)))
-     (signed-byte 61))
+(deftransform sb!vm::*-modfx
+    ((x y) (fixnum (constant-arg (unsigned-byte 64)))
+     fixnum)
   "recode as leas, shifts and adds"
   (let ((y (lvar-value y)))
     (*-transformer y)))

@@ -18,6 +18,43 @@
       (setf (slot-value x '%documentation) new-value)
       (setf (%fun-doc x) new-value)))
 
+;;; FIXME: There's already fun-name in code/describe.lisp, but it's
+;;; loaded after PCL, so it cannot be used, because we set
+;;; some documentation at the end of this file.
+(defun fun-name (x)
+  (if (typep x 'generic-function)
+      (sb-pcl:generic-function-name x)
+      (%fun-name x)))
+
+(defun real-function-name (name)
+  ;; Resolve the actual name of the function named by NAME
+  ;; e.g. (setf (name-function 'x) #'car)
+  ;; (real-function-name 'x) => CAR
+  (cond ((not (fboundp name))
+         nil)
+        ((and (symbolp name)
+              (special-operator-p name))
+         (%fun-name (fdefinition name)))
+        ((and (symbolp name)
+              (macro-function name))
+         (let ((name (%fun-name (macro-function name))))
+           (and (consp name)
+                (eq (car name) 'macro-function)
+                (cadr name))))
+        (t
+         (fun-name (fdefinition name)))))
+
+(defun set-function-name-documentation (name documentation)
+  (cond ((not (legal-fun-name-p name))
+         nil)
+        ((not (equal (real-function-name name) name))
+         (setf (random-documentation name 'function) documentation))
+        (t
+         (setf (fun-doc (or (and (symbolp name)
+                                 (macro-function name))
+                            (fdefinition name)))
+               documentation))))
+
 ;;; functions, macros, and special forms
 (defmethod documentation ((x function) (doc-type (eql 't)))
   (fun-doc x))
@@ -25,17 +62,25 @@
 (defmethod documentation ((x function) (doc-type (eql 'function)))
   (fun-doc x))
 
-(defmethod documentation ((x list) (doc-type (eql 'function)))
-  (when (and (legal-fun-name-p x) (fboundp x))
-    (fun-doc (fdefinition x))))
-
 (defmethod documentation ((x list) (doc-type (eql 'compiler-macro)))
   (awhen (compiler-macro-function x)
     (documentation it t)))
 
+(defmethod documentation ((x list) (doc-type (eql 'function)))
+  (when (legal-fun-name-p x)
+    (or (random-documentation x 'function)
+        (when (fboundp x)
+          (fun-doc (fdefinition x))))))
+
 (defmethod documentation ((x symbol) (doc-type (eql 'function)))
-  (when (and (legal-fun-name-p x) (fboundp x))
-    (fun-doc (or (macro-function x) (fdefinition x)))))
+  (when (legal-fun-name-p x)
+    (or (random-documentation x 'function)
+        ;; Nothing under the name, check the function object.
+        (when (fboundp x)
+          (fun-doc (if (special-operator-p x)
+                       (fdefinition x)
+                       (or (macro-function x)
+                           (fdefinition x))))))))
 
 (defmethod documentation ((x symbol) (doc-type (eql 'compiler-macro)))
   (awhen (compiler-macro-function x)
@@ -54,16 +99,14 @@
   (setf (fun-doc x) new-value))
 
 (defmethod (setf documentation) (new-value (x list) (doc-type (eql 'function)))
-  (when (and (legal-fun-name-p x) (fboundp x))
-    (setf (documentation (fdefinition x) t) new-value)))
+  (set-function-name-documentation x new-value))
 
 (defmethod (setf documentation) (new-value (x list) (doc-type (eql 'compiler-macro)))
   (awhen (compiler-macro-function x)
     (setf (documentation it t) new-value)))
 
 (defmethod (setf documentation) (new-value (x symbol) (doc-type (eql 'function)))
-  (when (and (legal-fun-name-p x) (fboundp x))
-    (setf (documentation (symbol-function x) t) new-value)))
+  (set-function-name-documentation x new-value))
 
 (defmethod (setf documentation) (new-value (x symbol) (doc-type (eql 'compiler-macro)))
   (awhen (compiler-macro-function x)
@@ -234,6 +277,22 @@
 ;;; set the documentation for the machinery for setting documentation.
 #+sb-doc
 (setf (documentation 'documentation 'function)
-      "Return the documentation string of Doc-Type for X, or NIL if
-  none exists. System doc-types are VARIABLE, FUNCTION, STRUCTURE, TYPE,
-  SETF, and T.")
+      "Return the documentation string of Doc-Type for X, or NIL if none
+exists. System doc-types are VARIABLE, FUNCTION, STRUCTURE, TYPE, SETF, and T.
+
+Function documentation is stored separately for function names and objects:
+DEFUN, LAMBDA, &co create function objects with the specified documentation
+strings.
+
+ \(SETF (DOCUMENTATION NAME 'FUNCTION) STRING)
+
+sets the documentation string stored under the specified name, and
+
+ \(SETF (DOCUMENTATION FUNC T) STRING)
+
+sets the documentation string stored in the function object.
+
+ \(DOCUMENTATION NAME 'FUNCTION)
+
+returns the documentation stored under the function name if any, and
+falls back on the documentation in the function object if necessary.")

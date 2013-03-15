@@ -22,6 +22,7 @@
 #include <sys/param.h>
 #include <sys/file.h>
 #include <unistd.h>
+#include <utime.h>
 #include <assert.h>
 #include <errno.h>
 #include "sbcl.h"
@@ -44,6 +45,11 @@
 #if defined LISP_FEATURE_GENCGC
 #include "gencgc-internal.h"
 #endif
+
+#if defined(LISP_FEATURE_SB_WTIMER) && !defined(LISP_FEATURE_DARWIN)
+# include <sys/event.h>
+#endif
+
 
 os_vm_size_t os_vm_page_size;
 
@@ -82,7 +88,7 @@ static void openbsd_init();
 void
 os_init(char *argv[], char *envp[])
 {
-    os_vm_page_size = getpagesize();
+    os_vm_page_size = BACKEND_PAGE_BYTES;
 
 #ifdef __NetBSD__
     netbsd_init();
@@ -90,6 +96,8 @@ os_init(char *argv[], char *envp[])
     freebsd_init();
 #elif defined(__OpenBSD__)
     openbsd_init();
+#elif defined(LISP_FEATURE_DARWIN)
+    darwin_init();
 #endif
 }
 
@@ -210,6 +218,10 @@ memory_fault_handler(int signal, siginfo_t *siginfo, os_context_t *context)
 
     FSHOW((stderr, "Memory fault at: %p, PC: %p\n", fault_addr, *os_context_pc_addr(context)));
 
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+    if (!handle_safepoint_violation(context, fault_addr))
+#endif
+
     if (!gencgc_handle_wp_violation(fault_addr))
         if(!handle_guard_page_triggered(context,fault_addr))
             lisp_memory_fault_error(context, fault_addr);
@@ -239,8 +251,14 @@ os_install_interrupt_handlers(void)
 #endif
 
 #ifdef LISP_FEATURE_SB_THREAD
+# ifdef LISP_FEATURE_SB_SAFEPOINT
+#  ifdef LISP_FEATURE_SB_THRUPTION
+    undoably_install_low_level_interrupt_handler(SIGPIPE, thruption_handler);
+#  endif
+# else
     undoably_install_low_level_interrupt_handler(SIG_STOP_FOR_GC,
                                                  sig_stop_for_gc_handler);
+# endif
 #endif
     SHOW("leaving os_install_interrupt_handlers()");
 }
@@ -340,6 +358,12 @@ _readdir(DIR *dirp)
     return readdir(dirp);
 }
 
+int
+_utime(const char *file, const struct utimbuf *timep)
+{
+    return utime(file, timep);
+}
+
 /* Used in sb-bsd-sockets. */
 int
 _socket(int domain, int type, int protocol)
@@ -383,8 +407,8 @@ static void freebsd_init()
 #endif /* LISP_FEATURE_X86 */
 }
 
-#if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX) \
-    && !defined(LISP_FEATURE_SB_LUTEX)
+#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_FUTEX) \
+    && !defined(LISP_FEATURE_SB_PTHREAD_FUTEX)
 int
 futex_wait(int *lock_word, long oldval, long sec, unsigned long usec)
 {
@@ -428,7 +452,7 @@ futex_wake(int *lock_word, int n)
 #endif
 
 char *
-os_get_runtime_executable_path()
+os_get_runtime_executable_path(int external)
 {
     char path[PATH_MAX + 1];
 
@@ -456,20 +480,16 @@ os_get_runtime_executable_path()
 }
 #elif defined(LISP_FEATURE_NETBSD) || defined(LISP_FEATURE_OPENBSD)
 char *
-os_get_runtime_executable_path()
+os_get_runtime_executable_path(int external)
 {
     struct stat sb;
-    char *path = strdup("/proc/curproc/file");
-    if (path && ((stat(path, &sb)) == 0))
-        return path;
-    else {
-        fprintf(stderr, "Couldn't stat /proc/curproc/file; is /proc mounted?\n");
-        return NULL;
-    }
+    if (!external && stat("/proc/curproc/file", &sb) == 0)
+        return copied_string("/proc/curproc/file");
+    return NULL;
 }
 #else /* Not DARWIN or FREEBSD or NETBSD or OPENBSD */
 char *
-os_get_runtime_executable_path()
+os_get_runtime_executable_path(int external)
 {
     return NULL;
 }
@@ -551,4 +571,61 @@ os_dlsym(void *handle, const char *symbol)
     return ret;
 }
 
+#endif
+
+#if defined(LISP_FEATURE_SB_WTIMER) && !defined(LISP_FEATURE_DARWIN)
+/*
+ * Waitable timer implementation for the safepoint-based (SIGALRM-free)
+ * timer facility using kqueue.
+ */
+int
+os_create_wtimer()
+{
+    int kq = kqueue();
+    if (kq == -1)
+        lose("os_create_wtimer: kqueue");
+    return kq;
+}
+
+int
+os_wait_for_wtimer(int kq)
+{
+    struct kevent ev;
+    int n;
+    if ( (n = kevent(kq, 0, 0, &ev, 1, 0)) == -1) {
+        if (errno != EINTR)
+            lose("os_wtimer_listen failed");
+        n = 0;
+    }
+    return n != 1;
+}
+
+void
+os_close_wtimer(int kq)
+{
+    if (close(kq) == -1)
+        lose("os_close_wtimer failed");
+}
+
+void
+os_set_wtimer(int kq, int sec, int nsec)
+{
+    long long msec
+        = ((long long) sec) * 1000 + (long long) (nsec+999999) / 1000000;
+    if (msec > INT_MAX) msec = INT_MAX;
+
+    struct kevent ev;
+    EV_SET(&ev, 1, EVFILT_TIMER, EV_ADD|EV_ENABLE|EV_ONESHOT, 0, (int)msec, 0);
+    if (kevent(kq, &ev, 1, 0, 0, 0) == -1)
+        perror("os_set_wtimer: kevent");
+}
+
+void
+os_cancel_wtimer(int kq)
+{
+    struct kevent ev;
+    EV_SET(&ev, 1, EVFILT_TIMER, EV_DISABLE, 0, 0, 0);
+    if (kevent(kq, &ev, 1, 0, 0, 0) == -1 && errno != ENOENT)
+        perror("os_cancel_wtimer: kevent");
+}
 #endif

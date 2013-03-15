@@ -30,22 +30,7 @@ PUNT=$EXIT_TEST_WIN
 
 build_so() (
   echo building $1.so
-  set +u
-  case "`uname -m`" in
-      x86_64|amd64|mips|mips64)
-	  CFLAGS="$CFLAGS -fPIC"
-	  ;;
-  esac
-  if [ "`uname`" = Darwin ]; then
-    SO_FLAGS="-bundle"
-    if run_sbcl --eval '(sb-ext:quit :unix-status #+x86-64 0 #-x86-64 1)'; then
-	CFLAGS="$CFLAGS -arch x86_64"
-    fi
-  else
-    SO_FLAGS="-shared"
-  fi
-  cc -c $1.c -o $1.o $CFLAGS
-  ld $SO_FLAGS -o $1.so $1.o  
+  /bin/sh ../run-compiler.sh -sbcl-pic -sbcl-shared "$1.c" -o "$1.so"
 )
 
 # We want to bail out in case any of these Unix programs fails.
@@ -143,7 +128,7 @@ cat > $TEST_FILESTEM.base.lisp <<EOF
         ;; At least as of sbcl-0.7.0.5, LOAD-SHARED-OBJECT isn't
         ;; supported on every OS. In that case, there's nothing to test,
         ;; and we can just fall through to success.
-        (sb-ext:quit :unix-status 22)))) ; catch that
+        (sb-ext:exit :code 22)))) ; catch that
   (define-alien-routine summish int (x int) (y int))
   (define-alien-variable numberish int)
   (define-alien-routine nummish int (x int))
@@ -271,7 +256,7 @@ cat > $TEST_FILESTEM.test.lisp <<EOF
       (assert (typep err 'undefined-alien-error)))
     (note "/linkage table ok"))
 
-  (sb-ext:quit :unix-status $EXIT_LISP_WIN) ; success convention for Lisp program
+  (sb-ext:exit :code $EXIT_LISP_WIN) ; success convention for Lisp program
 EOF
 
 # Files are now set up; toggle errexit off, since we use a custom exit
@@ -279,9 +264,10 @@ EOF
 set +e
 
 test_compile() {
+    x="$1"
     run_sbcl <<EOF
-(progn (load (compile-file "$TEST_FILESTEM.$1.lisp"))
-(sb-ext:quit :unix-status $EXIT_LISP_WIN))
+(progn (load (compile-file "$TEST_FILESTEM.$x.lisp"))
+(sb-ext:exit :code $EXIT_LISP_WIN))
 EOF
     check_status_maybe_lose "compile $1" $?
 }
@@ -299,10 +285,11 @@ test_use fast
 
 test_save() {
     echo testing save $1 
+    x="$1"
     run_sbcl --load $TEST_FILESTEM.$1.fasl <<EOF
-#+linkage-table (save-lisp-and-die "$TEST_FILESTEM.$1.core")
+#+linkage-table (save-lisp-and-die "$TEST_FILESTEM.$x.core")
 #-linkage-table nil
-(sb-ext:quit :unix-status 22) ; catch this
+(sb-ext:exit :code 22) ; catch this
 EOF
     check_status_maybe_lose "save $1" $? \
 	0 "(successful save)" 22 "(linkage table not available)"
@@ -331,7 +318,7 @@ run_sbcl_with_core $TEST_FILESTEM.fast.core --no-sysinit --no-userinit <<EOF
   (multiple-value-bind (val err) (ignore-errors (eval '(bar)))
     (assert (not val))
     (assert (typep err 'undefined-alien-error)))
-  (quit :unix-status $EXIT_LISP_WIN)
+  (exit :code $EXIT_LISP_WIN)
 EOF
 check_status_maybe_lose "missing-so" $?
 
@@ -353,7 +340,7 @@ run_sbcl <<EOF
   (define-alien-variable b (* foo))
   (funcall (compile nil '(lambda () (setq b (addr a)))))
   (assert (sb-sys:sap= (alien-sap a) (alien-sap (deref b))))
-  (quit :unix-status $EXIT_LISP_WIN)
+  (exit :code $EXIT_LISP_WIN)
 EOF
 check_status_maybe_lose "ADDR of a heap-allocated object" $?
 
@@ -369,7 +356,7 @@ run_sbcl <<EOF
   (setf (slot *inner* 'var) 40)
   (setf (slot *outer* 'two) *inner*)
   (assert (= (slot (slot *outer* 'two) 'var) 40))
-  (quit :unix-status $EXIT_LISP_WIN)
+  (exit :code $EXIT_LISP_WIN)
 EOF
 check_status_maybe_lose "struct offsets" $?
 

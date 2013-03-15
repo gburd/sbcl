@@ -30,6 +30,8 @@
   (:generator 1
      (storew (encode-value-if-immediate value) object offset lowtag)))
 
+(define-vop (init-slot set-slot))
+
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg) :to :eval)
          (old :scs (descriptor-reg any-reg) :target eax)
@@ -71,7 +73,8 @@
       (progn
         (loadw tls symbol symbol-tls-index-slot other-pointer-lowtag)
         ;; Thread-local area, no LOCK needed.
-        (inst cmpxchg (make-ea :dword :base tls) new :fs)
+        (with-tls-ea (EA :base tls :base-already-live-p t)
+          (inst cmpxchg EA new :maybe-fs))
         (inst cmp eax no-tls-value-marker-widetag)
         (inst jmp :ne check)
         (move eax old))
@@ -115,9 +118,10 @@
       (let ((global-val (gen-label))
             (done (gen-label)))
         (loadw tls symbol symbol-tls-index-slot other-pointer-lowtag)
-        (inst cmp (make-ea :dword :base tls) no-tls-value-marker-widetag :fs)
-        (inst jmp :z global-val)
-        (inst mov (make-ea :dword :base tls) value :fs)
+        (with-tls-ea (EA :base tls :base-already-live-p t)
+          (inst cmp EA no-tls-value-marker-widetag :maybe-fs)
+          (inst jmp :z global-val)
+          (inst mov EA value :maybe-fs))
         (inst jmp done)
         (emit-label global-val)
         (storew value symbol symbol-value-slot other-pointer-lowtag)
@@ -137,7 +141,8 @@
              (err-lab (generate-error-code vop 'unbound-symbol-error object))
              (ret-lab (gen-label)))
         (loadw value object symbol-tls-index-slot other-pointer-lowtag)
-        (inst mov value (make-ea :dword :base value) :fs)
+        (with-tls-ea (EA :base value :base-already-live-p t)
+          (inst mov value EA :maybe-fs))
         (inst cmp value no-tls-value-marker-widetag)
         (inst jmp :ne check-unbound-label)
         (loadw value object symbol-value-slot other-pointer-lowtag)
@@ -157,7 +162,8 @@
     (:generator 8
       (let ((ret-lab (gen-label)))
         (loadw value object symbol-tls-index-slot other-pointer-lowtag)
-        (inst mov value (make-ea :dword :base value) :fs)
+        (with-tls-ea (EA :base value :base-already-live-p t)
+          (inst mov value EA :maybe-fs))
         (inst cmp value no-tls-value-marker-widetag)
         (inst jmp :ne ret-lab)
         (loadw value object symbol-value-slot other-pointer-lowtag)
@@ -181,7 +187,8 @@
   (:generator 9
     (let ((check-unbound-label (gen-label)))
       (loadw value object symbol-tls-index-slot other-pointer-lowtag)
-      (inst mov value (make-ea :dword :base value) :fs)
+      (with-tls-ea (EA :base value :base-already-live-p t)
+        (inst mov value EA :maybe-fs))
       (inst cmp value no-tls-value-marker-widetag)
       (inst jmp :ne check-unbound-label)
       (loadw value object symbol-value-slot other-pointer-lowtag)
@@ -284,7 +291,7 @@
       (loadw tls-index symbol symbol-tls-index-slot other-pointer-lowtag)
       (inst add bsp (* binding-size n-word-bytes))
       (store-binding-stack-pointer bsp)
-      (inst or tls-index tls-index)
+      (inst test tls-index tls-index)
       (inst jmp :ne tls-index-valid)
       (inst mov tls-index symbol)
       (inst call (make-fixup
@@ -297,10 +304,11 @@
                     (#.esi-offset 'alloc-tls-index-in-esi))
                   :assembly-routine))
       (emit-label tls-index-valid)
-      (inst push (make-ea :dword :base tls-index) :fs)
-      (popw bsp (- binding-value-slot binding-size))
-      (storew symbol bsp (- binding-symbol-slot binding-size))
-      (inst mov (make-ea :dword :base tls-index) val :fs))))
+      (with-tls-ea (EA :base tls-index :base-already-live-p t)
+        (inst push EA :maybe-fs)
+        (popw bsp (- binding-value-slot binding-size))
+        (storew symbol bsp (- binding-symbol-slot binding-size))
+        (inst mov EA val :maybe-fs)))))
 
 #!-sb-thread
 (define-vop (bind)
@@ -326,7 +334,8 @@
     (loadw tls-index temp symbol-tls-index-slot other-pointer-lowtag)
     ;; Load VALUE from stack, then restore it to the TLS area.
     (loadw temp bsp (- binding-value-slot binding-size))
-    (inst mov (make-ea :dword :base tls-index) temp :fs)
+    (with-tls-ea (EA :base tls-index :base-already-live-p t)
+      (inst mov EA temp :maybe-fs))
     ;; Zero out the stack.
     (storew 0 bsp (- binding-symbol-slot binding-size))
     (storew 0 bsp (- binding-value-slot binding-size))
@@ -357,7 +366,7 @@
 
     LOOP
     (loadw symbol bsp (- binding-symbol-slot binding-size))
-    (inst or symbol symbol)
+    (inst test symbol symbol)
     (inst jmp :z skip)
     ;; Bind stack debug sentinels have the unbound marker in the symbol slot
     (inst cmp symbol unbound-marker-widetag)
@@ -367,7 +376,8 @@
 
     #!+sb-thread (loadw
                   tls-index symbol symbol-tls-index-slot other-pointer-lowtag)
-    #!+sb-thread (inst mov (make-ea :dword :base tls-index) value :fs)
+    #!+sb-thread (with-tls-ea (EA :base tls-index :base-already-live-p t)
+                   (inst mov EA value :maybe-fs))
     (storew 0 bsp (- binding-symbol-slot binding-size))
 
     SKIP
@@ -418,6 +428,12 @@
 
 (define-vop (closure-init slot-set)
   (:variant closure-info-offset fun-pointer-lowtag))
+
+(define-vop (closure-init-from-fp)
+  (:args (object :scs (descriptor-reg)))
+  (:info offset)
+  (:generator 4
+    (storew ebp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; value cell hackery
 
@@ -504,7 +520,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (inst mov value (make-ea-for-raw-slot object index tmp 1))))
 
@@ -522,7 +538,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (inst mov (make-ea-for-raw-slot object index tmp 1) value)
     (move result value)))
@@ -540,8 +556,8 @@
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg immediate))
-         (diff :scs (signed-reg) :target result))
-  (:arg-types * tagged-num signed-num)
+         (diff :scs (unsigned-reg) :target result))
+  (:arg-types * tagged-num unsigned-num)
   (:temporary (:sc unsigned-reg) tmp)
   (:results (result :scs (unsigned-reg)))
   (:result-types unsigned-num)
@@ -549,7 +565,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (inst xadd (make-ea-for-raw-slot object index tmp 1) diff :lock)
     (move result diff)))
@@ -566,7 +582,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (with-empty-tn@fp-top(value)
       (inst fld (make-ea-for-raw-slot object index tmp 1)))))
@@ -585,7 +601,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (unless (zerop (tn-offset value))
       (inst fxch value))
@@ -622,7 +638,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (with-empty-tn@fp-top(value)
       (inst fldd (make-ea-for-raw-slot object index tmp 2)))))
@@ -641,7 +657,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (unless (zerop (tn-offset value))
       (inst fxch value))
@@ -679,7 +695,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (let ((real-tn (complex-single-reg-real-tn value)))
       (with-empty-tn@fp-top (real-tn)
@@ -702,7 +718,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (let ((value-real (complex-single-reg-real-tn value))
           (result-real (complex-single-reg-real-tn result)))
@@ -758,7 +774,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (let ((real-tn (complex-double-reg-real-tn value)))
       (with-empty-tn@fp-top (real-tn)
@@ -781,7 +797,7 @@
     (loadw tmp object 0 instance-pointer-lowtag)
     (inst shr tmp n-widetag-bits)
     (when (sc-is index any-reg)
-      (inst shl tmp 2)
+      (inst shl tmp n-fixnum-tag-bits)
       (inst sub tmp index))
     (let ((value-real (complex-double-reg-real-tn value))
           (result-real (complex-double-reg-real-tn result)))

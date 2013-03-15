@@ -256,18 +256,19 @@
     (make-debug-source
      :compiled (source-info-start-time info)
 
-     :namestring (make-file-info-namestring
-                  (if (pathnamep (file-info-name file-info))
-                      (file-info-name file-info))
-                  file-info)
+     :namestring (or *source-namestring*
+                     (make-file-info-namestring
+                      (if (pathnamep (file-info-name file-info))
+                          (file-info-name file-info))
+                      file-info))
      :created (file-info-write-date file-info)
      :source-root (file-info-source-root file-info)
      :start-positions (coerce-to-smallest-eltype
                        (file-info-positions file-info))
 
      :form (let ((direct-file-info (source-info-file-info info)))
-             (if (eq :lisp (file-info-name direct-file-info))
-                 (elt (file-info-forms direct-file-info) 0)))
+             (when (eq :lisp (file-info-name direct-file-info))
+               (elt (file-info-forms direct-file-info) 0)))
      :function function)))
 
 ;;; Given an arbitrary sequence, coerce it to an unsigned vector if
@@ -348,7 +349,8 @@
   (let* ((name (leaf-debug-name var))
          (save-tn (and tn (tn-save-tn tn)))
          (kind (and tn (tn-kind tn)))
-         (flags 0))
+         (flags 0)
+         (info (lambda-var-arg-info var)))
     (declare (type index flags))
     (when minimal
       (setq flags (logior flags compiled-debug-var-minimal-p))
@@ -365,6 +367,12 @@
       (setq flags (logior flags compiled-debug-var-save-loc-p)))
     (unless (or (zerop id) minimal)
       (setq flags (logior flags compiled-debug-var-id-p)))
+    (when info
+      (case (arg-info-kind info)
+        (:more-context
+         (setq flags (logior flags compiled-debug-var-more-context-p)))
+        (:more-count
+         (setq flags (logior flags compiled-debug-var-more-count-p)))))
     (vector-push-extend flags buffer)
     (unless minimal
       (vector-push-extend name buffer)
@@ -460,27 +468,36 @@
       (if (and od (eq (optional-dispatch-main-entry od) fun))
           (let ((actual-vars (lambda-vars fun))
                 (saw-optional nil))
-            (dolist (arg (optional-dispatch-arglist od))
-              (let ((info (lambda-var-arg-info arg))
-                    (actual (pop actual-vars)))
-                (cond (info
-                       (case (arg-info-kind info)
-                         (:keyword
-                          (res (arg-info-key info)))
-                         (:rest
-                          (res 'rest-arg))
-                         (:more-context
-                          (res 'more-arg))
-                         (:optional
-                          (unless saw-optional
-                            (res 'optional-args)
-                            (setq saw-optional t))))
-                       (res (debug-location-for actual var-locs))
-                       (when (arg-info-supplied-p info)
-                         (res 'supplied-p)
-                         (res (debug-location-for (pop actual-vars) var-locs))))
-                      (t
-                       (res (debug-location-for actual var-locs)))))))
+            (labels ((one-arg (arg)
+                       (let ((info (lambda-var-arg-info arg))
+                             (actual (pop actual-vars)))
+                         (cond (info
+                                (case (arg-info-kind info)
+                                  (:keyword
+                                   (res (arg-info-key info)))
+                                  (:rest
+                                   (let ((more (arg-info-default info)))
+                                     (cond ((and (consp more) (third more))
+                                            (one-arg (first (arg-info-default info)))
+                                            (one-arg (second (arg-info-default info)))
+                                            (return-from one-arg))
+                                           (more
+                                            (setf (arg-info-default info) t)))
+                                     (res 'rest-arg)))
+                                  (:more-context
+                                   (res 'more-arg))
+                                  (:optional
+                                   (unless saw-optional
+                                     (res 'optional-args)
+                                     (setq saw-optional t))))
+                                (res (debug-location-for actual var-locs))
+                                (when (arg-info-supplied-p info)
+                                  (res 'supplied-p)
+                                  (res (debug-location-for (pop actual-vars) var-locs))))
+                                (t
+                                 (res (debug-location-for actual var-locs)))))))
+              (dolist (arg (optional-dispatch-arglist od))
+                (one-arg arg))))
           (dolist (var (lambda-vars fun))
             (res (debug-location-for var var-locs)))))
 
@@ -521,8 +538,9 @@
          (level (if #!+sb-dyncount *collect-dynamic-statistics*
                     #!-sb-dyncount nil
                     (max actual-level 2)
-                    actual-level)))
-    (cond ((zerop level))
+                    actual-level))
+         (toplevel-p (eq :toplevel (compiled-debug-fun-kind dfun))))
+    (cond ((or (zerop level) toplevel-p))
           ((and (<= level 1)
                 (let ((od (lambda-optional-dispatch fun)))
                   (or (not od)
@@ -536,7 +554,7 @@
            (setf (compiled-debug-fun-arguments dfun)
                  (compute-args fun var-locs))))
 
-    (if (>= level 2)
+    (if (and (>= level 2) (not toplevel-p))
         (multiple-value-bind (blocks tlf-num)
             (compute-debug-blocks fun var-locs)
           (setf (compiled-debug-fun-tlf-number dfun) tlf-num)

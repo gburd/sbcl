@@ -33,7 +33,7 @@
 
 (define-move-fun (load-character 1) (vop x y)
   ((immediate) (character-reg))
-  (inst li y (char-code (tn-value x))))
+  (inst lr y (char-code (tn-value x))))
 
 (define-move-fun (load-system-area-pointer 1) (vop x y)
   ((immediate) (sap-reg))
@@ -167,12 +167,8 @@
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 4
     (let ((done (gen-label)))
-      (inst andi. temp x 3)
-      (sc-case y
-        (signed-reg
-         (inst srawi y x 2))
-        (unsigned-reg
-         (inst srwi y x 2)))
+      (inst andi. temp x fixnum-tag-mask)
+      (inst srawi y x n-fixnum-tag-bits)
 
       (inst beq done)
       (loadw y x bignum-digits-offset other-pointer-lowtag)
@@ -189,7 +185,7 @@
   (:result-types tagged-num)
   (:note "fixnum tagging")
   (:generator 1
-    (inst slwi y x 2)))
+    (inst slwi y x n-fixnum-tag-bits)))
 (define-move-vop move-from-word/fixnum :move
   (signed-reg unsigned-reg) (any-reg descriptor-reg))
 
@@ -207,7 +203,7 @@
       (inst mtxer zero-tn)              ; clear sticky overflow bit in XER, CR0
       (inst addo temp x x)              ; set XER OV if top two bits differ
       (inst addo. temp temp temp)       ; set CR0 SO if any top three bits differ
-      (inst slwi y x 2)                 ; assume fixnum (tagged ok, maybe lost some high bits)
+      (inst slwi y x n-fixnum-tag-bits) ; assume fixnum (tagged ok, maybe lost some high bits)
       (inst bns done)
 
       (with-fixed-allocation (y pa-flag temp bignum-widetag (1+ bignum-digits-offset))
@@ -229,8 +225,8 @@
     (move x arg)
     (let ((done (gen-label))
           (one-word (gen-label)))
-      (inst srawi. temp x 29)
-      (inst slwi y x 2)
+      (inst srawi. temp x n-positive-fixnum-bits)
+      (inst slwi y x n-fixnum-tag-bits)
       (inst beq done)
 
       (with-fixed-allocation

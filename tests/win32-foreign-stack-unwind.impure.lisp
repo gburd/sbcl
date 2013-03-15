@@ -11,7 +11,8 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#-win32 (quit :unix-status 104) ;; This is extremely win32-specific.
+#-win32 (exit :code 104) ;; This is extremely win32-specific.
+#-x86   (exit :code 104) ;; And our AMD64 backend does not aim to support it.
 
 (use-package :sb-alien)
 
@@ -19,9 +20,9 @@
 ;;; go away.
 (import 'sb-alien::alien-lambda)
 
+;;; XXX XXX this should change to use run-compiler.sh, now that we have it
 (defun run-compiler ()
-  (let ((proc (run-program "gcc" '("win32-stack-unwind.c"
-                                   "-mno-cygwin" "-shared"
+  (let ((proc (run-program "gcc" '("win32-stack-unwind.c" "-shared"
                                    "-o" "win32-stack-unwind.dll")
                            :search t)))
     (unless (zerop (process-exit-code proc))

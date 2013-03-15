@@ -39,28 +39,6 @@
         (size (primitive-object-size obj)))
     (cond
      ((not lowtag))
-     (;; KLUDGE described in dan_b message "Another one for the
-      ;; collection [bug 108]" (sbcl-devel 2004-01-22)
-      ;;
-      ;; In a freshly started SBCL 0.8.7.20ish, (TIME (ROOM T))  causes
-      ;;   debugger invoked on a SB-INT:BUG in thread 5911:
-      ;;     failed AVER: "(SAP= CURRENT END)"
-      ;; [WHN: Similar things happened on one but not the other of my
-      ;; machines when I just run ROOM a lot in a loop.]
-      ;;
-      ;; This appears to be due to my [DB] abuse of the primitive
-      ;; object macros to define a thread object that shares a lowtag
-      ;; with fixnums and has no widetag: it looks like the code that
-      ;; generates *META-ROOM-INFO* infers from this that even fixnums
-      ;; are thread-sized - probably undesirable.
-      ;;
-      ;; This [the fix; the EQL NAME 'THREAD clause here] is more in the
-      ;; nature of a workaround than a really good fix. I'm not sure
-      ;; what a really good fix is: I /think/ it's probably to remove
-      ;; the :LOWTAG option in DEFINE-PRIMITIVE-OBJECT THREAD, then teach
-      ;; genesis to generate the necessary OBJECT_SLOT_OFFSET macros
-      ;; for assembly source in the runtime/genesis/*.h files.
-      (eql name 'thread))
      ((not widetag)
       (let ((info (make-room-info :name name
                                   :kind :lowtag))
@@ -103,15 +81,13 @@
                  (simple-array-unsigned-byte-16-widetag . 1)
                  (simple-array-unsigned-byte-31-widetag . 2)
                  (simple-array-unsigned-byte-32-widetag . 2)
-                 (simple-array-unsigned-byte-60-widetag . 3)
+                 (simple-array-unsigned-fixnum-widetag . #.sb!vm:word-shift)
                  (simple-array-unsigned-byte-63-widetag . 3)
                  (simple-array-unsigned-byte-64-widetag . 3)
                  (simple-array-signed-byte-8-widetag . 0)
                  (simple-array-signed-byte-16-widetag . 1)
-                 (simple-array-unsigned-byte-29-widetag . 2)
-                 (simple-array-signed-byte-30-widetag . 2)
+                 (simple-array-fixnum-widetag . #.sb!vm:word-shift)
                  (simple-array-signed-byte-32-widetag . 2)
-                 (simple-array-signed-byte-61-widetag . 3)
                  (simple-array-signed-byte-64-widetag . 3)
                  (simple-array-single-float-widetag . 2)
                  (simple-array-double-float-widetag . 3)
@@ -153,6 +129,10 @@
       (make-room-info :name 'instance
                       :kind :instance))
 
+(setf (svref *meta-room-info* funcallable-instance-header-widetag)
+      (make-room-info :name 'funcallable-instance
+                      :kind :closure))
+
 ) ; EVAL-WHEN
 
 (defparameter *room-info* '#.*meta-room-info*)
@@ -171,10 +151,10 @@
   (ecase space
     (:static
      (values (int-sap static-space-start)
-             (int-sap (* *static-space-free-pointer* n-word-bytes))))
+             (int-sap (ash *static-space-free-pointer* n-fixnum-tag-bits))))
     (:read-only
      (values (int-sap read-only-space-start)
-             (int-sap (* *read-only-space-free-pointer* n-word-bytes))))
+             (int-sap (ash *read-only-space-free-pointer* n-fixnum-tag-bits))))
     (:dynamic
      (values (int-sap (current-dynamic-space-start))
              (dynamic-space-free-pointer)))))
@@ -212,19 +192,19 @@
 (progn
   (define-alien-type (struct page)
       (struct page
-              (start long)
+              (start signed)
               ;; On platforms with small enough GC pages, this field
               ;; will be a short. On platforms with larger ones, it'll
               ;; be an int.
               (bytes-used (unsigned
-                           #.(if (typep sb!vm:gencgc-page-bytes
+                           #.(if (typep sb!vm:gencgc-card-bytes
                                         '(unsigned-byte 16))
                                  16
                                  32)))
               (flags (unsigned 8))
               (gen (signed 8))))
   (declaim (inline find-page-index))
-  (define-alien-routine "find_page_index" long (index long))
+  (define-alien-routine "find_page_index" long (index signed))
   (define-alien-variable "page_table" (* (struct page))))
 
 ;;; Iterate over all the objects allocated in SPACE, calling FUN with
@@ -236,6 +216,7 @@
 #!-sb-fluid (declaim (maybe-inline map-allocated-objects))
 (defun map-allocated-objects (fun space &optional careful)
   (declare (type function fun) (type spaces space))
+  (declare (optimize (sb!c:alien-funcall-saves-fp-and-pc 0)))
   (flet ((make-obj (tagged-address)
            (if careful
                (make-lisp-obj tagged-address nil)
@@ -265,7 +246,7 @@
                    (maybe-skip-page ()
                      #!+gencgc
                      (when (eq space :dynamic)
-                       (loop with page-mask = #.(1- sb!vm:gencgc-page-bytes)
+                       (loop with page-mask = #.(1- sb!vm:gencgc-card-bytes)
                              for addr of-type sb!vm:word = (sap-int current)
                              while (>= addr skip-tests-until-addr)
                              do
@@ -286,8 +267,8 @@
                                  ;; pointer is still below the allocation offset
                                  ;; of the page
                                  (when (and (not (zerop alloc-flag))
-                                            (<= (logand page-mask addr)
-                                                bytes-used))
+                                            (< (logand page-mask addr)
+                                               bytes-used))
                                    ;; Don't bother testing again until we
                                    ;; get past that allocation offset
                                    (setf skip-tests-until-addr
@@ -297,7 +278,7 @@
                                    (return-from maybe-skip-page))
                                  ;; Move CURRENT to start of next page.
                                  (setf current (int-sap (+ (logandc2 addr page-mask)
-                                                           sb!vm:gencgc-page-bytes)))
+                                                           sb!vm:gencgc-card-bytes)))
                                  (maybe-finish-mapping))))))
                    (maybe-map (obj obj-tag n-obj-bytes &optional (ok t))
                      (let ((next (typecase n-obj-bytes
@@ -327,7 +308,7 @@
                                 list-pointer-lowtag
                                 (* cons-size n-word-bytes)
                                 ok)))
-                  ((eql header-widetag closure-header-widetag)
+                  ((eq (room-info-kind info) :closure)
                    (let* ((obj (%make-lisp-obj (logior (sap-int current)
                                                        fun-pointer-lowtag)))
                           (size (round-to-dualword
@@ -573,7 +554,6 @@
              #.simple-array-unsigned-byte-32-widetag
              #.simple-array-signed-byte-8-widetag
              #.simple-array-signed-byte-16-widetag
-             ;; #.simple-array-signed-byte-30-widetag
              #.simple-array-signed-byte-32-widetag
              #.simple-array-single-float-widetag
              #.simple-array-double-float-widetag
@@ -783,6 +763,26 @@
              (return-from list-allocated-objects res))))
        space)
       res)))
+
+;;; Calls FUNCTION with all object that have (possibly conservative)
+;;; references to them on current stack.
+(defun map-stack-references (function)
+  (let ((end
+         (sb!di::descriptor-sap
+          #!+stack-grows-downward-not-upward *control-stack-end*
+          #!-stack-grows-downward-not-upward *control-stack-start*))
+        (sp (current-sp))
+        (seen nil))
+    (loop until #!+stack-grows-downward-not-upward (sap> sp end)
+                #!-stack-grows-downward-not-upward (sap< sp end)
+          do (multiple-value-bind (obj ok) (make-lisp-obj (sap-ref-word sp 0) nil)
+               (when (and ok (typep obj '(not (or fixnum character))))
+                 (unless (member obj seen :test #'eq)
+                   (funcall function obj)
+                   (push obj seen))))
+             (setf sp
+                   #!+stack-grows-downward-not-upward (sap+ sp n-word-bytes)
+                   #!-stack-grows-downward-not-upward (sap+ sp (- n-word-bytes))))))
 
 (defun map-referencing-objects (fun space object)
   (declare (type spaces space) (inline map-allocated-objects))

@@ -80,6 +80,15 @@
                    use))))
     (plu lvar)))
 
+(defun principal-lvar-dest (lvar)
+  (labels ((pld (lvar)
+             (declare (type lvar lvar))
+             (let ((dest (lvar-dest lvar)))
+               (if (cast-p dest)
+                   (pld (cast-lvar dest))
+                   dest))))
+    (pld lvar)))
+
 ;;; Update lvar use information so that NODE is no longer a use of its
 ;;; LVAR.
 ;;;
@@ -148,6 +157,16 @@
             (eq (ctran-next it) dest))
            (t (eq (block-start (first (block-succ (node-block node))))
                   (node-prev dest))))))
+
+;;; Returns the defined (usually untrusted) type of the combination,
+;;; or NIL if we couldn't figure it out.
+(defun combination-defined-type (combination)
+  (let ((use (principal-lvar-use (basic-combination-fun combination))))
+    (or (when (ref-p use)
+          (let ((type (leaf-defined-type (ref-leaf use))))
+            (when (fun-type-p type)
+              (fun-type-returns type))))
+        *wild-type*)))
 
 ;;; Return true if LVAR destination is executed after node with only
 ;;; uninteresting nodes intervening.
@@ -446,21 +465,40 @@
 
 ;;;; DYNAMIC-EXTENT related
 
+(defun lambda-var-original-name (leaf)
+  (let ((home (lambda-var-home leaf)))
+    (if (eq :external (functional-kind home))
+        (let* ((entry (functional-entry-fun home))
+               (p (1- (position leaf (lambda-vars home)))))
+          (leaf-debug-name
+           (if (optional-dispatch-p entry)
+               (elt (optional-dispatch-arglist entry) p)
+               (elt (lambda-vars entry) p))))
+        (leaf-debug-name leaf))))
+
 (defun note-no-stack-allocation (lvar &key flush)
   (do-uses (use (principal-lvar lvar))
     (unless (or
              ;; Don't complain about not being able to stack allocate constants.
              (and (ref-p use) (constant-p (ref-leaf use)))
              ;; If we're flushing, don't complain if we can flush the combination.
-             (and flush (combination-p use) (flushable-combination-p use)))
+             (and flush (combination-p use) (flushable-combination-p use))
+             ;; Don't report those with homes in :OPTIONAL -- we'd get doubled
+             ;; reports that way.
+             (and (ref-p use) (lambda-var-p (ref-leaf use))
+                  (eq :optional (lambda-kind (lambda-var-home (ref-leaf use))))))
+      ;; FIXME: For the first leg (lambda-bind (lambda-var-home ...))
+      ;; would be a far better description, but since we use
+      ;; *COMPILER-ERROR-CONTEXT* for muffling we can't -- as that node
+      ;; can have different handled conditions.
       (let ((*compiler-error-context* use))
-        (compiler-notify "could not stack allocate the result of ~S"
-                         (find-original-source (node-source-path use)))))))
+        (if (and (ref-p use) (lambda-var-p (ref-leaf use)))
+            (compiler-notify "~@<could~2:I not stack allocate ~S in: ~S~:@>"
+                             (lambda-var-original-name (ref-leaf use))
+                             (find-original-source (node-source-path use)))
+            (compiler-notify "~@<could~2:I not stack allocate: ~S~:@>"
+                             (find-original-source (node-source-path use))))))))
 
-(declaim (ftype (sfunction (node (member nil t :truly) &optional (or null component))
-                           boolean) use-good-for-dx-p))
-(declaim (ftype (sfunction (lvar (member nil t :truly) &optional (or null component))
-                           boolean) lvar-good-for-dx-p))
 (defun use-good-for-dx-p (use dx &optional component)
   ;; FIXME: Can casts point to LVARs in other components?
   ;; RECHECK-DYNAMIC-EXTENT-LVARS assumes that they can't -- that is, that the
@@ -531,21 +569,37 @@
                        (when (lambda-p clambda1)
                          (dolist (var (lambda-vars clambda1) t)
                            (dolist (var-ref (lambda-var-refs var))
-                             (let ((dest (lvar-dest (ref-lvar var-ref))))
+                             (let ((dest (principal-lvar-dest (ref-lvar var-ref))))
                                (unless (and (combination-p dest) (recurse dest))
                                  (return-from combination-args-flow-cleanly-p nil)))))))))))
     (recurse combination1)))
 
+(defun ref-good-for-dx-p (ref)
+ (let* ((lvar (ref-lvar ref))
+        (dest (when lvar (lvar-dest lvar))))
+   (and (combination-p dest)
+        (eq :known (combination-kind dest))
+        (awhen (combination-fun-info dest)
+          (or (ir1-attributep (fun-info-attributes it) dx-safe)
+              (and (not (combination-lvar dest))
+                   (awhen (fun-info-result-arg it)
+                     (eql lvar (nth it (combination-args dest))))))))))
+
 (defun trivial-lambda-var-ref-p (use)
   (and (ref-p use)
        (let ((var (ref-leaf use)))
-         ;; lambda-var, no SETS
-         (when (and (lambda-var-p var) (not (lambda-var-sets var)))
+         ;; lambda-var, no SETS, not explicitly indefinite-extent.
+         (when (and (lambda-var-p var) (not (lambda-var-sets var))
+                    (neq :indefinite (lambda-var-extent var)))
            (let ((home (lambda-var-home var))
                  (refs (lambda-var-refs var)))
-             ;; bound by a system lambda, no other REFS
+             ;; bound by a non-XEP system lambda, no other REFS that aren't
+             ;; DX-SAFE, or are result-args when the result is discarded.
              (when (and (lambda-system-lambda-p home)
-                        (eq use (car refs)) (not (cdr refs)))
+                        (neq :external (lambda-kind home))
+                        (dolist (ref refs t)
+                          (unless (or (eq use ref) (ref-good-for-dx-p ref))
+                            (return nil))))
                ;; the LAMBDA this var is bound by has only a single REF, going
                ;; to a combination
                (let* ((lambda-refs (lambda-refs home))
@@ -556,16 +610,15 @@
 
 (defun trivial-lambda-var-ref-lvar (use)
   (let* ((this (ref-leaf use))
-         (home (lambda-var-home this)))
-    (multiple-value-bind (fun vars)
-        (values home (lambda-vars home))
-      (let* ((combination (lvar-dest (ref-lvar (car (lambda-refs fun)))))
-             (args (combination-args combination)))
-        (assert (= (length vars) (length args)))
-        (loop for var in vars
-              for arg in args
-              when (eq var this)
-              return arg)))))
+         (fun (lambda-var-home this))
+         (vars (lambda-vars fun))
+         (combination (lvar-dest (ref-lvar (car (lambda-refs fun)))))
+         (args (combination-args combination)))
+    (aver (= (length vars) (length args)))
+    (loop for var in vars
+          for arg in args
+          when (eq var this)
+          return arg)))
 
 ;;; This needs to play nice with LVAR-GOOD-FOR-DX-P and friends.
 (defun handle-nested-dynamic-extent-lvars (dx lvar &optional recheck-component)
@@ -793,7 +846,7 @@
         (reoptimize-lvar prev)))
 
 ;;; Return a new LEXENV just like DEFAULT except for the specified
-;;; slot values. Values for the alist slots are NCONCed to the
+;;; slot values. Values for the alist slots are APPENDed to the
 ;;; beginning of the current value, rather than replacing it entirely.
 (defun make-lexenv (&key (default *lexenv*)
                          funs vars blocks tags
@@ -808,7 +861,7 @@
   (macrolet ((frob (var slot)
                `(let ((old (,slot default)))
                   (if ,var
-                      (nconc ,var old)
+                      (append ,var old)
                       old))))
     (internal-make-lexenv
      (frob funs lexenv-funs)
@@ -1052,6 +1105,7 @@
 (defun delete-lambda-var (leaf)
   (declare (type lambda-var leaf))
 
+  (setf (lambda-var-deleted leaf) t)
   ;; Iterate over all local calls flushing the corresponding argument,
   ;; allowing the computation of the argument to be deleted. We also
   ;; mark the LET for reoptimization, since it may be that we have
@@ -1258,11 +1312,32 @@
 
 ;;; Return functional for DEFINED-FUN which has been converted in policy
 ;;; corresponding to the current one, or NIL if no such functional exists.
+;;;
+;;; Also check that the parent of the functional is visible in the current
+;;; environment.
 (defun defined-fun-functional (defined-fun)
-  (let ((policy (lexenv-%policy *lexenv*)))
-    (dolist (functional (defined-fun-functionals defined-fun))
-      (when (equal policy (lexenv-%policy (functional-lexenv functional)))
-        (return functional)))))
+  (let ((functionals (defined-fun-functionals defined-fun)))
+    (when functionals
+      (let* ((sample (car functionals))
+             (there (lambda-parent (if (lambda-p sample)
+                                       sample
+                                       (optional-dispatch-main-entry sample)))))
+        (when there
+          (labels ((lookup (here)
+                     (unless (eq here there)
+                       (if here
+                           (lookup (lambda-parent here))
+                           ;; We looked up all the way up, and didn't find the parent
+                           ;; of the functional -- therefore it is nested in a lambda
+                           ;; we don't see, so return nil.
+                           (return-from defined-fun-functional nil)))))
+            (lookup (lexenv-lambda *lexenv*)))))
+      ;; Now find a functional whose policy matches the current one, if we already
+      ;; have one.
+      (let ((policy (lexenv-%policy *lexenv*)))
+        (dolist (functional functionals)
+          (when (equal policy (lexenv-%policy (functional-lexenv functional)))
+            (return functional)))))))
 
 ;;; Do stuff to delete the semantic attachments of a REF node. When
 ;;; this leaves zero or one reference, we do a type dispatch off of
@@ -1283,7 +1358,8 @@
                  (aver (null (functional-entry-fun leaf)))
                  (delete-lambda leaf))
                 (:external
-                 (delete-lambda leaf))
+                 (unless (functional-has-external-references-p leaf)
+                   (delete-lambda leaf)))
                 ((:deleted :zombie :optional))))
              (optional-dispatch
               (unless (eq (functional-kind leaf) :deleted)
@@ -2035,6 +2111,15 @@ is :ANY, the function name is not checked."
               (memq (functional-kind functional) '(:deleted :zombie))))
     (throw 'locall-already-let-converted functional)))
 
+(defun assure-leaf-live-p (leaf)
+  (typecase leaf
+    (lambda-var
+     (when (lambda-var-deleted leaf)
+       (throw 'locall-already-let-converted leaf)))
+    (functional
+     (assure-functional-live-p leaf))))
+
+
 (defun call-full-like-p (call)
   (declare (type combination call))
   (let ((kind (basic-combination-kind call)))
@@ -2178,20 +2263,41 @@ is :ANY, the function name is not checked."
                (setf (block-reoptimize (node-block node)) t)
                (reoptimize-component (node-component node) :maybe)))))))
 
-;;; Return true if LVAR's only use is a non-NOTINLINE reference to a
-;;; global function with one of the specified NAMES.
+;;; Return true if LVAR's only use is a reference to a global function
+;;; designator with one of the specified NAMES, that hasn't been
+;;; declared NOTINLINE.
 (defun lvar-fun-is (lvar names)
   (declare (type lvar lvar) (list names))
   (let ((use (lvar-uses lvar)))
     (and (ref-p use)
-         (let ((leaf (ref-leaf use)))
-           (and (global-var-p leaf)
-                (eq (global-var-kind leaf) :global-function)
-                (not (null (member (leaf-source-name leaf) names
-                                   :test #'equal))))))))
+         (let* ((*lexenv* (node-lexenv use))
+                (leaf (ref-leaf use))
+                (name
+                 (cond ((global-var-p leaf)
+                        ;; Case 1: #'NAME
+                        (and (eq (global-var-kind leaf) :global-function)
+                             (car (member (leaf-source-name leaf) names
+                                          :test #'equal))))
+                       ((constant-p leaf)
+                        (let ((value (constant-value leaf)))
+                          (car (if (functionp value)
+                                   ;; Case 2: #.#'NAME
+                                   (member value names
+                                           :key (lambda (name)
+                                                  (and (fboundp name)
+                                                       (fdefinition name)))
+                                           :test #'eq)
+                                   ;; Case 3: 'NAME
+                                   (member value names
+                                           :test #'equal))))))))
+           (and name
+                (not (fun-lexically-notinline-p name)))))))
 
+;;; Return true if LVAR's only use is a call to one of the named functions
+;;; (or any function if none are specified) with the specified number of
+;;; of arguments (or any number if number is not specified)
 (defun lvar-matches (lvar &key fun-names arg-count)
-  (let ((use (lvar-use lvar)))
+  (let ((use (lvar-uses lvar)))
     (and (combination-p use)
          (or (not fun-names)
              (multiple-value-bind (name ok)
@@ -2199,3 +2305,21 @@ is :ANY, the function name is not checked."
                (and ok (member name fun-names :test #'eq))))
          (or (not arg-count)
              (= arg-count (length (combination-args use)))))))
+
+;;; True if the optional has a rest-argument.
+(defun optional-rest-p (opt)
+  (dolist (var (optional-dispatch-arglist opt) nil)
+    (let* ((info (when (lambda-var-p var)
+                   (lambda-var-arg-info var)))
+           (kind (when info
+                   (arg-info-kind info))))
+      (when (eq :rest kind)
+        (return t)))))
+
+;;; Don't substitute single-ref variables on high-debug / low speed, to
+;;; improve the debugging experience. ...but don't bother keeping those
+;;; from system lambdas.
+(defun preserve-single-use-debug-var-p (call var)
+  (and (policy call (eql preserve-single-use-debug-variables 3))
+       (or (not (lambda-var-p var))
+           (not (lambda-system-lambda-p (lambda-var-home var))))))

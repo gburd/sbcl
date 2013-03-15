@@ -62,6 +62,9 @@
 ;;; should live in SB-SYS or even SB-EXT?
 
 (defmacro syscall ((name &rest arg-types) success-form &rest args)
+  (when (eql 3 (mismatch "[_]" name))
+    (setf name
+          (concatenate 'string #!+win32 "_" (subseq name 3))))
   `(locally
     (declare (optimize (sb!c::float-accuracy 0)))
     (let ((result (alien-funcall (extern-alien ,name (function int ,@arg-types))
@@ -111,7 +114,7 @@ SYSCALL-FORM. Repeat evaluation of SYSCALL-FORM if it is interrupted."
 (define-alien-routine ("getenv" posix-getenv) c-string
   "Return the \"value\" part of the environment string \"name=value\" which
 corresponds to NAME, or NIL if there is none."
-  (name c-string))
+  (name (c-string :not-null t)))
 
 ;;; from stdio.h
 
@@ -120,7 +123,9 @@ corresponds to NAME, or NIL if there is none."
 #!-win32
 (defun unix-rename (name1 name2)
   (declare (type unix-pathname name1 name2))
-  (void-syscall ("rename" c-string c-string) name1 name2))
+  (void-syscall ("rename" (c-string :not-null t)
+                          (c-string :not-null t))
+                name1 name2))
 
 ;;; from sys/types.h and gnu/types.h
 
@@ -131,10 +136,7 @@ corresponds to NAME, or NIL if there is none."
 ;;; is not extreme enough, since it doesn't need to be blindingly
 ;;; fast: we can just implement those functions in C as a wrapper
 ;;; layer.
-(define-alien-type fd-mask unsigned-long)
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant fd-setsize 1024))
+(define-alien-type fd-mask unsigned)
 
 (define-alien-type nil
   (struct fd-set
@@ -159,19 +161,23 @@ corresponds to NAME, or NIL if there is none."
   (declare (type unix-pathname path)
            (type fixnum flags)
            (type unix-file-mode mode))
-  (int-syscall ("open" c-string int int)
-               path
-               (logior #!+win32 o_binary
-                       #!+largefile o_largefile
-                       flags)
-               mode))
+  #!+win32 (sb!win32:unixlike-open path flags mode)
+  #!-win32
+  (with-restarted-syscall (value errno)
+    (int-syscall ("open" c-string int int)
+                 path
+                 (logior #!+win32 o_binary
+                         #!+largefile o_largefile
+                         flags)
+                 mode)))
 
 ;;; UNIX-CLOSE accepts a file descriptor and attempts to close the file
 ;;; associated with it.
 (/show0 "unix.lisp 391")
 (defun unix-close (fd)
-  (declare (type unix-fd fd))
-  (void-syscall ("close" int) fd))
+  #!+win32 (sb!win32:unixlike-close fd)
+  #!-win32 (declare (type unix-fd fd))
+  #!-win32 (void-syscall ("close" int) fd))
 
 ;;;; stdlib.h
 
@@ -194,7 +200,8 @@ corresponds to NAME, or NIL if there is none."
                                mode)))
         (if (minusp fd)
             (values nil (get-errno))
-            (values fd (octets-to-string template-buffer)))))))
+            (values #!-win32 fd #!+win32 (sb!win32::duplicate-and-unwrap-fd fd)
+                    (octets-to-string template-buffer)))))))
 
 ;;;; timebits.h
 
@@ -273,17 +280,24 @@ corresponds to NAME, or NIL if there is none."
 (defun unix-access (path mode)
   (declare (type unix-pathname path)
            (type (mod 8) mode))
-  (void-syscall ("access" c-string int) path mode))
+  (void-syscall ("[_]access" c-string int) path mode))
 
 ;;; values for the second argument to UNIX-LSEEK
+;;; Note that nowadays these are called SEEK_SET, SEEK_CUR, and SEEK_END
 (defconstant l_set 0) ; to set the file pointer
 (defconstant l_incr 1) ; to increment the file pointer
 (defconstant l_xtnd 2) ; to extend the file size
 
+;; off_t is 32 bit on Windows, yet our functions support 64 bit seeks.
+(define-alien-type unix-offset
+  #!-win32 off-t
+  #!+win32 (signed 64))
+
 ;;; Is a stream interactive?
 (defun unix-isatty (fd)
   (declare (type unix-fd fd))
-  (int-syscall ("isatty" int) fd))
+  #!-win32 (int-syscall ("isatty" int) fd)
+  #!+win32 (sb!win32::windows-isatty fd))
 
 (defun unix-lseek (fd offset whence)
   "Unix-lseek accepts a file descriptor and moves the file pointer by
@@ -295,10 +309,13 @@ corresponds to NAME, or NIL if there is none."
   "
   (declare (type unix-fd fd)
            (type (integer 0 2) whence))
-  (let ((result (alien-funcall (extern-alien #!-largefile "lseek"
+  (let ((result
+         #!-win32
+          (alien-funcall (extern-alien #!-largefile "lseek"
                                              #!+largefile "lseek_largefile"
                                              (function off-t int off-t int))
-                 fd offset whence)))
+                        fd offset whence)
+          #!+win32 (sb!win32:lseeki64 fd offset whence)))
     (if (minusp result)
         (values nil (get-errno))
       (values result 0))))
@@ -314,7 +331,8 @@ corresponds to NAME, or NIL if there is none."
 (defun unix-read (fd buf len)
   (declare (type unix-fd fd)
            (type (unsigned-byte 32) len))
-  (int-syscall ("read" int (* char) int) fd buf len))
+  (int-syscall (#!-win32 "read" #!+win32 "win32_unix_read"
+                int (* char) int) fd buf len))
 
 ;;; UNIX-WRITE accepts a file descriptor, a buffer, an offset, and the
 ;;; length to write. It attempts to write len bytes to the device
@@ -325,7 +343,8 @@ corresponds to NAME, or NIL if there is none."
            (type (unsigned-byte 32) offset len))
   (flet ((%write (sap)
            (declare (system-area-pointer sap))
-           (int-syscall ("write" int (* char) int)
+           (int-syscall (#!-win32 "write" #!+win32 "win32_unix_write"
+                         int (* char) int)
                         fd
                         (with-alien ((ptr (* char) sap))
                           (addr (deref ptr offset)))
@@ -348,15 +367,10 @@ corresponds to NAME, or NIL if there is none."
     (syscall ("pipe" (* int))
              (values (deref fds 0) (deref fds 1))
              (cast fds (* int)))))
-#!+win32
-(defun msvcrt-raw-pipe (fds size mode)
-  (syscall ("_pipe" (* int) int int)
-           (values (deref fds 0) (deref fds 1))
-           (cast fds (* int)) size mode))
+
 #!+win32
 (defun unix-pipe ()
-  (with-alien ((fds (array int 2)))
-    (msvcrt-raw-pipe fds 256 o_binary)))
+  (sb!win32::windows-pipe))
 
 ;; Windows mkdir() doesn't take the mode argument. It's cdecl, so we could
 ;; actually call it passing the mode argument, but some sharp-eyed reader
@@ -419,6 +433,7 @@ corresponds to NAME, or NIL if there is none."
 ;;; Duplicate an existing file descriptor (given as the argument) and
 ;;; return it. If FD is not a valid file descriptor, NIL and an error
 ;;; number are returned.
+#!-win32
 (defun unix-dup (fd)
   (declare (type unix-fd fd))
   (int-syscall ("dup" int) fd))
@@ -426,12 +441,23 @@ corresponds to NAME, or NIL if there is none."
 ;;; Terminate the current process with an optional error code. If
 ;;; successful, the call doesn't return. If unsuccessful, the call
 ;;; returns NIL and an error number.
-(defun unix-exit (&optional (code 0))
-  (declare (type (signed-byte 32) code))
-  (void-syscall ("exit" int) code))
+(deftype exit-code ()
+  `(signed-byte 32))
+(defun os-exit (code &key abort)
+  #!+sb-doc
+  "Exit the process with CODE. If ABORT is true, exit is performed using _exit(2),
+avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
+  (unless (typep code 'exit-code)
+    (setf code (if abort 1 0)))
+  (if abort
+      (void-syscall ("_exit" int) code)
+      (void-syscall ("exit" int) code)))
+
+(define-deprecated-function :early "1.0.56.55" unix-exit os-exit (code)
+  (os-exit code))
 
 ;;; Return the process id of the current process.
-(define-alien-routine ("getpid" unix-getpid) int)
+(define-alien-routine (#!+win32 "_getpid" #!-win32 "getpid" unix-getpid) int)
 
 ;;; Return the real user id associated with the current process.
 #!-win32
@@ -448,11 +474,18 @@ corresponds to NAME, or NIL if there is none."
 ;;; Return the namestring of the home directory, being careful to
 ;;; include a trailing #\/
 #!-win32
-(defun uid-homedir (uid)
-  (or (newcharstar-string (alien-funcall (extern-alien "uid_homedir"
-                                                       (function (* char) int))
-                                         uid))
-      (error "failed to resolve home directory for Unix uid=~S" uid)))
+(progn
+  (defun uid-homedir (uid)
+    (or (newcharstar-string (alien-funcall (extern-alien "uid_homedir"
+                                                         (function (* char) int))
+                                           uid))
+        (error "failed to resolve home directory for Unix uid=~S" uid)))
+
+  (defun user-homedir (uid)
+    (or (newcharstar-string (alien-funcall (extern-alien "user_homedir"
+                                                         (function (* char) c-string))
+                                           uid))
+        (error "failed to resolve home directory for Unix uid=~S" uid))))
 
 ;;; Invoke readlink(2) on the file name specified by PATH. Return
 ;;; (VALUES LINKSTRING NIL) on success, or (VALUES NIL ERRNO) on
@@ -496,7 +529,7 @@ corresponds to NAME, or NIL if there is none."
 ;;; name and the file if this is the last link.
 (defun unix-unlink (name)
   (declare (type unix-pathname name))
-  (void-syscall ("unlink" c-string) name))
+  (void-syscall ("[_]unlink" c-string) name))
 
 ;;; Return the name of the host machine as a string.
 #!-win32
@@ -573,28 +606,68 @@ corresponds to NAME, or NIL if there is none."
                       (slot usage 'ru-nivcsw))
               who (addr usage))))
 
-;;;; sys/select.h
-
-(defvar *on-dangerous-select* :warn)
+(defvar *on-dangerous-wait* :warn)
 
 ;;; Calling select in a bad place can hang in a nasty manner, so it's better
 ;;; to have some way to detect these.
-(defun note-dangerous-select ()
-  (let ((action *on-dangerous-select*)
-        (*on-dangerous-select* nil))
+(defun note-dangerous-wait (type)
+  (let ((action *on-dangerous-wait*)
+        (*on-dangerous-wait* nil))
     (case action
       (:warn
-       (warn "Starting a select without a timeout while interrupts are ~
-             disabled."))
+       (warn "Starting a ~A without a timeout while interrupts are ~
+             disabled."
+             type))
       (:error
-       (error "Starting a select without a timeout while interrupts are ~
-              disabled."))
+       (error "Starting a ~A without a timeout while interrupts are ~
+              disabled."
+              type))
       (:backtrace
-       (write-line
-        "=== Starting a select without a timeout while interrupts are disabled. ==="
-        *debug-io*)
+       (format *debug-io*
+               "~&=== Starting a ~A without a timeout while interrupts are disabled. ===~%"
+               type)
        (sb!debug:backtrace)))
     nil))
+
+;;;; poll.h
+#!+os-provides-poll
+(progn
+  (define-alien-type nil
+      (struct pollfd
+              (fd      int)
+              (events  short)           ; requested events
+              (revents short)))         ; returned events
+
+  (defun unix-simple-poll (fd direction to-msec)
+    (declare (fixnum fd to-msec))
+    (when (and (minusp to-msec) (not *interrupts-enabled*))
+      (note-dangerous-wait "poll(2)"))
+    (let ((events (ecase direction
+                    (:input (logior pollin pollpri))
+                    (:output pollout))))
+      (with-alien ((fds (struct pollfd)))
+        (with-restarted-syscall (count errno)
+          (progn
+            (setf (slot fds 'fd) fd
+                  (slot fds 'events) events
+                  (slot fds 'revents) 0)
+            (int-syscall ("poll" (* (struct pollfd)) int int)
+                         (addr fds) 1 to-msec))
+          (if (zerop errno)
+              (let ((revents (slot fds 'revents)))
+                (or (and (eql 1 count) (logtest events revents))
+                    (logtest pollhup revents)))
+              (error "Syscall poll(2) failed: ~A" (strerror))))))))
+
+;;;; sys/select.h
+
+(defmacro with-fd-setsize ((n) &body body)
+  `(let ((,n (if (< 0 ,n fd-setsize)
+                 ,n
+                 (error "Cannot select(2) on ~D: above FD_SETSIZE limit."
+                        (1- num-descriptors)))))
+     (declare (type (integer 0 #.fd-setsize) ,n))
+     ,@body))
 
 ;;;; FIXME: Why have both UNIX-SELECT and UNIX-FAST-SELECT?
 
@@ -603,24 +676,25 @@ corresponds to NAME, or NIL if there is none."
 (defun unix-fast-select (num-descriptors
                          read-fds write-fds exception-fds
                          timeout-secs timeout-usecs)
-  (declare (type (integer 0 #.fd-setsize) num-descriptors)
+  (declare (type integer num-descriptors)
            (type (or (alien (* (struct fd-set))) null)
                  read-fds write-fds exception-fds)
            (type (or null (unsigned-byte 31)) timeout-secs timeout-usecs))
-  (flet ((select (tv-sap)
-           (int-syscall ("select" int (* (struct fd-set)) (* (struct fd-set))
-                                  (* (struct fd-set)) (* (struct timeval)))
-                        num-descriptors read-fds write-fds exception-fds
-                        tv-sap)))
-    (cond ((or timeout-secs timeout-usecs)
-           (with-alien ((tv (struct timeval)))
-             (setf (slot tv 'tv-sec) (or timeout-secs 0))
-             (setf (slot tv 'tv-usec) (or timeout-usecs 0))
-             (select (alien-sap (addr tv)))))
-          (t
-           (unless *interrupts-enabled*
-             (note-dangerous-select))
-           (select (int-sap 0))))))
+  (with-fd-setsize (num-descriptors)
+    (flet ((select (tv-sap)
+             (int-syscall ("select" int (* (struct fd-set)) (* (struct fd-set))
+                                    (* (struct fd-set)) (* (struct timeval)))
+                          num-descriptors read-fds write-fds exception-fds
+                          tv-sap)))
+      (cond ((or timeout-secs timeout-usecs)
+             (with-alien ((tv (struct timeval)))
+               (setf (slot tv 'tv-sec) (or timeout-secs 0))
+               (setf (slot tv 'tv-usec) (or timeout-usecs 0))
+               (select (alien-sap (addr tv)))))
+            (t
+             (unless *interrupts-enabled*
+               (note-dangerous-wait "select(2)"))
+             (select (int-sap 0)))))))
 
 ;;; UNIX-SELECT accepts sets of file descriptors and waits for an event
 ;;; to happen on one of them or to time out.
@@ -651,35 +725,95 @@ corresponds to NAME, or NIL if there is none."
 ;;; they are ready for reading and writing. See the UNIX Programmer's
 ;;; Manual for more information.
 (defun unix-select (nfds rdfds wrfds xpfds to-secs &optional (to-usecs 0))
-  (declare (type (integer 0 #.fd-setsize) nfds)
+  (declare (type integer nfds)
            (type unsigned-byte rdfds wrfds xpfds)
            (type (or (unsigned-byte 31) null) to-secs)
            (type (unsigned-byte 31) to-usecs)
            (optimize (speed 3) (safety 0) (inhibit-warnings 3)))
-  (with-alien ((tv (struct timeval))
-               (rdf (struct fd-set))
-               (wrf (struct fd-set))
-               (xpf (struct fd-set)))
-    (cond (to-secs
-           (setf (slot tv 'tv-sec) to-secs
-                 (slot tv 'tv-usec) to-usecs))
-          ((not *interrupts-enabled*)
-           (note-dangerous-select)))
-    (num-to-fd-set rdf rdfds)
-    (num-to-fd-set wrf wrfds)
-    (num-to-fd-set xpf xpfds)
-    (macrolet ((frob (lispvar alienvar)
-                 `(if (zerop ,lispvar)
-                      (int-sap 0)
-                      (alien-sap (addr ,alienvar)))))
-      (syscall ("select" int (* (struct fd-set)) (* (struct fd-set))
-                         (* (struct fd-set)) (* (struct timeval)))
-               (values result
-                       (fd-set-to-num nfds rdf)
-                       (fd-set-to-num nfds wrf)
-                       (fd-set-to-num nfds xpf))
-               nfds (frob rdfds rdf) (frob wrfds wrf) (frob xpfds xpf)
-               (if to-secs (alien-sap (addr tv)) (int-sap 0))))))
+  (with-fd-setsize (nfds)
+    (with-alien ((tv (struct timeval))
+                 (rdf (struct fd-set))
+                 (wrf (struct fd-set))
+                 (xpf (struct fd-set)))
+      (cond (to-secs
+             (setf (slot tv 'tv-sec) to-secs
+                   (slot tv 'tv-usec) to-usecs))
+            ((not *interrupts-enabled*)
+             (note-dangerous-wait "select(2)")))
+      (num-to-fd-set rdf rdfds)
+      (num-to-fd-set wrf wrfds)
+      (num-to-fd-set xpf xpfds)
+      (macrolet ((frob (lispvar alienvar)
+                   `(if (zerop ,lispvar)
+                        (int-sap 0)
+                        (alien-sap (addr ,alienvar)))))
+        (syscall ("select" int (* (struct fd-set)) (* (struct fd-set))
+                           (* (struct fd-set)) (* (struct timeval)))
+                 (values result
+                         (fd-set-to-num nfds rdf)
+                         (fd-set-to-num nfds wrf)
+                         (fd-set-to-num nfds xpf))
+                 nfds (frob rdfds rdf) (frob wrfds wrf) (frob xpfds xpf)
+                 (if to-secs (alien-sap (addr tv)) (int-sap 0)))))))
+
+;;; Lisp-side implmentations of FD_FOO macros. Abandon all hope who enters
+;;; here...
+;;;
+(defmacro fd-set (offset fd-set)
+  (with-unique-names (word bit)
+    `(multiple-value-bind (,word ,bit) (floor ,offset
+                                              sb!vm:n-machine-word-bits)
+       (setf (deref (slot ,fd-set 'fds-bits) ,word)
+             (logior (truly-the (unsigned-byte #.sb!vm:n-machine-word-bits)
+                                (ash 1 ,bit))
+                     (deref (slot ,fd-set 'fds-bits) ,word))))))
+
+(defmacro fd-clr (offset fd-set)
+  (with-unique-names (word bit)
+    `(multiple-value-bind (,word ,bit) (floor ,offset
+                                              sb!vm:n-machine-word-bits)
+       (setf (deref (slot ,fd-set 'fds-bits) ,word)
+             (logand (deref (slot ,fd-set 'fds-bits) ,word)
+                     (sb!kernel:word-logical-not
+                      (truly-the (unsigned-byte #.sb!vm:n-machine-word-bits)
+                                 (ash 1 ,bit))))))))
+
+(defmacro fd-isset (offset fd-set)
+  (with-unique-names (word bit)
+    `(multiple-value-bind (,word ,bit) (floor ,offset
+                                              sb!vm:n-machine-word-bits)
+       (logbitp ,bit (deref (slot ,fd-set 'fds-bits) ,word)))))
+
+(defmacro fd-zero (fd-set)
+  `(progn
+     ,@(loop for index upfrom 0 below (/ fd-setsize sb!vm:n-machine-word-bits)
+         collect `(setf (deref (slot ,fd-set 'fds-bits) ,index) 0))))
+
+#!-os-provides-poll
+(defun unix-simple-poll (fd direction to-msec)
+  (multiple-value-bind (to-sec to-usec)
+      (if (minusp to-msec)
+          (values nil nil)
+          (multiple-value-bind (to-sec to-msec2) (truncate to-msec 1000)
+            (values to-sec (* to-msec2 1000))))
+    (sb!unix:with-restarted-syscall (count errno)
+      (sb!alien:with-alien ((fds (sb!alien:struct sb!unix:fd-set)))
+        (sb!unix:fd-zero fds)
+        (sb!unix:fd-set fd fds)
+        (multiple-value-bind (read-fds write-fds)
+            (ecase direction
+              (:input
+               (values (addr fds) nil))
+              (:output
+               (values nil (addr fds))))
+          (sb!unix:unix-fast-select (1+ fd)
+                                    read-fds write-fds nil
+                                    to-sec to-usec)))
+      (case count
+        ((1) t)
+        ((0) nil)
+        (otherwise
+         (error "Syscall select(2) failed on fd ~D: ~A" fd (strerror)))))))
 
 ;;;; sys/stat.h
 
@@ -767,11 +901,40 @@ corresponds to NAME, or NIL if there is none."
              (%extract-stat-results (addr buf))
              name (addr buf))))
 (defun unix-fstat (fd)
+  #!-win32
   (declare (type unix-fd fd))
-  (with-alien ((buf (struct wrapped_stat)))
-    (syscall ("fstat_wrapper" int (* (struct wrapped_stat)))
-             (%extract-stat-results (addr buf))
-             fd (addr buf))))
+  (#!-win32 funcall #!+win32 sb!win32::call-with-crt-fd
+   (lambda (fd)
+     (with-alien ((buf (struct wrapped_stat)))
+       (syscall ("fstat_wrapper" int (* (struct wrapped_stat)))
+                (%extract-stat-results (addr buf))
+                fd (addr buf))))
+   fd))
+
+#!-win32
+(defun fd-type (fd)
+  (declare (type unix-fd fd))
+  (let ((fmt (logand
+              sb!unix:s-ifmt
+              (or (with-alien ((buf (struct wrapped_stat)))
+                    (syscall ("fstat_wrapper" int (* (struct wrapped_stat)))
+                             (slot buf 'st-mode)
+                             fd (addr buf)))
+                  0))))
+    (cond ((logtest sb!unix:s-ififo fmt)
+           :fifo)
+          ((logtest sb!unix:s-ifchr fmt)
+           :character)
+          ((logtest sb!unix:s-ifdir fmt)
+           :directory)
+          ((logtest sb!unix:s-ifblk fmt)
+           :block)
+          ((logtest sb!unix:s-ifreg fmt)
+           :regular)
+          ((logtest sb!unix:s-ifsock fmt)
+           :socket)
+          (t
+           :unknown))))
 
 ;;;; time.h
 
@@ -808,7 +971,7 @@ corresponds to NAME, or NIL if there is none."
             (tm-zone c-string))) ; Timezone abbreviation.
 
 (define-alien-routine get-timezone sb!alien:void
-  (when sb!alien:long :in)
+  (when time-t :in)
   (seconds-west sb!alien:int :out)
   (daylight-savings-p sb!alien:boolean :out))
 
@@ -816,14 +979,38 @@ corresponds to NAME, or NIL if there is none."
 (defun nanosleep (secs nsecs)
   (with-alien ((req (struct timespec))
                (rem (struct timespec)))
-    (setf (slot req 'tv-sec) secs)
-    (setf (slot req 'tv-nsec) nsecs)
-    (loop while (eql sb!unix:eintr
-                     (nth-value 1
-                                (int-syscall ("nanosleep" (* (struct timespec))
-                                                          (* (struct timespec)))
-                                             (addr req) (addr rem))))
-       do (rotatef req rem))))
+    (setf (slot req 'tv-sec) secs
+          (slot req 'tv-nsec) nsecs)
+    (loop while (and (eql sb!unix:eintr
+                          (nth-value 1
+                                     (int-syscall ("nanosleep" (* (struct timespec))
+                                                               (* (struct timespec)))
+                                                  (addr req) (addr rem))))
+                     ;; KLUDGE: On Darwin, if an interrupt cases nanosleep to
+                     ;; take longer than the requested time, the call will
+                     ;; return with EINT and (unsigned)-1 seconds in the
+                     ;; remainder timespec, which would cause us to enter
+                     ;; nanosleep again for ~136 years. So, we check that the
+                     ;; remainder time is actually decreasing.
+                     ;;
+                     ;; It would be neat to do this bit of defensive
+                     ;; programming on all platforms, but unfortunately on
+                     ;; Linux, REM can be a little higher than REQ if the
+                     ;; nanosleep() call is interrupted quickly enough,
+                     ;; probably due to the request being rounded up to the
+                     ;; nearest HZ. This would cause the sleep to return way
+                     ;; too early.
+                     #!+darwin
+                     (let ((rem-sec (slot rem 'tv-sec))
+                           (rem-nsec (slot rem 'tv-nsec)))
+                       (when (or (> secs rem-sec)
+                                 (and (= secs rem-sec) (>= nsecs rem-nsec)))
+                         ;; Update for next round.
+                         (setf secs  rem-sec
+                               nsecs rem-nsec)
+                         t)))
+          do (setf (slot req 'tv-sec) (slot rem 'tv-sec)
+                   (slot req 'tv-nsec) (slot rem 'tv-nsec)))))
 
 (defun unix-get-seconds-west (secs)
   (multiple-value-bind (ignore seconds dst) (get-timezone secs)
@@ -1094,43 +1281,3 @@ the UNIX epoch (January 1st 1970.)"
 ;;;; the headers that may or may not be the same thing. To be
 ;;;; investigated. -- CSR, 2002-03-25
 (defconstant wstopped #o177)
-
-
-;;;; stuff not yet found in the header files
-;;;;
-;;;; Abandon all hope who enters here...
-
-;;; not checked for linux...
-(defmacro fd-set (offset fd-set)
-  (with-unique-names (word bit)
-    `(multiple-value-bind (,word ,bit) (floor ,offset
-                                              sb!vm:n-machine-word-bits)
-       (setf (deref (slot ,fd-set 'fds-bits) ,word)
-             (logior (truly-the (unsigned-byte #.sb!vm:n-machine-word-bits)
-                                (ash 1 ,bit))
-                     (deref (slot ,fd-set 'fds-bits) ,word))))))
-
-;;; not checked for linux...
-(defmacro fd-clr (offset fd-set)
-  (with-unique-names (word bit)
-    `(multiple-value-bind (,word ,bit) (floor ,offset
-                                              sb!vm:n-machine-word-bits)
-       (setf (deref (slot ,fd-set 'fds-bits) ,word)
-             (logand (deref (slot ,fd-set 'fds-bits) ,word)
-                     (sb!kernel:word-logical-not
-                      (truly-the (unsigned-byte #.sb!vm:n-machine-word-bits)
-                                 (ash 1 ,bit))))))))
-
-;;; not checked for linux...
-(defmacro fd-isset (offset fd-set)
-  (with-unique-names (word bit)
-    `(multiple-value-bind (,word ,bit) (floor ,offset
-                                              sb!vm:n-machine-word-bits)
-       (logbitp ,bit (deref (slot ,fd-set 'fds-bits) ,word)))))
-
-;;; not checked for linux...
-(defmacro fd-zero (fd-set)
-  `(progn
-     ,@(loop for index upfrom 0 below (/ fd-setsize sb!vm:n-machine-word-bits)
-         collect `(setf (deref (slot ,fd-set 'fds-bits) ,index) 0))))
-

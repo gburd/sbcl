@@ -55,11 +55,11 @@
 ;;; used.
 (defvar *pv-tables* (make-hash-table :test 'equal))
 
-;;; ...and one lock to rule them. Spinlock because for certain (rare)
+;;; ...and one lock to rule them. Lock because for certain (rare)
 ;;; cases this lock might be grabbed in the course of method dispatch
 ;;; -- and mostly this is already under the *world-lock*
 (defvar *pv-lock*
-  (sb-thread::make-spinlock :name "pv table index lock"))
+  (sb-thread:make-mutex :name "pv table index lock"))
 
 (defun intern-pv-table (&key slot-name-lists)
   (flet ((intern-slot-names (slot-names)
@@ -77,22 +77,25 @@
                                     :pv-size (* 2 (reduce #'+ snl
                                                           :key (lambda (slots)
                                                                  (length (cdr slots))))))))))
-    (sb-thread::with-spinlock (*pv-lock*)
+    (sb-thread:with-mutex (*pv-lock*)
       (%intern-pv-table (mapcar #'intern-slot-names slot-name-lists)))))
 
-(defun optimize-slot-value-by-class-p (class slot-name type)
+(defun use-standard-slot-access-p (class slot-name type)
   (or (not (eq **boot-state** 'complete))
-      (let ((slotd (find-slot-definition class slot-name)))
-        (and slotd
-             (slot-accessor-std-p slotd type)))))
+      (and (standard-class-p class)
+           (let ((slotd (find-slot-definition class slot-name)))
+             (and slotd
+                  (slot-accessor-std-p slotd type))))))
 
-(defun compute-slot-location-for-pv (slot-name wrapper class)
-  (when (optimize-slot-value-by-class-p class slot-name 'all)
-    (car (find-slot-cell wrapper slot-name))))
-
-(defun compute-slot-typecheckfun-for-pv (slot-name wrapper class)
-  (when (optimize-slot-value-by-class-p class slot-name 'all)
-    (cadr (find-slot-cell wrapper slot-name))))
+(defun slot-missing-info (class slot-name)
+  (flet ((missing (operation)
+           (lambda (object)
+             (slot-missing class object slot-name operation))))
+    (make-slot-info
+     :reader (missing 'slot-value)
+     :boundp (missing 'slot-boundp)
+     :writer (lambda (new-value object)
+               (slot-missing class object slot-name 'setf new-value)))))
 
 (defun compute-pv (slot-name-lists wrappers)
   (unless (listp wrappers)
@@ -104,12 +107,15 @@
                (std-p (typep wrapper 'wrapper))
                (class (wrapper-class* wrapper)))
           (dolist (slot-name (cdr slot-names))
-            (push (when std-p
-                    (compute-slot-location-for-pv slot-name wrapper class))
+            (let ((cell
+                   (or (find-slot-cell wrapper slot-name)
+                       (cons nil (slot-missing-info class slot-name)))))
+              (push (when (and std-p (use-standard-slot-access-p class slot-name 'all))
+                      (car cell))
                   elements)
-            (push (when std-p
-                    (compute-slot-typecheckfun-for-pv slot-name wrapper class))
-                  elements)))))
+              (push (or (cdr cell)
+                        (bug "No SLOT-INFO for ~S in ~S" slot-name class))
+                  elements))))))
     (let* ((n (length elements))
            (pv (make-array n)))
       (loop for i from (1- n) downto 0
@@ -138,40 +144,61 @@
 (defun make-pv-type-declaration (var)
   `(type simple-vector ,var))
 
+;;; Sometimes we want to finalize if we can, but it's OK if
+;;; we can't.
+(defun try-finalize-inheritance (class)
+  (unless (typep class 'forward-referenced-class)
+    (when (every (lambda (super)
+                   (or (eq super class)
+                       (class-finalized-p super)
+                       (try-finalize-inheritance super)))
+                 (class-direct-superclasses class))
+      (finalize-inheritance class)
+      t)))
+
 (defun can-optimize-access (form required-parameters env)
   (destructuring-bind (op var-form slot-name-form &optional new-value) form
-      (let ((type (ecase op
-                    (slot-value 'reader)
-                    (set-slot-value 'writer)
-                    (slot-boundp 'boundp)))
-            (var (extract-the var-form))
-            (slot-name (constant-form-value slot-name-form env)))
-        (when (and (symbolp var) (not (var-special-p var env)))
-          (let* ((rebound? (caddr (var-declaration '%variable-rebinding var env)))
-                 (parameter-or-nil (car (memq (or rebound? var)
-                                              required-parameters))))
-            (when parameter-or-nil
-              (let* ((class-name (caddr (var-declaration '%class
-                                                         parameter-or-nil
-                                                         env)))
-                     (class (find-class class-name nil)))
-                (when (or (not (eq **boot-state** 'complete))
-                          (and class (not (class-finalized-p class))))
-                  (setq class nil))
-                (when (and class-name (not (eq class-name t)))
-                  (when (or (null type)
-                            (not (and class
-                                      (memq *the-class-structure-object*
-                                            (class-precedence-list class))))
-                            (optimize-slot-value-by-class-p class slot-name type))
-                    (values (cons parameter-or-nil (or class class-name))
-                            slot-name
-                            new-value))))))))))
+    (let ((type (ecase op
+                  (slot-value 'reader)
+                  (set-slot-value 'writer)
+                  (slot-boundp 'boundp)))
+          (var (extract-the var-form))
+          (slot-name (constant-form-value slot-name-form env)))
+      (when (and (symbolp var) (not (var-special-p var env)))
+        (let* ((rebound? (caddr (var-declaration '%variable-rebinding var env)))
+               (parameter-or-nil (car (memq (or rebound? var)
+                                            required-parameters))))
+          (when parameter-or-nil
+            (let* ((class-name (caddr (var-declaration '%class
+                                                       parameter-or-nil
+                                                       env)))
+                   (class (find-class class-name nil)))
+              (cond ((not (eq **boot-state** 'complete))
+                     (setq class nil))
+                    ((and class (not (class-finalized-p class)))
+                     ;; The class itself is never forward-referenced
+                     ;; here, but its superclasses may be.
+                     (unless (try-finalize-inheritance class)
+                       (when (boundp 'sb-c:*lexenv*)
+                         (sb-c:compiler-notify
+                          "~@<Cannot optimize slot access, inheritance of ~S is not ~
+                           yet finaliable due to forward-referenced superclasses:~
+                           ~%  ~S~:@>"
+                          class form))
+                       (setf class nil))))
+              (when (and class-name (not (eq class-name t)))
+                (when (not (and class
+                                (memq *the-class-structure-object*
+                                      (class-precedence-list class))))
+                  (aver type)
+                  (values (cons parameter-or-nil (or class class-name))
+                          slot-name
+                          new-value))))))))))
 
 ;;; Check whether the binding of the named variable is modified in the
 ;;; method body.
 (defun parameter-modified-p (parameter-name env)
-  (let ((modified-variables (macroexpand '%parameter-binding-modified env)))
+  (let ((modified-variables (%macroexpand '%parameter-binding-modified env)))
     (memq parameter-name modified-variables)))
 
 (defun optimize-slot-value (form slots required-parameters env)
@@ -181,24 +208,24 @@
         (let ((optimized-form
                (optimize-instance-access slots :read sparameter
                                          slot-name nil)))
-             ;; We don't return the optimized form directly, since there's
-             ;; still a chance that we'll find out later on that the
-             ;; optimization should not have been done, for example due to
-             ;; the walker encountering a SETQ on SPARAMETER later on in
-             ;; the body [ see for example clos.impure.lisp test with :name
-             ;; ((:setq :method-parameter) slot-value)) ]. Instead we defer
-             ;; the decision until the compiler macroexpands
-             ;; OPTIMIZED-SLOT-VALUE.
-             ;;
-             ;; Note that we must still call OPTIMIZE-INSTANCE-ACCESS at
-             ;; this point (instead of when expanding
-             ;; OPTIMIZED-SLOT-VALUE), since it mutates the structure of
-             ;; SLOTS. If that mutation isn't done during the walking,
-             ;; MAKE-METHOD-LAMBDA-INTERNAL won't wrap a correct PV-BINDING
-             ;; form around the body, and compilation will fail.  -- JES,
-             ;; 2006-09-18
-             `(optimized-slot-value ,form ,(car sparameter) ,optimized-form))
-           `(accessor-slot-value ,@(cdr form)))))
+          ;; We don't return the optimized form directly, since there's
+          ;; still a chance that we'll find out later on that the
+          ;; optimization should not have been done, for example due to
+          ;; the walker encountering a SETQ on SPARAMETER later on in
+          ;; the body [ see for example clos.impure.lisp test with :name
+          ;; ((:setq :method-parameter) slot-value)) ]. Instead we defer
+          ;; the decision until the compiler macroexpands
+          ;; OPTIMIZED-SLOT-VALUE.
+          ;;
+          ;; Note that we must still call OPTIMIZE-INSTANCE-ACCESS at
+          ;; this point (instead of when expanding
+          ;; OPTIMIZED-SLOT-VALUE), since it mutates the structure of
+          ;; SLOTS. If that mutation isn't done during the walking,
+          ;; MAKE-METHOD-LAMBDA-INTERNAL won't wrap a correct PV-BINDING
+          ;; form around the body, and compilation will fail.  -- JES,
+          ;; 2006-09-18
+          `(optimized-slot-value ,form ,(car sparameter) ,optimized-form))
+        `(accessor-slot-value ,@(cdr form)))))
 
 (defmacro optimized-slot-value (form parameter-name optimized-form
                                 &environment env)
@@ -307,30 +334,66 @@
          (let ((slotd (find-slot-definition class slot-name)))
            (and slotd (eq :class (slot-definition-allocation slotd)))))))
 
-(defun skip-fast-slot-access-p (class-form slot-name-form type)
-  (let ((class (and (constantp class-form) (constant-form-value class-form)))
-        (slot-name (and (constantp slot-name-form)
-                        (constant-form-value slot-name-form))))
-    (and (eq **boot-state** 'complete)
-         (standard-class-p class)
-         (not (eq class *the-class-t*)) ; shouldn't happen, though.
-         ;; FIXME: Is this really right? "Don't skip if there is
-         ;; no slot definition."
-         (let ((slotd (find-slot-definition class slot-name)))
-           (and slotd
-                (not (slot-accessor-std-p slotd type)))))))
+(defun constant-value-or-nil (form)
+  (and (constantp form) (constant-form-value form)))
 
-(defmacro instance-read-internal (pv slots pv-offset default &optional kind)
+(defun slot-access-strategy (class slot-name type &optional conservative)
+  ;; CONSERVATIVE means we should assume custom access pattern even if
+  ;; there are no custom accessors defined if the metaclass is non-standard.
+  ;;
+  ;; This is needed because DEFCLASS generates accessor methods before possible
+  ;; SLOT-VALUE-USING-CLASS methods are defined, which causes them to take
+  ;; the slow path unless we make the conservative assumption here.
+  (if (eq **boot-state** 'complete)
+      (let (slotd)
+        (cond ((or
+                ;; Conditions, structures, and classes for which FIND-CLASS
+                ;; doesn't return them yet.
+                ;; FIXME: surely we can get faster accesses for structures?
+                (not (standard-class-p class))
+                ;; Should not happen... (FIXME: assert instead?)
+                (eq class *the-class-t*)
+                (not (class-finalized-p class))
+                ;; Strangeness...
+                (not (setf slotd (find-slot-definition class slot-name))))
+               :accessor)
+              ((and (slot-accessor-std-p slotd type)
+                    (or (not conservative) (eq *the-class-standard-class* (class-of class))))
+               ;; The best case.
+               :standard)
+              (t
+               :custom)))
+      :standard))
+
+;;;; SLOT-VALUE
+
+(defmacro instance-read (pv-offset parameter position slot-name class)
+  (ecase (slot-access-strategy (constant-value-or-nil class)
+                               (constant-value-or-nil slot-name)
+                               'reader)
+    (:standard
+     `(instance-read-standard
+       .pv. ,(slot-vector-symbol position)
+       ,pv-offset (accessor-slot-value ,parameter ,slot-name)
+       ,(if (generate-fast-class-slot-access-p class slot-name)
+            :class :instance)))
+    (:custom
+     `(instance-read-custom .pv. ,pv-offset ,parameter))
+    (:accessor
+     `(accessor-slot-value ,parameter ,slot-name))))
+
+(defmacro instance-read-standard (pv slots pv-offset default &optional kind)
   (unless (member kind '(nil :instance :class))
-    (error "illegal kind argument to ~S: ~S" 'instance-read-internal kind))
+    (error "illegal kind argument to ~S: ~S" 'instance-read-standard kind))
   (let* ((index (gensym))
          (value index))
     `(locally (declare #.*optimize-speed*)
-       (let ((,index (svref ,pv ,pv-offset)))
+       (let ((,index (svref ,pv ,pv-offset))
+             (,slots (truly-the simple-vector ,slots)))
          (setq ,value (typecase ,index
                         ;; FIXME: the line marked by KLUDGE below (and
                         ;; the analogous spot in
-                        ;; INSTANCE-WRITE-INTERNAL) is there purely to
+                        ;; INSTANCE-WRITE-STANDARD) is there purely to
                         ;; suppress a type mismatch warning that
                         ;; propagates through to user code.
                         ;; Presumably SLOTS at this point can never
@@ -340,31 +403,53 @@
                         ;; sbcl-devel 2003-09-21) -- CSR, 2003-11-30
                         ,@(when (or (null kind) (eq kind :instance))
                                 `((fixnum
-                                   (and ,slots ; KLUDGE
-                                        (clos-slots-ref ,slots ,index)))))
+                                   (clos-slots-ref ,slots ,index))))
                         ,@(when (or (null kind) (eq kind :class))
                                 `((cons (cdr ,index))))
-                        (t +slot-unbound+)))
+                        (t
+                         +slot-unbound+)))
          (if (eq ,value +slot-unbound+)
              ,default
              ,value)))))
 
-(defmacro instance-read (pv-offset parameter position slot-name class)
-  (if (skip-fast-slot-access-p class slot-name 'reader)
-      `(accessor-slot-value ,parameter ,slot-name)
-      `(instance-read-internal .pv. ,(slot-vector-symbol position)
-        ,pv-offset (accessor-slot-value ,parameter ,slot-name)
-        ,(if (generate-fast-class-slot-access-p class slot-name)
-             :class :instance))))
+(defmacro instance-read-custom (pv pv-offset parameter)
+  `(locally (declare #.*optimize-speed*)
+     (funcall (slot-info-reader (svref ,pv (1+ ,pv-offset))) ,parameter)))
 
-(defmacro instance-write-internal (pv slots pv-offset new-value default
+;;;; (SETF SLOT-VALUE)
+
+(defmacro instance-write (pv-offset parameter position slot-name class new-value
+                          &optional check-type-p)
+  (ecase (slot-access-strategy (constant-value-or-nil class)
+                               (constant-value-or-nil slot-name)
+                               'writer)
+    (:standard
+     `(instance-write-standard
+       .pv. ,(slot-vector-symbol position)
+       ,pv-offset ,new-value
+       ;; KLUDGE: .GOOD-NEW-VALUE. is type-checked by the time this form
+       ;; is executed (if it is executed).
+       (accessor-set-slot-value ,parameter ,slot-name .good-new-value.)
+       ,(if (generate-fast-class-slot-access-p class slot-name)
+            :class :instance)
+       ,check-type-p))
+    (:custom
+     `(instance-write-custom .pv. ,pv-offset ,parameter ,new-value))
+    (:accessor
+     (if check-type-p
+         ;; FIXME: We don't want this here. If it's _possible_ the fast path
+         ;; is applicable, we want to use it as well.
+         `(safe-set-slot-value ,parameter ,slot-name ,new-value)
+         `(accessor-set-slot-value ,parameter ,slot-name ,new-value)))))
+
+(defmacro instance-write-standard (pv slots pv-offset new-value default
                                    &optional kind safep)
   (unless (member kind '(nil :instance :class))
-    (error "illegal kind argument to ~S: ~S" 'instance-write-internal kind))
+    (error "illegal kind argument to ~S: ~S" 'instance-write-standard kind))
   (let* ((index (gensym))
          (new-value-form
           (if safep
-              `(let ((.typecheckfun. (svref ,pv (1+ ,pv-offset))))
+              `(let ((.typecheckfun. (slot-info-typecheck (svref ,pv (1+ ,pv-offset)))))
                  (declare (type (or function null) .typecheckfun.))
                  (if .typecheckfun.
                      (funcall .typecheckfun. ,new-value)
@@ -382,28 +467,31 @@
                    `((cons (setf (cdr ,index) .good-new-value.))))
            (t ,default))))))
 
-(defmacro instance-write (pv-offset parameter position slot-name class new-value
-                          &optional check-type-p)
-  (if (skip-fast-slot-access-p class slot-name 'writer)
-      (if check-type-p
-          ;; FIXME: We don't want this here. If it's _possible_ the fast path
-          ;; is applicable, we wan to use it as well.
-          `(safe-set-slot-value ,parameter ,slot-name ,new-value)
-          `(accessor-set-slot-value ,parameter ,slot-name ,new-value))
-      `(instance-write-internal
-        .pv. ,(slot-vector-symbol position)
-        ,pv-offset ,new-value
-        ;; KLUDGE: .GOOD-NEW-VALUE. is type-checked by the time this form
-        ;; is executed (if it is executed).
-        (accessor-set-slot-value ,parameter ,slot-name .good-new-value.)
-        ,(if (generate-fast-class-slot-access-p class slot-name)
-             :class :instance)
-        ,check-type-p)))
+(defmacro instance-write-custom (pv pv-offset parameter new-value)
+  `(locally (declare #.*optimize-speed*)
+     (funcall (slot-info-writer (svref ,pv (1+ ,pv-offset))) ,new-value ,parameter)))
 
-(defmacro instance-boundp-internal (pv slots pv-offset default
+;;;; SLOT-BOUNDP
+
+(defmacro instance-boundp (pv-offset parameter position slot-name class)
+  (ecase (slot-access-strategy (constant-value-or-nil class)
+                               (constant-value-or-nil slot-name)
+                               'boundp)
+    (:standard
+     `(instance-boundp-standard
+       .pv. ,(slot-vector-symbol position)
+       ,pv-offset (accessor-slot-boundp ,parameter ,slot-name)
+       ,(if (generate-fast-class-slot-access-p class slot-name)
+            :class :instance)))
+    (:custom
+     `(instance-boundp-custom .pv. ,pv-offset ,parameter))
+    (:accessor
+     `(accessor-slot-boundp ,parameter ,slot-name))))
+
+(defmacro instance-boundp-standard (pv slots pv-offset default
                                     &optional kind)
   (unless (member kind '(nil :instance :class))
-    (error "illegal kind argument to ~S: ~S" 'instance-boundp-internal kind))
+    (error "illegal kind argument to ~S: ~S" 'instance-boundp-standard kind))
   (let* ((index (gensym)))
     `(locally (declare #.*optimize-speed*)
        (let ((,index (svref ,pv ,pv-offset)))
@@ -416,13 +504,9 @@
                    `((cons (not (eq (cdr ,index) +slot-unbound+)))))
            (t ,default))))))
 
-(defmacro instance-boundp (pv-offset parameter position slot-name class)
-  (if (skip-fast-slot-access-p class slot-name 'boundp)
-      `(accessor-slot-boundp ,parameter ,slot-name)
-      `(instance-boundp-internal .pv. ,(slot-vector-symbol position)
-        ,pv-offset (accessor-slot-boundp ,parameter ,slot-name)
-        ,(if (generate-fast-class-slot-access-p class slot-name)
-             :class :instance))))
+(defmacro instance-boundp-custom (pv pv-offset parameter)
+  `(locally (declare #.*optimize-speed*)
+     (funcall (slot-info-boundp (svref ,pv (1+ ,pv-offset))) ,parameter)))
 
 ;;; This magic function has quite a job to do indeed.
 ;;;
@@ -459,7 +543,7 @@
         (incf pv-offset)
         (dolist (form (cdr slot-entry))
           (setf (cadr form) pv-offset))
-        ;; Count one more for the slot we use for typecheckfun.
+        ;; Count one more for the slot we use for SLOT-INFO.
         (incf pv-offset)))
     sorted-slots))
 
@@ -550,7 +634,7 @@
         (declare ,(make-pv-type-declaration '.pv.))
         ,@forms)))
 
-(defun split-declarations (body args maybe-reads-params-p)
+(defun split-declarations (body args req-args cnm-p parameters-setqd)
   (let ((inner-decls nil)
         (outer-decls nil)
         decl)
@@ -579,7 +663,9 @@
                            ;; args when a next-method is involved, to
                            ;; prevent compiler warnings about ignored
                            ;; args being read.
-                           (unless (and (eq 'ignore name) maybe-reads-params-p)
+                           (unless (and (eq 'ignore name)
+                                        (member var req-args :test #'eq)
+                                        (or cnm-p (member var parameters-setqd)))
                              (push var outers))
                            (push var inners)))
                      (when outers
@@ -593,17 +679,6 @@
       (setq body (cdr body)))
     (values outer-decls inner-decls body)))
 
-;;; Pull a name out of the %METHOD-NAME declaration in the function
-;;; body given, or return NIL if no %METHOD-NAME declaration is found.
-(defun body-method-name (body)
-  (multiple-value-bind (real-body declarations documentation)
-      (parse-body body)
-    (declare (ignore real-body documentation))
-    (let ((name-decl (get-declaration '%method-name declarations)))
-      (and name-decl
-           (destructuring-bind (name) name-decl
-             name)))))
-
 ;;; Convert a lambda expression containing a SB-PCL::%METHOD-NAME
 ;;; declaration (which is a naming style internal to PCL) into an
 ;;; SB-INT:NAMED-LAMBDA expression (which is a naming style used
@@ -611,9 +686,9 @@
 ;;; no SB-PCL::%METHOD-NAME declaration, then just return the original
 ;;; lambda expression.
 (defun name-method-lambda (method-lambda)
-  (let ((method-name (body-method-name (cddr method-lambda))))
+  (let ((method-name *method-name*))
     (if method-name
-        `(named-lambda (slow-method ,method-name) ,(rest method-lambda))
+        `(named-lambda (slow-method ,@method-name) ,@(rest method-lambda))
         method-lambda)))
 
 (defun make-method-initargs-form-internal (method-lambda initargs env)
@@ -677,7 +752,7 @@
          (outer-parameters req-args)
          ;; The lambda-list used by BIND-ARGS
          (bind-list lambda-list)
-         (setq-p (getf (cdr lmf-params) :setq-p))
+         (parameters-setqd (getf (cdr lmf-params) :parameters-setqd))
          (auxp (member '&aux bind-list))
          (call-next-method-p (getf (cdr lmf-params) :call-next-method-p)))
     ;; Try to use the normal function call machinery instead of BIND-ARGS
@@ -702,7 +777,7 @@
             bind-list req-args))
     (multiple-value-bind (outer-decls inner-decls body-sans-decls)
         (split-declarations
-         body outer-parameters (or call-next-method-p setq-p))
+         body outer-parameters req-args call-next-method-p parameters-setqd)
       (let* ((rest-arg (when restp
                          '.rest-arg.))
              (fmf-lambda-list (if rest-arg
@@ -712,10 +787,10 @@
                                       lambda-list))))
         `(list*
           :function
-          (let* ((fmf (,(if (body-method-name body) 'named-lambda 'lambda)
-                        ,@(when (body-method-name body)
+          (let* ((fmf (,(if *method-name* 'named-lambda 'lambda)
+                        ,@(when *method-name*
                                 ;; function name
-                                (list (cons 'fast-method (body-method-name body))))
+                                (list `(fast-method ,@*method-name*)))
                         ;; The lambda-list of the FMF
                         (.pv. .next-method-call. ,@fmf-lambda-list)
                         ;; body of the function

@@ -18,6 +18,8 @@
  * more information.
  */
 
+#include "genesis/config.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -28,19 +30,17 @@
   #define WIN32_LEAN_AND_MEAN
   #include <windows.h>
   #include <shlobj.h>
+  #include <wincrypt.h>
   #undef boolean
 #else
+  #include <poll.h>
+  #include <sys/select.h>
   #include <sys/times.h>
   #include <sys/wait.h>
   #include <sys/ioctl.h>
   #include <sys/termios.h>
-  #ifdef __APPLE_CC__
-    #include "../src/runtime/darwin-dlshim.h"
-    #include "../src/runtime/darwin-langinfo.h"
-  #else
-    #include <dlfcn.h>
-    #include <langinfo.h>
-  #endif
+  #include <langinfo.h>
+  #include <dlfcn.h>
 #endif
 
 #include <sys/stat.h>
@@ -48,8 +48,6 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
-
-#include "genesis/config.h"
 
 #ifdef LISP_FEATURE_HPUX
 #include <sys/bsdtty.h> /* for TIOCGPGRP */
@@ -189,12 +187,19 @@ main(int argc, char *argv[])
 
     printf(";;; FormatMessage\n");
 
-    defconstant ("FORMAT_MESSAGE_ALLOCATE_BUFFER", FORMAT_MESSAGE_ALLOCATE_BUFFER);
-    defconstant ("FORMAT_MESSAGE_FROM_SYSTEM", FORMAT_MESSAGE_FROM_SYSTEM);
+    defconstant("FORMAT_MESSAGE_ALLOCATE_BUFFER", FORMAT_MESSAGE_ALLOCATE_BUFFER);
+    defconstant("FORMAT_MESSAGE_FROM_SYSTEM", FORMAT_MESSAGE_FROM_SYSTEM);
+    defconstant("FORMAT_MESSAGE_MAX_WIDTH_MASK", FORMAT_MESSAGE_MAX_WIDTH_MASK);
 
     printf(";;; Errors\n");
 
-    defconstant ("ERROR_ENVVAR_NOT_FOUND", ERROR_ENVVAR_NOT_FOUND);
+    printf(";;; Errors\n");
+
+    defconstant("ERROR_ENVVAR_NOT_FOUND", ERROR_ENVVAR_NOT_FOUND);
+    defconstant("ERROR_ALREADY_EXISTS", ERROR_ALREADY_EXISTS);
+    defconstant("ERROR_FILE_EXISTS", ERROR_FILE_EXISTS);
+    defconstant("ERROR_FILE_NOT_FOUND", ERROR_FILE_NOT_FOUND);
+    defconstant("ERROR_ACCESS_DENIED", ERROR_ACCESS_DENIED);
 
     printf(";;; GetComputerName\n");
 
@@ -208,6 +213,43 @@ main(int argc, char *argv[])
     DEFTYPE("uint",    UINT);
     DEFTYPE("ulong",   ULONG);
 
+    printf(";;; File Desired Access\n");
+    defconstant ("FILE_GENERIC_READ", FILE_GENERIC_READ);
+    defconstant ("FILE_GENERIC_WRITE", FILE_GENERIC_WRITE);
+    defconstant ("FILE_GENERIC_EXECUTE", FILE_GENERIC_EXECUTE);
+    defconstant ("FILE_SHARE_READ", FILE_SHARE_READ);
+    defconstant ("FILE_SHARE_WRITE", FILE_SHARE_WRITE);
+    defconstant ("FILE_SHARE_DELETE", FILE_SHARE_DELETE);
+
+    printf(";;; File Creation Dispositions\n");
+    defconstant("CREATE_NEW", CREATE_NEW);
+    defconstant("CREATE_ALWAYS", CREATE_ALWAYS);
+    defconstant("OPEN_EXISTING", OPEN_EXISTING);
+    defconstant("OPEN_ALWAYS", OPEN_ALWAYS);
+    defconstant("TRUNCATE_EXISTING", TRUNCATE_EXISTING);
+
+    printf(";;; Desired Access\n");
+    defconstant("ACCESS_GENERIC_READ", GENERIC_READ);
+    defconstant("ACCESS_GENERIC_WRITE", GENERIC_WRITE);
+    defconstant("ACCESS_GENERIC_EXECUTE", GENERIC_EXECUTE);
+    defconstant("ACCESS_GENERIC_ALL", GENERIC_ALL);
+    defconstant("ACCESS_FILE_APPEND_DATA", FILE_APPEND_DATA);
+    defconstant("ACCESS_DELETE", DELETE);
+
+    printf(";;; Handle Information Flags\n");
+    defconstant("HANDLE_FLAG_INHERIT", HANDLE_FLAG_INHERIT);
+    defconstant("HANDLE_FLAG_PROTECT_FROM_CLOSE", HANDLE_FLAG_PROTECT_FROM_CLOSE);
+
+    printf(";;; Standard Handle Keys\n");
+    defconstant("STD_INPUT_HANDLE", STD_INPUT_HANDLE);
+    defconstant("STD_OUTPUT_HANDLE", STD_OUTPUT_HANDLE);
+    defconstant("STD_ERROR_HANDLE", STD_ERROR_HANDLE);
+
+    printf(";;; WinCrypt\n");
+    defconstant("crypt-verifycontext", CRYPT_VERIFYCONTEXT);
+    defconstant("crypt-silent", CRYPT_SILENT);
+    defconstant("prov-rsa-full", PROV_RSA_FULL);
+
     /* FIXME: SB-UNIX and SB-WIN32 really need to be untangled. */
     printf("(in-package \"SB!UNIX\")\n\n");
     printf(";;; Unix-like constants and types on Windows\n");
@@ -219,11 +261,13 @@ main(int argc, char *argv[])
     defconstant("o_append", _O_APPEND);
     defconstant("o_excl",   _O_EXCL);
     defconstant("o_binary", _O_BINARY);
+    defconstant("o_noinherit", _O_NOINHERIT);
 
     defconstant("enoent", ENOENT);
     defconstant("eexist", EEXIST);
     defconstant("eintr", EINTR);
     defconstant("eagain", EAGAIN);
+    defconstant("ebadf", EBADF);
 
     defconstant("s-ifmt",  S_IFMT);
     defconstant("s-ifdir", S_IFDIR);
@@ -242,6 +286,9 @@ main(int argc, char *argv[])
     DEFTYPE("wst-nlink-t", wst_nlink_t);
     DEFTYPE("wst-uid-t", wst_uid_t);
     DEFTYPE("wst-gid-t", wst_gid_t);
+
+    /* KLUDGE */
+    defconstant("fd-setsize", 1024);
     printf("\n");
 #else
     printf("(in-package \"SB!ALIEN\")\n\n");
@@ -253,6 +300,16 @@ main(int argc, char *argv[])
     defconstant ("rtld-global", RTLD_GLOBAL);
 
     printf("(in-package \"SB!UNIX\")\n\n");
+
+    printf(";;; select()\n");
+    defconstant("fd-setsize", FD_SETSIZE);
+
+    printf(";;; poll()\n");
+    defconstant("pollin", POLLIN);
+    defconstant("pollout", POLLOUT);
+    defconstant("pollpri", POLLPRI);
+    defconstant("pollhup", POLLHUP);
+    DEFTYPE("nfds-t", nfds_t);
 
     printf(";;; langinfo\n");
     defconstant("codeset", CODESET);
@@ -457,13 +514,16 @@ main(int argc, char *argv[])
     printf("\n");
 #endif
 
+    printf("(in-package \"SB!KERNEL\")\n\n");
 #ifdef LISP_FEATURE_GENCGC
     printf(";;; GENCGC related\n");
-    printf("(in-package \"SB!KERNEL\")\n");
     DEFTYPE("page-index-t", page_index_t);
     DEFTYPE("generation-index-t", generation_index_t);
     printf("\n");
 #endif
+
+    printf(";;; Our runtime types\n");
+    DEFTYPE("os-vm-size-t", os_vm_size_t);
 
     return 0;
 }

@@ -93,6 +93,7 @@
 (defvar *current-path*)
 (defvar *current-component*)
 (defvar *delayed-ir1-transforms*)
+(defvar *eval-tlf-index*)
 (defvar *handled-conditions*)
 (defvar *disabled-package-locks*)
 (defvar *policy*)
@@ -112,6 +113,7 @@
 (defvar *lexenv*)
 (defvar *source-info*)
 (defvar *source-plist*)
+(defvar *source-namestring*)
 (defvar *trace-table*)
 (defvar *undefined-warnings*)
 (defvar *warnings-p*)
@@ -186,7 +188,8 @@ the stack without triggering overflow protection.")
     ;; FIXME: should be COMPILER-STYLE-WARNING?
     (style-warn 'sb!kernel:asterisks-around-lexical-variable-name
                 :format-control
-                "using the lexical binding of the symbol ~S, not the~@
+                "using the lexical binding of the symbol ~
+                 ~/sb-impl::print-symbol-with-prefix/, not the~@
                  dynamic binding"
                 :format-arguments (list symbol)))
   (values))
@@ -227,7 +230,7 @@ the stack without triggering overflow protection.")
 (setf *debug-name-sharp* (make-debug-name-marker)
       *debug-name-ellipsis* (make-debug-name-marker))
 
-(defun debug-name (type thing)
+(defun debug-name (type thing &optional context)
   (let ((*debug-name-punt* nil))
     (labels ((walk (x)
                (typecase x
@@ -254,7 +257,7 @@ the stack without triggering overflow protection.")
                   x)
                  (t
                   (type-of x)))))
-      (let ((name (list type (walk thing))))
+      (let ((name (list* type (walk thing) (when context (name-context)))))
         (when (legal-fun-name-p name)
           (bug "~S is a legal function name, and cannot be used as a ~
                 debug name." name))

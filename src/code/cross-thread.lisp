@@ -15,9 +15,6 @@
   (declare (ignore name value))
   nil)
 
-#!+(and sb-lutex sb-thread)
-(defun make-lutex () nil)
-
 (defmacro with-mutex ((mutex) &body body)
   (declare (ignore mutex))
   `(locally ,@body))
@@ -26,18 +23,6 @@
   (declare (ignore mutex))
   `(locally ,@body))
 
-(defun make-spinlock (&key name value)
-  (declare (ignore name value))
-  nil)
-
-(defun get-spinlock (spinlock)
-  (declare (ignore spinlock))
-  t)
-
-(defun release-spinlock (spinlock)
-  (declare (ignore spinlock))
-  nil)
-
-(defmacro with-spinlock ((spinlock) &body body)
-  (declare (ignore spinlock))
-  `(locally ,@body))
+(defmacro barrier ((kind) &body body)
+  (declare (ignore kind))
+  `(progn ,@body))

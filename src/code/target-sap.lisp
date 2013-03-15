@@ -65,6 +65,14 @@
            (fixnum offset))
   (sap-ref-8 sap offset))
 
+(defun sap-ref-octets (sap offset count)
+  (declare (type system-area-pointer sap)
+           (fixnum offset count))
+  (let ((buffer (make-array count :element-type '(unsigned-byte 8))))
+    (dotimes (i count)
+      (setf (aref buffer i) (sap-ref-8 sap (+ offset i))))
+    buffer))
+
 ;;; Return the 16-bit word at OFFSET bytes from SAP.
 (defun sap-ref-16 (sap offset)
   (declare (type system-area-pointer sap)
@@ -94,6 +102,12 @@
   (declare (type system-area-pointer sap)
            (fixnum offset))
   (sap-ref-sap sap offset))
+
+;; Return the LISPOBJ at OFFSET bytes from SAP.
+(defun sap-ref-lispobj (sap offset)
+  (declare (type system-area-pointer sap)
+           (fixnum offset))
+  (sap-ref-lispobj sap offset))
 
 ;;; Return the 32-bit SINGLE-FLOAT at OFFSET bytes from SAP.
 (defun sap-ref-single (sap offset)
@@ -208,6 +222,12 @@
   (declare (type system-area-pointer sap new-value)
            (fixnum offset))
   (setf (sap-ref-sap sap offset) new-value))
+
+(defun %set-sap-ref-lispobj (sap offset new-value)
+  (declare (type system-area-pointer sap)
+           (fixnum offset)
+           (t new-value))
+  (setf (sap-ref-lispobj sap offset) new-value))
 
 (defun %set-sap-ref-single (sap offset new-value)
   (declare (type system-area-pointer sap)

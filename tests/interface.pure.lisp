@@ -12,6 +12,10 @@
 ;;;; more information.
 
 (in-package :cl-user)
+
+(load "test-util.lisp")
+(load "compiler-test-util.lisp")
+(use-package :test-util)
 
 ;;;; properties of symbols, e.g. presence of doc strings for public symbols
 
@@ -63,10 +67,13 @@
       (sleep 2)
       (sleep 2))))
 
+;;; SLEEP should not cons
+(with-test (:name (sleep :non-consing) :fails-on '(or (not :x86-64) :win32))
+  (ctu:assert-no-consing (sleep 0.00001)))
+
 ;;; SLEEP should work with large integers as well -- no timers
 ;;; on win32, so don't test there.
-#-win32
-(with-test (:name (sleep pretty-much-forever))
+(with-test (:name (sleep pretty-much-forever) :skipped-on :win32)
   (assert (eq :timeout
               (handler-case
                   (sb-ext:with-timeout 1
@@ -117,3 +124,14 @@
 (loop repeat 2
       do (compile nil '(lambda (x) x))
       do (sb-ext:gc :full t))
+
+;;; On x86-64, the instruction definitions for CMP*[PS][SD] were broken
+;;; so that the disassembler threw an error when they were used with
+;;; one operand in memory.
+(with-test (:name :bug-814702)
+  (disassemble (lambda (x)
+                 (= #C(2.0f0 3.0f0)
+                    (the (complex single-float) x))))
+  (disassemble (lambda (x y)
+                 (= (the (complex single-float) x)
+                    (the (complex single-float) y)))))

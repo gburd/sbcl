@@ -57,9 +57,11 @@
 ;;; constant. At worst, it will convert to %TYPEP, which will prevent
 ;;; spurious attempts at transformation (and possible repeated
 ;;; warnings.)
-(deftransform typep ((object type) * * :node node)
+(deftransform typep ((object type &optional env) * * :node node)
   (unless (constant-lvar-p type)
     (give-up-ir1-transform "can't open-code test of non-constant type"))
+  (unless (and (constant-lvar-p env) (null (lvar-value env)))
+    (give-up-ir1-transform "environment argument present and not null"))
   (multiple-value-bind (expansion fail-p)
       (source-transform-typep 'object (lvar-value type))
     (if fail-p
@@ -69,25 +71,46 @@
 ;;; If the lvar OBJECT definitely is or isn't of the specified
 ;;; type, then return T or NIL as appropriate. Otherwise quietly
 ;;; GIVE-UP-IR1-TRANSFORM.
-(defun ir1-transform-type-predicate (object type)
+(defun ir1-transform-type-predicate (object type node)
   (declare (type lvar object) (type ctype type))
   (let ((otype (lvar-type object)))
-    (cond ((not (types-equal-or-intersect otype type))
-           nil)
-          ((csubtypep otype type)
-           t)
-          ((eq type *empty-type*)
-           nil)
-          (t
-           (give-up-ir1-transform)))))
+    (flet ((tricky ()
+             (cond ((typep type 'alien-type-type)
+                    ;; We don't transform alien type tests until here, because
+                    ;; once we do that the rest of the type system can no longer
+                    ;; reason about them properly -- so we'd miss out on type
+                    ;; derivation, etc.
+                    (delay-ir1-transform node :optimize)
+                    (let ((alien-type (alien-type-type-alien-type type)))
+                      ;; If it's a lisp-rep-type, the CTYPE should be one already.
+                      (aver (not (compute-lisp-rep-type alien-type)))
+                      `(sb!alien::alien-value-typep object ',alien-type)))
+                   (t
+                    (give-up-ir1-transform)))))
+      (cond ((not (types-equal-or-intersect otype type))
+            nil)
+           ((csubtypep otype type)
+            t)
+           ((eq type *empty-type*)
+            nil)
+           (t
+            (let ((intersect (type-intersection2 type otype)))
+              (unless intersect
+                (tricky))
+              (multiple-value-bind (constantp value)
+                  (type-singleton-p intersect)
+                (if constantp
+                    `(eql object ',value)
+                    (tricky)))))))))
 
 ;;; Flush %TYPEP tests whose result is known at compile time.
-(deftransform %typep ((object type))
+(deftransform %typep ((object type) * * :node node)
   (unless (constant-lvar-p type)
     (give-up-ir1-transform))
   (ir1-transform-type-predicate
    object
-   (ir1-transform-specifier-type (lvar-value type))))
+   (ir1-transform-specifier-type (lvar-value type))
+   node))
 
 ;;; This is the IR1 transform for simple type predicates. It checks
 ;;; whether the single argument is known to (not) be of the
@@ -99,7 +122,7 @@
                            (basic-combination-fun node))))
                         *backend-predicate-types*)))
     (aver ctype)
-    (ir1-transform-type-predicate object ctype)))
+    (ir1-transform-type-predicate object ctype node)))
 
 ;;; If FIND-CLASSOID is called on a constant class, locate the
 ;;; CLASSOID-CELL at load time.
@@ -552,6 +575,9 @@
     (or (when (not ctype)
           (compiler-warn "illegal type specifier for TYPEP: ~S" type)
           (return-from source-transform-typep (values nil t)))
+        (multiple-value-bind (constantp value) (type-singleton-p ctype)
+          (and constantp
+               `(eql ,object ',value)))
         (let ((pred (cdr (assoc ctype *backend-type-predicates*
                                 :test #'type=))))
           (when pred `(,pred ,object)))
@@ -584,14 +610,15 @@
           (t nil))
         `(%typep ,object ',type))))
 
-(define-source-transform typep (object spec)
+(define-source-transform typep (object spec &optional env)
   ;; KLUDGE: It looks bad to only do this on explicitly quoted forms,
   ;; since that would overlook other kinds of constants. But it turns
   ;; out that the DEFTRANSFORM for TYPEP detects any constant
   ;; lvar, transforms it into a quoted form, and gives this
   ;; source transform another chance, so it all works out OK, in a
   ;; weird roundabout way. -- WHN 2001-03-18
-  (if (and (consp spec)
+  (if (and (not env)
+           (consp spec)
            (eq (car spec) 'quote)
            (or (not *allow-instrumenting*)
                (policy *lexenv* (= store-coverage-data 0))))
@@ -610,6 +637,30 @@
         (constant-fold-call node)
         t))))
 
+;;; Drops dimension information from vector types.
+(defun simplify-vector-type (type)
+  (aver (csubtypep type (specifier-type '(array * (*)))))
+  (let* ((array-type
+          (if (csubtypep type (specifier-type 'simple-array))
+              'simple-array
+              'array))
+         (complexp
+          (not
+           (or (eq 'simple-array array-type)
+               (neq *empty-type*
+                    (type-intersection type (specifier-type 'simple-array)))))))
+    (dolist (etype
+              #+sb-xc-host '(t bit character)
+              #-sb-xc-host sb!kernel::*specialized-array-element-types*
+              #+sb-xc-host (values nil nil nil)
+              #-sb-xc-host (values `(,array-type * (*)) t complexp))
+      (when etype
+        (let ((simplified (specifier-type `(,array-type ,etype (*)))))
+          (when (csubtypep type simplified)
+            (return (values (type-specifier simplified)
+                            etype
+                            complexp))))))))
+
 (deftransform coerce ((x type) (* *) * :node node)
   (unless (constant-lvar-p type)
     (give-up-ir1-transform))
@@ -617,65 +668,55 @@
          (tspec (ir1-transform-specifier-type tval)))
     (if (csubtypep (lvar-type x) tspec)
         'x
-        ;; Note: The THE here makes sure that specifiers like
-        ;; (SINGLE-FLOAT 0.0 1.0) can raise a TYPE-ERROR.
-        `(the ,(lvar-value type)
-           ,(cond
-             ((csubtypep tspec (specifier-type 'double-float))
-              '(%double-float x))
-             ;; FIXME: #!+long-float (t ,(error "LONG-FLOAT case needed"))
-             ((csubtypep tspec (specifier-type 'float))
-              '(%single-float x))
-             ;; Special case STRING and SIMPLE-STRING as they are union types
-             ;; in SBCL.
-             ((member tval '(string simple-string))
-              `(if (typep x ',tval)
+        ;; Note: The THE forms we use to wrap the results make sure that
+        ;; specifiers like (SINGLE-FLOAT 0.0 1.0) can raise a TYPE-ERROR.
+        (cond
+          ((csubtypep tspec (specifier-type 'double-float))
+           `(the ,tval (%double-float x)))
+          ;; FIXME: #!+long-float (t ,(error "LONG-FLOAT case needed"))
+          ((csubtypep tspec (specifier-type 'float))
+           `(the ,tval (%single-float x)))
+           ;; Special case STRING and SIMPLE-STRING as they are union types
+           ;; in SBCL.
+           ((member tval '(string simple-string))
+            `(the ,tval
+               (if (typep x ',tval)
                    x
-                   (replace (make-array (length x) :element-type 'character) x)))
-             ;; Special case VECTOR
-             ((eq tval 'vector)
-              `(if (vectorp x)
+                   (replace (make-array (length x) :element-type 'character) x))))
+           ;; Special case VECTOR
+           ((eq tval 'vector)
+            `(the ,tval
+               (if (vectorp x)
                    x
-                   (replace (make-array (length x)) x)))
-             ;; Handle specialized element types for 1D arrays.
-             ((csubtypep tspec (specifier-type '(array * (*))))
-              ;; Can we avoid checking for dimension issues like (COERCE FOO
-              ;; '(SIMPLE-VECTOR 5)) returning a vector of length 6?
-              (if (or (policy node (< safety 3)) ; no need in unsafe code
-                      (and (array-type-p tspec)  ; no need when no dimensions
-                           (equal (array-type-dimensions tspec) '(*))))
-                  ;; We can!
-                  (let ((array-type
-                         (if (csubtypep tspec (specifier-type 'simple-array))
-                             'simple-array
-                             'array)))
-                    (dolist (etype
-                              #+sb-xc-host '(t bit character)
-                              #-sb-xc-host sb!kernel::*specialized-array-element-types*
-                             (give-up-ir1-transform))
-                      (when etype
-                        (let ((spec `(,array-type ,etype (*))))
-                          (when (csubtypep tspec (specifier-type spec))
-                            ;; Is the result required to be non-simple?
-                            (let ((result-simple
-                                   (or (eq 'simple-array array-type)
-                                       (neq *empty-type*
-                                            (type-intersection
-                                             tspec (specifier-type 'simple-array))))))
-                              (return
-                                `(if (typep x ',spec)
-                                     x
-                                     (replace
-                                      (make-array (length x) :element-type ',etype
-                                                  ,@(unless result-simple
-                                                            (list :fill-pointer t
-                                                                  :adjustable t)))
-                                      x)))))))))
-                  ;; No, duh. Dimension checking required.
-                  (give-up-ir1-transform
-                   "~@<~S specifies dimensions other than (*) in safe code.~:@>"
-                   tval)))
-             (t
-              (give-up-ir1-transform
-               "~@<open coding coercion to ~S not implemented.~:@>"
-               tval)))))))
+                   (replace (make-array (length x)) x))))
+           ;; Handle specialized element types for 1D arrays.
+           ((csubtypep tspec (specifier-type '(array * (*))))
+            ;; Can we avoid checking for dimension issues like (COERCE FOO
+            ;; '(SIMPLE-VECTOR 5)) returning a vector of length 6?
+            ;;
+            ;; CLHS actually allows this for all code with SAFETY < 3,
+            ;; but we're a conservative bunch.
+            (if (or (policy node (zerop safety)) ; no need in unsafe code
+                    (and (array-type-p tspec)    ; no need when no dimensions
+                         (equal (array-type-dimensions tspec) '(*))))
+                ;; We can!
+                (multiple-value-bind (vtype etype complexp) (simplify-vector-type tspec)
+                  (unless vtype
+                    (give-up-ir1-transform))
+                  `(the ,vtype
+                     (if (typep x ',vtype)
+                         x
+                         (replace
+                          (make-array (length x) :element-type ',etype
+                                      ,@(when complexp
+                                              (list :fill-pointer t
+                                                    :adjustable t)))
+                          x))))
+                ;; No, duh. Dimension checking required.
+                (give-up-ir1-transform
+                 "~@<~S specifies dimensions other than (*) in safe code.~:@>"
+                 tval)))
+           (t
+            (give-up-ir1-transform
+             "~@<open coding coercion to ~S not implemented.~:@>"
+             tval))))))

@@ -127,6 +127,24 @@
         (inst addi (- (bytes-needed-for-non-descriptor-stack-frame))
               nfp val)))))
 
+;;; Accessing a slot from an earlier stack frame is definite hackery.
+(define-vop (ancestor-frame-ref)
+  (:args (frame-pointer :scs (descriptor-reg))
+         (variable-home-tn :load-if nil))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:policy :fast-safe)
+  (:generator 4
+    (aver (sc-is variable-home-tn control-stack))
+    (loadw value frame-pointer (tn-offset variable-home-tn))))
+(define-vop (ancestor-frame-set)
+  (:args (frame-pointer :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:results (variable-home-tn :load-if nil))
+  (:policy :fast-safe)
+  (:generator 4
+    (aver (sc-is variable-home-tn control-stack))
+    (storew value frame-pointer (tn-offset variable-home-tn))))
+
 (define-vop (xep-allocate-frame)
   (:info start-lab copy-more-arg-follows)
   (:ignore copy-more-arg-follows)
@@ -399,6 +417,15 @@ default-value-8
               nvals)
   (:temporary (:scs (non-descriptor-reg)) temp))
 
+
+;;; This hook in the codegen pass lets us insert code before fall-thru entry
+;;; points, local-call entry points, and tail-call entry points.  The default
+;;; does nothing.
+(defun emit-block-header (start-label trampoline-label fall-thru-p alignp)
+  (declare (ignore fall-thru-p alignp))
+  (when trampoline-label
+    (emit-label trampoline-label))
+  (emit-label start-label))
 
 
 ;;;; Local call with unknown values convention return:

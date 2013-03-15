@@ -35,22 +35,32 @@
 ;;; guess the other.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun pick-lisp-and-alien-names (name)
-    (etypecase name
-      (string
-       (values (guess-lisp-name-from-alien-name name) name))
-      (symbol
-       (values name (guess-alien-name-from-lisp-name name)))
-      (list
-       (unless (proper-list-of-length-p name 2)
-         (error "badly formed alien name"))
-       (values (cadr name) (car name))))))
+    (flet ((oops ()
+             (error "~@<~:IMalformed alien name. Acceptable formats are:~
+                     ~:@_  (\"alien_name\" LISP-NAME)~
+                     ~:@_  FOO-BAR                - equivalent to (\"foo_bar\" FOO-BAR)~
+                     ~:@_  \"foo_bar\"              - equivalent to (\"foo_bar\" FOO-BAR)~:@>")))
+      (etypecase name
+       (string
+        (values (guess-lisp-name-from-alien-name name)
+                (coerce name 'simple-string)))
+       (symbol
+        (values name (guess-alien-name-from-lisp-name name)))
+       (list
+        (unless (and (proper-list-of-length-p name 2)
+                     (symbolp (second name))
+                     (stringp (first name)))
+          (oops))
+        (values (second name) (coerce (first name) 'simple-string)))
+       (t
+        (oops))))))
 
 (defmacro define-alien-variable (name type &environment env)
   #!+sb-doc
-  "Define NAME as an external alien variable of type TYPE. NAME should be
-   a list of a string holding the alien name and a symbol to use as the Lisp
-   name. If NAME is just a symbol or string, then the other name is guessed
-   from the one supplied."
+  "Define NAME as an external alien variable of type TYPE. NAME should
+be a list of a string holding the alien name and a symbol to use as
+the Lisp name. If NAME is just a symbol or string, then the other name
+is guessed from the one supplied."
   (multiple-value-bind (lisp-name alien-name) (pick-lisp-and-alien-names name)
     (with-auxiliary-alien-types env
       (let ((alien-type (parse-alien-type type env)))
@@ -68,20 +78,27 @@
     (setf (info :variable :where-from lisp-name) :defined)
     (setf (info :variable :alien-info lisp-name)
           (make-heap-alien-info :type type
-                                :sap-form `(foreign-symbol-sap ',alien-name t)))))
+                                :alien-name alien-name
+                                :datap t))))
+
+(defun alien-value (symbol)
+  #!+sb-doc
+  "Returns the value of the alien variable bound to SYMBOL. Signals an
+error if SYMBOL is not bound to an alien variable, or if the alien
+variable is undefined."
+  (%heap-alien (or (info :variable :alien-info symbol)
+                   (error 'unbound-variable :name symbol))))
 
 (defmacro extern-alien (name type &environment env)
   #!+sb-doc
-  "Access the alien variable named NAME, assuming it is of type TYPE. This
-   is SETFable."
+  "Access the alien variable named NAME, assuming it is of type TYPE.
+This is SETFable."
   (let* ((alien-name (etypecase name
                        (symbol (guess-alien-name-from-lisp-name name))
                        (string name)))
          (alien-type (parse-alien-type type env))
          (datap (not (alien-fun-type-p alien-type))))
-    `(%heap-alien ',(make-heap-alien-info
-                     :type alien-type
-                     :sap-form `(foreign-symbol-sap ',alien-name ,datap)))))
+    `(%alien-value (foreign-symbol-sap ,alien-name ,datap) 0 ',alien-type)))
 
 (defmacro with-alien (bindings &body body &environment env)
   #!+sb-doc
@@ -136,13 +153,11 @@
                              ,@body)))))
                     (:extern
                      (/show0 ":EXTERN case")
-                     (let ((info (make-heap-alien-info
-                                  :type alien-type
-                                  :sap-form `(foreign-symbol-sap ',initial-value
-                                                                 ,datap))))
-                       `((symbol-macrolet
-                             ((,symbol (%heap-alien ',info)))
-                           ,@body))))
+                     `((symbol-macrolet
+                           ((,symbol
+                              (%alien-value
+                               (foreign-symbol-sap ,initial-value ,datap) 0 ,alien-type)))
+                         ,@body)))
                     (:local
                      (/show0 ":LOCAL case")
                      (let* ((var (sb!xc:gensym "VAR"))
@@ -229,12 +244,38 @@
 
 (defmacro make-alien (type &optional size &environment env)
   #!+sb-doc
-  "Allocate an alien of type TYPE and return an alien pointer to it. If SIZE
-is supplied, how it is interpreted depends on TYPE. If TYPE is an array type,
-SIZE is used as the first dimension for the allocated array. If TYPE is not an
-array, then SIZE is the number of elements to allocate. The memory is
-allocated using ``malloc'', so it can be passed to foreign functions which use
-``free''."
+  "Allocate an alien of type TYPE in foreign heap, and return an alien
+pointer to it. The allocated memory is not initialized, and may
+contain garbage. The memory is allocated using malloc(3), so it can be
+passed to foreign functions which use free(3), or released using
+FREE-ALIEN.
+
+For alien stack allocation, see macro WITH-ALIEN.
+
+The TYPE argument is not evaluated. If SIZE is supplied, how it is
+interpreted depends on TYPE:
+
+  * When TYPE is a foreign array type, an array of that type is
+    allocated, and a pointer to it is returned. Note that you
+    must use DEREF to first access the arrey through the pointer.
+
+    If supplied, SIZE is used as the first dimension for the array.
+
+  * When TYPE is any other foreign type, then an object for that
+    type is allocated, and a pointer to it is returned. So
+    (make-alien int) returns a (* int).
+
+    If SIZE is specified, then a block of that many objects is
+    allocated, with the result pointing to the first one.
+
+Examples:
+
+  (defvar *foo* (make-alien (array char 10)))
+  (type-of *foo*)                 ; => (alien (* (array (signed 8) 10)))
+  (setf (deref (deref foo) 0) 10) ; => 10
+
+  (make-alien char 12)            ; => (alien (* (signed 8)))
+"
   (let ((alien-type (if (alien-type-p type)
                         type
                         (parse-alien-type type env))))
@@ -269,27 +310,77 @@ allocated using ``malloc'', so it can be passed to foreign functions which use
         ;; undesirable, in most uses of MAKE-ALIEN the %SAP-ALIEN
         ;; cannot be optimized away.
         `(locally (declare (muffle-conditions compiler-note))
-           (%sap-alien (%make-alien (* ,(align-offset bits alignment)
-                                       ,size-expr))
+           ;; FIXME: Do we really need the ASH/+7 here after ALIGN-OFFSET?
+           (%sap-alien (%make-alien (* ,(ash (+ 7 (align-offset bits alignment)) -3)
+                                       (the index ,size-expr)))
                        ',(make-alien-pointer-type :to alien-type)))))))
+
+(defun malloc-error (bytes errno)
+  (error 'simple-storage-condition
+         :format-control "~A: malloc() of ~S bytes failed."
+         :format-arguments (list (strerror errno) bytes)))
 
 ;;; Allocate a block of memory at least BITS bits long and return a
 ;;; system area pointer to it.
 #!-sb-fluid (declaim (inline %make-alien))
-(defun %make-alien (bits)
-  (declare (type index bits))
-  (alien-funcall (extern-alien "malloc"
-                               (function system-area-pointer unsigned))
-                 (ash (the index (+ bits 7)) -3)))
+(defun %make-alien (bytes)
+  (declare (type index bytes)
+           (optimize (sb!c:alien-funcall-saves-fp-and-pc 0)))
+  (let ((sap (alien-funcall (extern-alien "malloc"
+                                          (function system-area-pointer size-t))
+                            bytes)))
+    (if (and (not (eql 0 bytes)) (eql 0 (sap-int sap)))
+        (malloc-error bytes (get-errno))
+        sap)))
 
 #!-sb-fluid (declaim (inline free-alien))
 (defun free-alien (alien)
   #!+sb-doc
-  "Dispose of the storage pointed to by ALIEN. ALIEN must have been allocated
-   by MAKE-ALIEN or malloc(3)."
+  "Dispose of the storage pointed to by ALIEN. The ALIEN must have been
+allocated by MAKE-ALIEN, MAKE-ALIEN-STRING or malloc(3)."
   (alien-funcall (extern-alien "free" (function (values) system-area-pointer))
                  (alien-sap alien))
   nil)
+
+(declaim (type (sfunction * system-area-pointer) %make-alien-string))
+(defun %make-alien-string (string &key (start 0) end
+                                       (external-format :default)
+                                       (null-terminate t))
+  ;; FIXME: This is slow. We want a function to get the length of the
+  ;; encoded string so we can allocate the foreign memory first and
+  ;; encode directly there.
+  (let* ((octets (string-to-octets string
+                                   :start start :end end
+                                   :external-format external-format
+                                   :null-terminate null-terminate))
+         (count (length octets))
+         (buf (%make-alien count)))
+    (sb!kernel:copy-ub8-to-system-area octets 0 buf 0 count)
+    buf))
+
+(defun make-alien-string (string &rest rest
+                                 &key (start 0) end
+                                      (external-format :default)
+                                      (null-terminate t))
+  "Copy part of STRING delimited by START and END into freshly
+allocated foreign memory, freeable using free(3) or FREE-ALIEN.
+Returns the allocated string as a (* CHAR) alien, and the number of
+bytes allocated as secondary value.
+
+The string is encoded using EXTERNAL-FORMAT. If NULL-TERMINATE is
+true (the default), the alien string is terminated by an additional
+null byte.
+"
+  (declare (ignore start end external-format null-terminate))
+  (multiple-value-bind (sap bytes)
+      (apply #'%make-alien-string string rest)
+    (values (%sap-alien sap (parse-alien-type '(* char) nil))
+            bytes)))
+
+(define-compiler-macro make-alien-string (&rest args)
+  `(multiple-value-bind (sap bytes) (%make-alien-string ,@args)
+     (values (%sap-alien sap ',(parse-alien-type '(* char) nil))
+             bytes)))
 
 ;;;; the SLOT operator
 
@@ -315,9 +406,9 @@ allocated using ``malloc'', so it can be passed to foreign functions which use
        (slot (deref alien) slot))
       (alien-record-type
        (let ((field (slot-or-lose type slot)))
-         (extract-alien-value (alien-value-sap alien)
-                              (alien-record-field-offset field)
-                              (alien-record-field-type field)))))))
+         (%alien-value (alien-value-sap alien)
+                       (alien-record-field-offset field)
+                       (alien-record-field-type field)))))))
 
 ;;; Deposit the value in the specified slot of the record ALIEN. If
 ;;; the ALIEN is really a pointer, DEREF it first. The compiler uses
@@ -332,10 +423,10 @@ allocated using ``malloc'', so it can be passed to foreign functions which use
        (%set-slot (deref alien) slot value))
       (alien-record-type
        (let ((field (slot-or-lose type slot)))
-         (deposit-alien-value (alien-value-sap alien)
-                              (alien-record-field-offset field)
-                              (alien-record-field-type field)
-                              value))))))
+         (setf (%alien-value (alien-value-sap alien)
+                             (alien-record-field-offset field)
+                             (alien-record-field-type field))
+               value))))))
 
 ;;; Compute the address of the specified slot and return a pointer to it.
 (defun %slot-addr (alien slot)
@@ -405,19 +496,19 @@ allocated using ``malloc'', so it can be passed to foreign functions which use
            (type list indices)
            (optimize (inhibit-warnings 3)))
   (multiple-value-bind (target-type offset) (deref-guts alien indices)
-    (extract-alien-value (alien-value-sap alien)
-                         offset
-                         target-type)))
+    (%alien-value (alien-value-sap alien)
+                  offset
+                  target-type)))
 
 (defun %set-deref (alien value &rest indices)
   (declare (type alien-value alien)
            (type list indices)
            (optimize (inhibit-warnings 3)))
   (multiple-value-bind (target-type offset) (deref-guts alien indices)
-    (deposit-alien-value (alien-value-sap alien)
-                         offset
-                         target-type
-                         value)))
+    (setf (%alien-value (alien-value-sap alien)
+                        offset
+                        target-type)
+          value)))
 
 (defun %deref-addr (alien &rest indices)
   (declare (type alien-value alien)
@@ -432,22 +523,22 @@ allocated using ``malloc'', so it can be passed to foreign functions which use
 (defun %heap-alien (info)
   (declare (type heap-alien-info info)
            (optimize (inhibit-warnings 3)))
-  (extract-alien-value (eval (heap-alien-info-sap-form info))
-                       0
-                       (heap-alien-info-type info)))
+  (%alien-value (heap-alien-info-sap info)
+                0
+                (heap-alien-info-type info)))
 
 (defun %set-heap-alien (info value)
   (declare (type heap-alien-info info)
            (optimize (inhibit-warnings 3)))
-  (deposit-alien-value (eval (heap-alien-info-sap-form info))
-                       0
-                       (heap-alien-info-type info)
-                       value))
+  (setf (%alien-value (heap-alien-info-sap info)
+                      0
+                      (heap-alien-info-type info))
+        value))
 
 (defun %heap-alien-addr (info)
   (declare (type heap-alien-info info)
            (optimize (inhibit-warnings 3)))
-  (%sap-alien (eval (heap-alien-info-sap-form info))
+  (%sap-alien (heap-alien-info-sap info)
               (make-alien-pointer-type :to (heap-alien-info-type info))))
 
 ;;;; accessing local aliens
@@ -573,19 +664,19 @@ allocated using ``malloc'', so it can be passed to foreign functions which use
   (funcall (coerce-to-interpreted-function (compute-deport-alloc-lambda type))
            value type))
 
-(defun extract-alien-value (sap offset type)
+(defun %alien-value (sap offset type)
   (declare (type system-area-pointer sap)
            (type unsigned-byte offset)
            (type alien-type type))
   (funcall (coerce-to-interpreted-function (compute-extract-lambda type))
            sap offset type))
 
-(defun deposit-alien-value (sap offset type value)
+(defun (setf %alien-value) (value sap offset type)
   (declare (type system-area-pointer sap)
            (type unsigned-byte offset)
            (type alien-type type))
   (funcall (coerce-to-interpreted-function (compute-deposit-lambda type))
-           sap offset type value))
+           value sap offset type))
 
 ;;;; ALIEN-FUNCALL, DEFINE-ALIEN-ROUTINE
 
@@ -738,6 +829,10 @@ allocated using ``malloc'', so it can be passed to foreign functions which use
         (and (alien-value-p object)
              (alien-subtype-p (alien-value-type object) type)))))
 
+(defun alien-value-typep (object type)
+  (when (alien-value-p object)
+    (alien-subtype-p (alien-value-type object) type)))
+
 ;;;; ALIEN CALLBACKS
 ;;;;
 ;;;; See "Foreign Linkage / Callbacks" in the SBCL Internals manual.
@@ -772,8 +867,10 @@ we don't create new wrappers if one for the same specifier already exists.")
   "Lisp trampoline store: assembler wrappers contain indexes to this, and
 ENTER-ALIEN-CALLBACK pulls the corresponsing trampoline out and calls it.")
 
-(defun %alien-callback-sap (specifier result-type argument-types function wrapper)
-  (let ((key (cons specifier function)))
+(defun %alien-callback-sap (specifier result-type argument-types function wrapper
+                            &optional call-type)
+  (declare #!-x86 (ignore call-type))
+  (let ((key (list specifier function)))
     (or (gethash key *alien-callbacks*)
         (setf (gethash key *alien-callbacks*)
               (let* ((index (fill-pointer *alien-callback-trampolines*))
@@ -784,8 +881,17 @@ ENTER-ALIEN-CALLBACK pulls the corresponsing trampoline out and calls it.")
                      ;; per-function tramp would need assembler at
                      ;; runtime. Possibly we could even pregenerate
                      ;; the code and just patch the index in later.
-                     (assembler-wrapper (alien-callback-assembler-wrapper
-                                         index result-type argument-types)))
+                     (assembler-wrapper
+                      (alien-callback-assembler-wrapper
+                       index result-type argument-types
+                       #!+x86
+                       (if (eq call-type :stdcall)
+                           (ceiling
+                            (apply #'+
+                                   (mapcar 'alien-type-word-aligned-bits
+                                           argument-types))
+                            8)
+                           0))))
                 (vector-push-extend
                  (alien-callback-lisp-trampoline wrapper function)
                  *alien-callback-trampolines*)
@@ -822,22 +928,31 @@ ENTER-ALIEN-CALLBACK pulls the corresponsing trampoline out and calls it.")
                             :local ,(alien-callback-accessor-form
                                      spec 'args-sap offset))
                  do (incf offset (alien-callback-argument-bytes spec env)))
-           ,(flet ((store (spec)
+           ,(flet ((store (spec real-type)
                           (if spec
                               `(setf (deref (sap-alien res-sap (* ,spec)))
-                                     (funcall function ,@arguments))
+                                     ,(if real-type
+                                          `(the ,real-type
+                                             (funcall function ,@arguments))
+                                          `(funcall function ,@arguments)))
                               `(funcall function ,@arguments))))
                   (cond ((alien-void-type-p result-type)
-                         (store nil))
+                         (store nil nil))
                         ((alien-integer-type-p result-type)
+                         ;; Integer types should be padded out to a full
+                         ;; register width, to comply with most ABI calling
+                         ;; conventions, but should be typechecked on the
+                         ;; declared type width, hence the following:
                          (if (alien-integer-type-signed result-type)
                              (store `(signed
-                                      ,(alien-type-word-aligned-bits result-type)))
+                                      ,(alien-type-word-aligned-bits result-type))
+                                    `(signed-byte ,(alien-type-bits result-type)))
                              (store
                               `(unsigned
-                                ,(alien-type-word-aligned-bits result-type)))))
+                                ,(alien-type-word-aligned-bits result-type))
+                              `(unsigned-byte ,(alien-type-bits result-type)))))
                         (t
-                         (store (unparse-alien-type result-type)))))))
+                         (store (unparse-alien-type result-type) nil))))))
        (values))))
 
 (defun invalid-alien-callback (&rest arguments)
@@ -855,11 +970,17 @@ ENTER-ALIEN-CALLBACK pulls the corresponsing trampoline out and calls it.")
   (destructuring-bind (function result-type &rest argument-types)
       specifier
     (aver (eq 'function function))
-    (values (let ((*values-type-okay* t))
-              (parse-alien-type result-type env))
-            (mapcar (lambda (spec)
-                      (parse-alien-type spec env))
-                    argument-types))))
+    (multiple-value-bind (bare-result-type calling-convention)
+        (typecase result-type
+          ((cons calling-convention *)
+             (values (second result-type) (first result-type)))
+          (t result-type))
+      (values (let ((*values-type-okay* t))
+                (parse-alien-type bare-result-type env))
+              (mapcar (lambda (spec)
+                        (parse-alien-type spec env))
+                      argument-types)
+              calling-convention))))
 
 (defun alien-void-type-p (type)
   (and (alien-values-type-p type) (not (alien-values-type-values type))))
@@ -895,7 +1016,8 @@ SPECIFIER and FUNCTION already exists, it is returned instead of consing a new
 one."
   ;; Pull out as much work as is convenient to macro-expansion time, specifically
   ;; everything that can be done given just the SPECIFIER and ENV.
-  (multiple-value-bind (result-type argument-types) (parse-alien-ftype specifier env)
+  (multiple-value-bind (result-type argument-types call-type)
+      (parse-alien-ftype specifier env)
     `(%sap-alien
       (%alien-callback-sap ',specifier ',result-type ',argument-types
                            ,function
@@ -903,7 +1025,8 @@ one."
                                (setf (gethash ',specifier *alien-callback-wrappers*)
                                      (compile nil
                                               ',(alien-callback-lisp-wrapper-lambda
-                                                 specifier result-type argument-types env)))))
+                                                 specifier result-type argument-types env))))
+                           ,call-type)
       ',(parse-alien-type specifier env))))
 
 (defun alien-callback-p (alien)

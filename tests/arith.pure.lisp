@@ -151,11 +151,11 @@
              ((1+ most-positive-fixnum) (1+ most-positive-fixnum) nil)
              ((1+ most-positive-fixnum) (1- most-negative-fixnum) t)
              (1 (ash most-negative-fixnum 1) nil)
-             (#.(- sb-vm:n-word-bits sb-vm:n-lowtag-bits) most-negative-fixnum t)
-             (#.(1+ (- sb-vm:n-word-bits sb-vm:n-lowtag-bits)) (ash most-negative-fixnum 1) t)
-             (#.(+ 2 (- sb-vm:n-word-bits sb-vm:n-lowtag-bits)) (ash most-negative-fixnum 1) t)
-             (#.(+ sb-vm:n-word-bits 32) (ash most-negative-fixnum #.(+ 32 sb-vm:n-lowtag-bits 1)) nil)
-             (#.(+ sb-vm:n-word-bits 33) (ash most-negative-fixnum #.(+ 32 sb-vm:n-lowtag-bits 1)) t)))
+             (#.(- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits 1) most-negative-fixnum t)
+             (#.(1+ (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits 1)) (ash most-negative-fixnum 1) t)
+             (#.(+ 2 (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits 1)) (ash most-negative-fixnum 1) t)
+             (#.(+ sb-vm:n-word-bits 32) (ash most-negative-fixnum #.(+ 32 sb-vm:n-fixnum-tag-bits 2)) nil)
+             (#.(+ sb-vm:n-word-bits 33) (ash most-negative-fixnum #.(+ 32 sb-vm:n-fixnum-tag-bits 2)) t)))
   (destructuring-bind (index int result) x
     (assert (eq (eval `(logbitp ,index ,int)) result))))
 
@@ -339,19 +339,27 @@
            (test-op (op)
              (let ((ub `(unsigned-byte ,sb-vm:n-word-bits))
                    (sb `(signed-byte ,sb-vm:n-word-bits)))
-               (loop for (x y type) in `((2 1 fixnum)
-                                         (2 1 ,ub)
-                                         (2 1 ,sb)
-                                         (,(1+ (ash 1 28)) ,(1- (ash 1 28)) fixnum)
-                                         (,(+ 3 (ash 1 30)) ,(+ 2 (ash 1 30)) ,ub)
-                                         (,(- -2 (ash 1 29)) ,(- 3 (ash 1 29)) ,sb)
-                                         ,@(when (> sb-vm:n-word-bits 32)
-                                             `((,(1+ (ash 1 29)) ,(1- (ash 1 29)) fixnum)
-                                               (,(1+ (ash 1 31)) ,(1- (ash 1 31)) ,ub)
-                                               (,(- -2 (ash 1 31)) ,(- 3 (ash 1 30)) ,sb)
-                                               (,(ash 1 40) ,(ash 1 39) fixnum)
-                                               (,(ash 1 40) ,(ash 1 39) ,ub)
-                                               (,(ash 1 40) ,(ash 1 39) ,sb))))
+               (loop for (x y type)
+                     in `((2 1 fixnum)
+                          (2 1 ,ub)
+                          (2 1 ,sb)
+                          (,(1+ (ash 1 28)) ,(1- (ash 1 28)) fixnum)
+                          (,(+ 3 (ash 1 30)) ,(+ 2 (ash 1 30)) ,ub)
+                          (,(- -2 (ash 1 29)) ,(- 3 (ash 1 29)) ,sb)
+                          ,@(when (> sb-vm:n-word-bits 32)
+                              `((,(1+ (ash 1 29)) ,(1- (ash 1 29)) fixnum)
+                                (,(1+ (ash 1 31)) ,(1- (ash 1 31)) ,ub)
+                                (,(- -2 (ash 1 31)) ,(- 3 (ash 1 30)) ,sb)
+                                (,(ash 1 40) ,(ash 1 39) fixnum)
+                                (,(ash 1 40) ,(ash 1 39) ,ub)
+                                (,(ash 1 40) ,(ash 1 39) ,sb)))
+                          ;; fixnums that can be represented as 32-bit
+                          ;; sign-extended immediates on x86-64
+                          ,@(when (and (> sb-vm:n-word-bits 32)
+                                       (< sb-vm:n-fixnum-tag-bits 3))
+                              `((,(1+ (ash 1 (- 31 sb-vm:n-fixnum-tag-bits)))
+                                 ,(1- (ash 1 (- 32 sb-vm:n-fixnum-tag-bits)))
+                                 fixnum))))
                      do
                   (test-case op x y type)
                   (test-case op x x type)))))
@@ -359,3 +367,220 @@
                       < <= = >= >
                       eql
                       eq))))
+
+;; GCD used to sometimes return negative values. The following did, on 32 bit
+;; builds.
+(with-test (:name :gcd)
+  ;; from lp#413680
+  (assert (plusp (gcd 20286123923750474264166990598656
+                      680564733841876926926749214863536422912)))
+  ;; from lp#516750
+  (assert (plusp (gcd 2596102012663483082521318626691873
+                      2596148429267413814265248164610048))))
+
+(with-test (:name :expt-zero-zero)
+  ;; Check that (expt 0.0 0.0) and (expt 0 0.0) signal error, but (expt 0.0 0)
+  ;; returns 1.0
+  (assert (raises-error? (expt 0.0 0.0) sb-int:arguments-out-of-domain-error))
+  (assert (raises-error? (expt 0 0.0) sb-int:arguments-out-of-domain-error))
+  (assert (eql (expt 0.0 0) 1.0)))
+
+(with-test (:name :multiple-constant-folding)
+  (let ((*random-state* (make-random-state t)))
+    (flet ((make-args ()
+             (let (args vars)
+               (loop repeat (1+ (random 12))
+                     do (if (zerop (random 2))
+                            (let ((var (gensym)))
+                              (push var args)
+                              (push var vars))
+                            (push (- (random 21) 10) args)))
+               (values args vars))))
+      (dolist (op '(+ * logior logxor logand logeqv gcd lcm - /))
+        (loop repeat 10
+              do (multiple-value-bind (args vars) (make-args)
+                   (let ((fast (compile nil `(lambda ,vars
+                                               (,op ,@args))))
+                         (slow (compile nil `(lambda ,vars
+                                               (declare (notinline ,op))
+                                               (,op ,@args)))))
+                     (loop repeat 3
+                           do (let* ((call-args (loop repeat (length vars)
+                                                      collect (- (random 21) 10)))
+                                     (fast-result (handler-case
+                                                      (apply fast call-args)
+                                                    (division-by-zero () :div0)))
+                                     (slow-result (handler-case
+                                                      (apply slow call-args)
+                                                    (division-by-zero () :div0))))
+                                (if (eql fast-result slow-result)
+                                    (print (list :ok `(,op ,@args) :=> fast-result))
+                                    (error "oops: ~S, ~S" args call-args)))))))))))
+
+;;; (TRUNCATE <unsigned-word> <constant unsigned-word>) is optimized
+;;; to use multiplication instead of division. This propagates to FLOOR,
+;;; MOD and REM. Test that the transform is indeed triggered and test
+;;; several cases for correct results.
+(with-test (:name (:integer-division-using-multiplication :used)
+                  :skipped-on '(not (or :x86-64 :x86)))
+  (dolist (fun '(truncate floor ceiling mod rem))
+    (let* ((foo (compile nil `(lambda (x)
+                                (declare (optimize (speed 3)
+                                                   (space 1)
+                                                   (compilation-speed 0))
+                                         (type (unsigned-byte
+                                                ,sb-vm:n-word-bits) x))
+                                (,fun x 9))))
+           (disassembly (with-output-to-string (s)
+                          (disassemble foo :stream s))))
+      ;; KLUDGE copied from test :float-division-using-exact-reciprocal
+      ;; in compiler.pure.lisp.
+      (assert (and (not (search "DIV" disassembly))
+                   (search "MUL" disassembly))))))
+
+(with-test (:name (:integer-division-using-multiplication :correctness))
+  (let ((*random-state* (make-random-state t)))
+    (dolist (dividend-type `((unsigned-byte ,sb-vm:n-word-bits)
+                             (and fixnum unsigned-byte)
+                             (integer 10000 10100)))
+      (dolist (divisor `(;; Some special cases from the paper
+                         7 10 14 641 274177
+                         ;; Range extremes
+                         3
+                         ,most-positive-fixnum
+                         ,(1- (expt 2 sb-vm:n-word-bits))
+                         ;; Some random values
+                         ,@(loop for i from 8 to sb-vm:n-word-bits
+                                 for r = (random (expt 2 i))
+                                 ;; We don't want 0, 1 and powers of 2.
+                                 when (not (zerop (logand r (1- r))))
+                                 collect r)))
+        (dolist (fun '(truncate ceiling floor mod rem))
+          (let ((foo (compile nil `(lambda (x)
+                                     (declare (optimize (speed 3)
+                                                        (space 1)
+                                                        (compilation-speed 0))
+                                              (type ,dividend-type x))
+                                     (,fun x ,divisor)))))
+            (dolist (dividend `(0 1 ,most-positive-fixnum
+                                ,(1- divisor) ,divisor
+                                ,(1- (* divisor 2)) ,(* divisor 2)
+                                ,@(loop repeat 4
+                                        collect (+ 10000 (random 101)))
+                                ,@(loop for i from 4 to sb-vm:n-word-bits
+                                        for pow = (expt 2 (1- i))
+                                        for r = (+ pow (random pow))
+                                        collect r)))
+              (when (typep dividend dividend-type)
+                (multiple-value-bind (q1 r1)
+                    (funcall foo dividend)
+                  (multiple-value-bind (q2 r2)
+                      (funcall fun dividend divisor)
+                    (unless (and (= q1 q2)
+                                 (eql r1 r2))
+                      (error "bad results for ~s with dividend type ~s"
+                             (list fun dividend divisor)
+                             dividend-type))))))))))))
+
+;; The fast path for logbitp underestimated sb!vm:n-positive-fixnum-bits
+;; for > 61 bit fixnums.
+(with-test (:name :logbitp-wide-fixnum)
+  (assert (not (logbitp (1- (integer-length most-positive-fixnum))
+                        most-negative-fixnum))))
+
+;; EXPT dispatches in a complicated way on the types of its arguments.
+;; Check that all possible combinations are covered.
+(with-test (:name (:expt :argument-type-combinations))
+  (let ((numbers '(2                 ; fixnum
+                   3/5               ; ratio
+                   1.2f0             ; single-float
+                   2.0d0             ; double-float
+                   #c(3/5 1/7)       ; complex rational
+                   #c(1.2f0 1.3f0)   ; complex single-float
+                   #c(2.0d0 3.0d0))) ; complex double-float
+        (bignum (expt 2 64))
+        results)
+    (dolist (base (cons bignum numbers))
+      (dolist (power numbers)
+        (format t "(expt ~s ~s) => " base power)
+        (let ((result (expt base power)))
+          (format t "~s~%" result)
+          (push result results))))
+    (assert (every #'numberp results))))
+
+(with-test (:name :bug-741564)
+  ;; The bug was that in (expt <fixnum> <(complex double-float)>) the
+  ;; calculation was partially done only to single-float precision,
+  ;; making the complex double-float result too unprecise. Some other
+  ;; combinations of argument types were affected, too; test that all
+  ;; of them are good to double-float precision.
+  (labels ((nearly-equal-p (x y)
+             "Are the arguments equal to nearly double-float precision?"
+             (declare (type double-float x y))
+             (< (/ (abs (- x y)) (abs y))
+                (* double-float-epsilon 4))) ; Differences in the two least
+                                             ; significant mantissa bits
+                                             ; are OK.
+           (test-complex (x y)
+             (and (nearly-equal-p (realpart x) (realpart y))
+                  (nearly-equal-p (imagpart x) (imagpart y))))
+           (print-result (msg base power got expected)
+             (format t "~a (expt ~s ~s)~%got      ~s~%expected ~s~%"
+                     msg base power got expected)))
+    (let ((n-broken 0))
+      (flet ((test (base power coerce-to-type)
+               (let* ((got (expt base power))
+                      (expected (expt (coerce base coerce-to-type) power))
+                      (result (test-complex got expected)))
+                 (print-result (if result "Good:" "Bad:")
+                               base power got expected)
+                 (unless result
+                   (incf n-broken)))))
+        (dolist (base (list 2                    ; fixnum
+                            (expt 2 64)          ; bignum
+                            3/5                  ; ratio
+                            2.0f0))              ; single-float
+          (let ((power #c(-2.5d0 -4.5d0)))       ; complex double-float
+            (test base power 'double-float)))
+        (dolist (base (list #c(2.0f0 3.0f0)      ; complex single-float
+                            #c(2 3)              ; complex fixnum
+                            (complex (expt 2 64) (expt 2 65))
+                                                 ; complex bignum
+                            #c(3/5 1/7)))        ; complex ratio
+          (dolist (power (list #c(-2.5d0 -4.5d0) ; complex double-float
+                               -2.5d0))          ; double-float
+            (test base power '(complex double-float)))))
+      (when (> n-broken 0)
+        (error "Number of broken combinations: ~a" n-broken)))))
+
+(with-test (:name (:ldb :rlwinm :ppc))
+  (let ((one (compile nil '(lambda (a) (ldb (byte 9 27) a))))
+        (two (compile nil '(lambda (a)
+                            (declare (type (integer -3 57216651) a))
+                            (ldb (byte 9 27) a)))))
+    (assert (= 0 (- (funcall one 10) (funcall two 10))))))
+
+;; The ISQRT implementation is sufficiently complicated that it should
+;; be tested.
+(with-test (:name :isqrt)
+  (labels ((test (x)
+             (let* ((r (isqrt x))
+                    (r2 (expt r 2))
+                    (s2 (expt (1+ r) 2)))
+               (unless (and (<= r2 x)
+                            (> s2 x))
+                 (error "isqrt failure for ~a" x))))
+           (tests (x)
+             (test x)
+             (let ((x2 (expt x 2)))
+               (test x2)
+               (test (1+ x2))
+               (test (1- x2)))))
+    (loop for i from 1 to 200
+          for pow = (expt 2 (1- i))
+          for j = (+ pow (random pow))
+          do
+          (tests i)
+          (tests j))
+    (dotimes (i 10)
+      (tests (random (expt 2 (+ 1000 (random 10000))))))))

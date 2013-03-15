@@ -122,6 +122,12 @@
  ;; original CMU CL code.)
  ; :sb-show-assem
 
+ ;; Compile the C runtime with support for low-level debugging output
+ ;; through FSHOW and FSHOW_SIGNAL.  If enabled, this feature allows
+ ;; users to turn on such debugging output using environment variables at
+ ;; run-time.
+ ; :sb-qshow
+
  ;; Setting this makes SBCL more "fluid", i.e. more amenable to
  ;; modification at runtime, by suppressing various INLINE declarations,
  ;; compiler macro definitions, FREEZE-TYPE declarations; and by
@@ -216,29 +222,28 @@
 
  ;; low-level thread primitives support
  ;;
- ;; As of SBCL 0.8, this is only supposed to work in x86 Linux with
- ;; NPTL support (usually kernel 2.6, though sme Red Hat distributions
- ;; with older kernels also have it) and is implemented using clone(2)
- ;; and the %fs segment register.  Note that no consistent effort to
- ;; audit the SBCL library code for thread safety has been performed,
- ;; so caveat executor.
+ ;; As of SBCL 1.0.33.26, threads are part of the default build on
+ ;; x86oid Linux. Other platforms that support them include
+ ;; x86oid Darwin, FreeBSD, and Solaris.
  ; :sb-thread
 
- ;; lutex support
+ ;; futex support
  ;;
  ;; While on linux we are able to use futexes for our locking
- ;; primitive, on other platforms we don't have this luxury. NJF's
- ;; lutexes present a locking API similar to the futex-based API that
- ;; allows for sb-thread support on x86 OS X, Solaris and
- ;; FreeBSD.
+ ;; primitive, on other platforms we don't have this luxury.
  ;;
- ; :sb-lutex
+ ; :sb-futex
 
  ;; On some operating systems the FS segment register (used for SBCL's
  ;; thread local storage) is not reliably preserved in signal
  ;; handlers, so we need to restore its value from the pthread thread
  ;; local storage.
- ; :restore-tls-segment-register-from-tls
+ ; :restore-fs-segment-register-from-tls
+
+ ;; On some x86oid operating systems (darwin) SIGTRAP is not reliably
+ ;; delivered for the INT3 instruction, so we use the UD2 instruction
+ ;; which generates SIGILL instead.
+ ; :ud2-breakpoints
 
  ;; Support for detection of unportable code (when applied to the
  ;; COMMON-LISP package, or SBCL-internal pacakges) or bad-neighbourly
@@ -266,6 +271,11 @@
  ;; (slime-edit-uses) work which lists call/expansion/etc. sites.
  ;; It'll increase the core size by major 5-6mB, though.
  ; :sb-xref-for-internals
+
+ ;; We support package local nicknames. No :sb-prefix here as we vainly
+ ;; believe our API is worth copying to other implementations as well.
+ ;; This doesn't affect the build at all, merely declares how things are.
+ :package-local-nicknames
 
  ;; This affects the definition of a lot of things in bignum.lisp. It
  ;; doesn't seem to be documented anywhere what systems it might apply
@@ -306,6 +316,37 @@
  ;; want to disable it, if you need to pass file descriptors to
  ;; foreign code that uses a 32-bit off_t.
  ; :largefile
+
+ ;; Enabled automatically on platforms that have VOPs to compute the
+ ;; high half of a full word-by-word multiplication.  When disabled,
+ ;; SB-KERNEL:%MULTIPLY-HIGH is implemented in terms of
+ ;; SB-BIGNUM:%MULTIPLY.
+ ; :multiply-high-vops
+
+ ;; SBCL has optional support for zlib-based compressed core files.  Enable
+ ;; this feature to compile it in.  Obviously, doing so adds a dependency
+ ;; on zlib.
+ ; :sb-core-compression
+
+ ;; On certain thread-enabled platforms, synchronization between threads
+ ;; for the purpose of stopping and starting the world around GC can be
+ ;; performed using safepoints instead of signals.  Enable this feature
+ ;; to compile with safepoints and to use them for GC.
+ ;; (Replaces use of SIG_STOP_FOR_GC.)
+ ; :sb-safepoint
+
+ ;; When compiling with safepoints, the INTERRUPT-THREAD mechanism can
+ ;; also use safepoints to roll the target thread to a point at which it
+ ;; can be interrupted safely, instead of using a signal for this
+ ;; purpose.  Enable this feature in addition to :SB-SAFEPOINT to enable
+ ;; such behaviour.
+ ;; (Replaces use of SIGPIPE, except to wake up syscalls.)
+ ; :sb-thruption
+
+ ;; When compiling with safepoints and thruptions, the TIMER facility
+ ;; can replace its use of setitimer with a background thread.
+ ;; (Replaces use of SIGALRM.)
+ ; :sb-wtimer
 
  ;;
  ;; miscellaneous notes on other things which could have special significance
@@ -387,6 +428,10 @@
  ;;
  ;;   :compare-and-swap-vops
  ;;     The backend implements compare-and-swap VOPs.
+ ;;
+ ;;   :memory-barrier-vops
+ ;;     Memory barriers (for multi-threaded synchronization) have been
+ ;;     implemented for this platform.
  ;;
  ;; operating system features:
  ;;   :unix    = We're intended to run under some Unix-like OS. (This is not

@@ -422,8 +422,8 @@
         (format stream "~A~Vt~W~%" '.align
                 (dstate-argument-column dstate)
                 alignment))
-      (incf(dstate-next-offs dstate)
-           (- (align location alignment) location)))
+      (incf (dstate-next-offs dstate)
+            (- (align location alignment) location)))
     nil))
 
 (defun rewind-current-segment (dstate segment)
@@ -471,20 +471,42 @@
         (unless (= (dstate-next-offs dstate) cur-offs)
           (return prefix-p))))))
 
-(defun handle-bogus-instruction (stream dstate)
+;;; Print enough spaces to fill the column used for instruction bytes,
+;;; assuming that N-BYTES many instruction bytes have already been
+;;; printed in it, then print an additional space as separator to the
+;;; opcode column.
+(defun pad-inst-column (stream n-bytes)
+  (declare (type stream stream)
+           (type text-width n-bytes))
+  (when (> *disassem-inst-column-width* 0)
+    (dotimes (i (- *disassem-inst-column-width* (* 2 n-bytes)))
+      (write-char #\space stream))
+    (write-char #\space stream)))
+
+(defun handle-bogus-instruction (stream dstate prefix-len)
   (let ((alignment (dstate-alignment dstate)))
     (unless (null stream)
       (multiple-value-bind (words bytes)
           (truncate alignment sb!vm:n-word-bytes)
         (when (> words 0)
-          (print-inst (* words sb!vm:n-word-bytes) stream dstate))
+          (print-inst (* words sb!vm:n-word-bytes) stream dstate
+                      :trailing-space nil))
         (when (> bytes 0)
-          (print-inst bytes stream dstate)))
-      (print-bytes alignment stream dstate))
+          (print-inst bytes stream dstate :trailing-space nil)))
+      (pad-inst-column stream (+ prefix-len alignment))
+      (decf (dstate-cur-offs dstate) prefix-len)
+      (print-bytes (+ prefix-len alignment) stream dstate))
     (incf (dstate-next-offs dstate) alignment)))
 
 ;;; Iterate through the instructions in SEGMENT, calling FUNCTION for
 ;;; each instruction, with arguments of CHUNK, STREAM, and DSTATE.
+;;; Additionally, unless STREAM is NIL, several items are output to it:
+;;; things printed from several hooks, for example labels, and instruction
+;;; bytes before FUNCTION is called, notes and a newline afterwards.
+;;; Instructions having an INST-PRINTER of NIL are treated as prefix
+;;; instructions which makes them print on the same line as the following
+;;; instruction, outputting their INST-PRINT-NAME (unless that is NIL)
+;;; before FUNCTION is called for the following instruction.
 (defun map-segment-instructions (function segment dstate &optional stream)
   (declare (type function function)
            (type segment segment)
@@ -493,7 +515,8 @@
 
   (let ((ispace (get-inst-space))
         (prefix-p nil) ; just processed a prefix inst
-        (prefix-len 0)) ; length of any prefix instruction(s)
+        (prefix-len 0) ; sum of lengths of any prefix instruction(s)
+        (prefix-print-names nil)) ; reverse list of prefixes seen
 
     (rewind-current-segment dstate segment)
 
@@ -501,6 +524,11 @@
       (when (>= (dstate-cur-offs dstate)
                 (seg-length (dstate-segment dstate)))
         ;; done!
+        (when (and stream (> prefix-len 0))
+          (pad-inst-column stream prefix-len)
+          (decf (dstate-cur-offs dstate) prefix-len)
+          (print-bytes prefix-len stream dstate)
+          (incf (dstate-cur-offs dstate) prefix-len))
         (return))
 
       (setf (dstate-next-offs dstate) (dstate-cur-offs dstate))
@@ -514,56 +542,73 @@
         (sb!sys:without-gcing
          (setf (dstate-segment-sap dstate) (funcall (seg-sap-maker segment)))
 
-         (let ((chunk
-                (sap-ref-dchunk (dstate-segment-sap dstate)
-                                (dstate-cur-offs dstate)
-                                (dstate-byte-order dstate))))
-           (let ((fun-prefix-p (call-fun-hooks chunk stream dstate)))
-             (if (> (dstate-next-offs dstate) (dstate-cur-offs dstate))
-                 (setf prefix-p fun-prefix-p)
+         (let* ((chunk
+                 (sap-ref-dchunk (dstate-segment-sap dstate)
+                                 (dstate-cur-offs dstate)
+                                 (dstate-byte-order dstate)))
+                (fun-prefix-p (call-fun-hooks chunk stream dstate)))
+           (if (> (dstate-next-offs dstate) (dstate-cur-offs dstate))
+               (setf prefix-p fun-prefix-p)
                (let ((inst (find-inst chunk ispace)))
                  (cond ((null inst)
-                        (handle-bogus-instruction stream dstate))
+                        (handle-bogus-instruction stream dstate prefix-len)
+                        (setf prefix-p nil))
                        (t
-                        (setf (dstate-inst-properties dstate) nil)
                         (setf (dstate-next-offs dstate)
                               (+ (dstate-cur-offs dstate)
                                  (inst-length inst)))
-                        (let ((orig-next (dstate-next-offs dstate)))
-                          (print-inst (inst-length inst) stream dstate :trailing-space nil)
-                          (let ((prefilter (inst-prefilter inst))
-                                (control (inst-control inst)))
-                            (when prefilter
-                              (funcall prefilter chunk dstate))
+                        (let ((orig-next (dstate-next-offs dstate))
+                              (prefilter (inst-prefilter inst))
+                              (control (inst-control inst)))
+                          (print-inst (inst-length inst) stream dstate
+                                      :trailing-space nil)
+                          (when prefilter
+                            (funcall prefilter chunk dstate))
 
-                            (setf prefix-p (null (inst-printer inst)))
+                          (setf prefix-p (null (inst-printer inst)))
 
-                            ;; print any instruction bytes recognized by the prefilter which calls read-suffix
-                            ;; and updates next-offs
-                            (when stream
-                              (let ((suffix-len (- (dstate-next-offs dstate) orig-next)))
-                                (when (plusp suffix-len)
-                                  (print-inst suffix-len stream dstate :offset (inst-length inst) :trailing-space nil))
-                                (unless prefix-p
-                                  (dotimes (i (- *disassem-inst-column-width* (* 2 (+ (inst-length inst) suffix-len prefix-len))))
-                                    (write-char #\space stream))
-                                  (write-char #\space stream))
+                          (when stream
+                            ;; Print any instruction bytes recognized by
+                            ;; the prefilter which calls read-suffix and
+                            ;; updates next-offs.
+                            (let ((suffix-len (- (dstate-next-offs dstate)
+                                                 orig-next)))
+                              (when (plusp suffix-len)
+                                (print-inst suffix-len stream dstate
+                                            :offset (inst-length inst)
+                                            :trailing-space nil))
+                              ;; Keep track of the number of bytes
+                              ;; printed so far.
+                              (incf prefix-len (+ (inst-length inst)
+                                                  suffix-len)))
+                            (if prefix-p
+                                (let ((name (inst-print-name inst)))
+                                  (when name
+                                    (push name prefix-print-names)))
+                                (progn
+                                  ;; PREFIX-LEN includes the length of the
+                                  ;; current (non-prefix) instruction here.
+                                  (pad-inst-column stream prefix-len)
+                                  (dolist (name (reverse prefix-print-names))
+                                    (princ name stream)
+                                    (write-char #\space stream)))))
 
-                                (setf prefix-len (+ (inst-length inst) suffix-len))))
+                          (funcall function chunk inst)
 
-                            (funcall function chunk inst)
-
-                            (when control
-                              (funcall control chunk inst stream dstate))
-                            ))))))))))
+                          (when control
+                            (funcall control chunk inst stream dstate))))))))))
 
       (setf (dstate-cur-offs dstate) (dstate-next-offs dstate))
 
-      (unless (null stream)
+      (when stream
         (unless prefix-p
-          (setf prefix-len 0)
+          (setf prefix-len 0
+                prefix-print-names nil)
           (print-notes-and-newline stream dstate))
-        (setf (dstate-output-state dstate) nil)))))
+        (setf (dstate-output-state dstate) nil))
+      (unless prefix-p
+        (setf (dstate-inst-properties dstate) nil)))))
+
 
 ;;; Make an initial non-printing disassembly pass through DSTATE,
 ;;; noting any addresses that are referenced by instructions in this
@@ -742,14 +787,13 @@
 
 ;;; Print NUM instruction bytes to STREAM as hex values.
 (defun print-inst (num stream dstate &key (offset 0) (trailing-space t))
-  (let ((sap (dstate-segment-sap dstate))
-        (start-offs (+ offset (dstate-cur-offs dstate))))
-    (dotimes (offs num)
-      (format stream "~2,'0x" (sb!sys:sap-ref-8 sap (+ offs start-offs))))
-    (when trailing-space
-      (dotimes (i (- *disassem-inst-column-width* (* 2 num)))
-        (write-char #\space stream))
-      (write-char #\space stream))))
+  (when (> *disassem-inst-column-width* 0)
+    (let ((sap (dstate-segment-sap dstate))
+          (start-offs (+ offset (dstate-cur-offs dstate))))
+      (dotimes (offs num)
+        (format stream "~2,'0x" (sb!sys:sap-ref-8 sap (+ offs start-offs))))
+      (when trailing-space
+        (pad-inst-column stream num)))))
 
 ;;; Disassemble NUM bytes to STREAM as simple `BYTE' instructions.
 (defun print-bytes (num stream dstate)
@@ -795,21 +839,20 @@
 
 ;;; Make a disassembler-state object.
 (defun make-dstate (&optional (fun-hooks *default-dstate-hooks*))
-  (let ((sap
-         ;; FIXME: What is this for? This cannot be safe!
-         (sb!sys:vector-sap (coerce #() '(vector (unsigned-byte 8)))))
-        (alignment *disassem-inst-alignment-bytes*)
+  (let ((alignment *disassem-inst-alignment-bytes*)
         (arg-column
-         (+ (or *disassem-opcode-column-width* 0)
+         (+ 2
             *disassem-location-column-width*
             1
-            label-column-width)))
+            label-column-width
+            *disassem-inst-column-width*
+            (if (zerop *disassem-inst-column-width*) 0 1)
+            *disassem-opcode-column-width*)))
 
     (when (> alignment 1)
       (push #'alignment-hook fun-hooks))
 
-    (%make-dstate :segment-sap sap
-                  :fun-hooks fun-hooks
+    (%make-dstate :fun-hooks fun-hooks
                   :argument-column arg-column
                   :alignment alignment
                   :byte-order sb!c:*backend-byte-order*)))
@@ -942,110 +985,30 @@
                               (:copier nil))
   (debug-source nil :type (or null sb!di:debug-source))
   (toplevel-form-index -1 :type fixnum)
-  (toplevel-form nil :type list)
-  (form-number-mapping-table nil :type (or null (vector list)))
   (last-location-retrieved nil :type (or null sb!di:code-location))
   (last-form-retrieved -1 :type fixnum))
 
-;;; OAOO note: this shares a lot of implementation with
-;;; SB-DEBUG::GET-FILE-TOPLEVEL-FORM.  Perhaps these should be merged
-;;; somehow.
-(defun get-toplevel-form (debug-source tlf-index)
-  (cond
-    ((sb!di:debug-source-namestring debug-source)
-     (let ((namestring (sb!di:debug-source-namestring debug-source)))
-       (cond ((not (probe-file namestring))
-              (warn "The source file ~S no longer seems to exist." namestring)
-              nil)
-             (t
-              (let ((start-positions
-                     (sb!di:debug-source-start-positions debug-source)))
-                (cond ((null start-positions)
-                       (warn "There is no start positions map.")
-                       nil)
-                      (t
-                       (let* ((local-tlf-index
-                               (- tlf-index
-                                  (sb!di:debug-source-root-number
-                                   debug-source)))
-                              (char-offset
-                               (aref start-positions local-tlf-index)))
-                         (with-open-file (f namestring)
-                           (cond ((= (sb!di:debug-source-created debug-source)
-                                     (file-write-date namestring))
-                                  (file-position f char-offset))
-                                 (t
-                                  (warn "Source file ~S has been modified; ~@
-                                         using form offset instead of ~
-                                         file index."
-                                        namestring)
-                                  (let ((*read-suppress* t))
-                                    (dotimes (i local-tlf-index) (read f)))))
-                           (let ((*readtable* (copy-readtable)))
-                             (set-dispatch-macro-character
-                              #\# #\.
-                              (lambda (stream sub-char &rest rest)
-                                (declare (ignore rest sub-char))
-                                (let ((token (read stream t nil t)))
-                                  (format nil "#.~S" token))))
-                             (read f)))))))))))
-    ((sb!di:debug-source-form debug-source)
-     (sb!di:debug-source-form debug-source))
-    (t (bug "Don't know how to use a DEBUG-SOURCE without ~
-             a namestring or a form."))))
-
-(defun cache-valid (loc cache)
-  (and cache
-       (and (eq (sb!di:code-location-debug-source loc)
-                (sfcache-debug-source cache))
-            (eq (sb!di:code-location-toplevel-form-offset loc)
-                (sfcache-toplevel-form-index cache)))))
-
-(defun get-source-form (loc context &optional cache)
-  (let* ((cache-valid (cache-valid loc cache))
-         (tlf-index (sb!di:code-location-toplevel-form-offset loc))
-         (form-number (sb!di:code-location-form-number loc))
-         (toplevel-form
-          (if cache-valid
-              (sfcache-toplevel-form cache)
-              (get-toplevel-form (sb!di:code-location-debug-source loc)
-                                  tlf-index)))
-         (mapping-table
-          (if cache-valid
-              (sfcache-form-number-mapping-table cache)
-              (sb!di:form-number-translations toplevel-form tlf-index))))
-    (when (and (not cache-valid) cache)
-      (setf (sfcache-debug-source cache) (sb!di:code-location-debug-source loc)
-            (sfcache-toplevel-form-index cache) tlf-index
-            (sfcache-toplevel-form cache) toplevel-form
-            (sfcache-form-number-mapping-table cache) mapping-table))
-    (cond ((null toplevel-form)
-           nil)
-          ((>= form-number (length mapping-table))
-           (warn "bogus form-number in form!  The source file has probably ~@
-                  been changed too much to cope with.")
-           (when cache
-             ;; Disable future warnings.
-             (setf (sfcache-toplevel-form cache) nil))
-           nil)
-          (t
-           (when cache
-             (setf (sfcache-last-location-retrieved cache) loc)
-             (setf (sfcache-last-form-retrieved cache) form-number))
-           (sb!di:source-path-context toplevel-form
-                                      (aref mapping-table form-number)
-                                      context)))))
-
 (defun get-different-source-form (loc context &optional cache)
-  (if (and (cache-valid loc cache)
-           (or (= (sb!di:code-location-form-number loc)
-                  (sfcache-last-form-retrieved cache))
-               (and (sfcache-last-location-retrieved cache)
-                    (sb!di:code-location=
-                     loc
-                     (sfcache-last-location-retrieved cache)))))
+  (if (and cache
+           (eq (sb!di:code-location-debug-source loc)
+               (sfcache-debug-source cache))
+           (eq (sb!di:code-location-toplevel-form-offset loc)
+               (sfcache-toplevel-form-index cache))
+           (or (eql (sb!di:code-location-form-number loc)
+                    (sfcache-last-form-retrieved cache))
+               (awhen (sfcache-last-location-retrieved cache)
+                 (sb!di:code-location= loc it))))
       (values nil nil)
-      (values (get-source-form loc context cache) t)))
+      (let ((form (sb!debug::code-location-source-form loc context nil)))
+        (when cache
+          (setf (sfcache-debug-source cache)
+                (sb!di:code-location-debug-source loc))
+          (setf (sfcache-toplevel-form-index cache)
+                (sb!di:code-location-toplevel-form-offset loc))
+          (setf (sfcache-last-form-retrieved cache)
+                (sb!di:code-location-form-number loc))
+          (setf (sfcache-last-location-retrieved cache) loc))
+        (values form t))))
 
 ;;;; stuff to use debugging info to augment the disassembly
 
@@ -1265,11 +1228,15 @@
                   ))))
         (sb!di:no-debug-blocks () nil)))))
 
+(defvar *disassemble-annotate* t
+  "Annotate DISASSEMBLE output with source code.")
+
 (defun add-debugging-hooks (segment debug-fun &optional sfcache)
   (when debug-fun
     (setf (seg-storage-info segment)
           (storage-info-for-debug-fun debug-fun))
-    (add-source-tracking-hooks segment debug-fun sfcache)
+    (when *disassemble-annotate*
+      (add-source-tracking-hooks segment debug-fun sfcache))
     (let ((kind (sb!di:debug-fun-kind debug-fun)))
       (flet ((add-new-hook (n)
                (push (make-offs-hook
@@ -1487,17 +1454,6 @@
       (label-segments segments dstate))
     (disassemble-segments segments stream dstate)))
 
-;;; FIXME: We probably don't need this any more now that there are
-;;; no interpreted functions, only compiled ones.
-(defun compile-function-lambda-expr (function)
-  (declare (type function function))
-  (multiple-value-bind (lambda closurep name)
-      (function-lambda-expression function)
-    (declare (ignore name))
-    (when closurep
-      (error "can't compile a lexical closure"))
-    (compile nil lambda)))
-
 (defun valid-extended-function-designators-for-disassemble-p (thing)
   (cond ((legal-fun-name-p thing)
          (compiled-funs-or-lose (fdefinition thing) thing))
@@ -1522,7 +1478,7 @@
         (error 'simple-type-error
                :datum thing
                :expected-type '(satisfies valid-extended-function-designators-for-disassemble-p)
-               :format-control "can't make a compiled function from ~S"
+               :format-control "Can't make a compiled function from ~S"
                :format-arguments (list name)))))
 
 (defun disassemble (object &key

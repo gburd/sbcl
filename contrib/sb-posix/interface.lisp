@@ -8,7 +8,11 @@
       (export ',name :sb-posix)
       (defclass ,name ,superclasses
         ,(loop for slotd in slots
-               collect (ldiff slotd (member :array-length slotd)))
+               ;; KLUDGE: Splice out :ARRAY-LENGTH options (they're
+               ;; for the conversion functions, not for DEFCLASS).
+               for array-length-option = (member :array-length slotd)
+               collect (append (ldiff slotd array-length-option)
+                               (cddr array-length-option)))
         ,@options)
       (declaim (inline ,to-alien ,to-protocol))
       (declaim (inline ,to-protocol ,to-alien))
@@ -57,14 +61,25 @@
       (find-class ',name))))
 
 (define-condition sb-posix:syscall-error (error)
-  ((errno :initarg :errno :reader sb-posix:syscall-errno))
+  ((errno :initarg :errno :reader sb-posix:syscall-errno)
+   (name :initarg :name :initform nil :reader sb-posix:syscall-name))
   (:report (lambda (c s)
-             (let ((errno (sb-posix:syscall-errno c)))
-               (format s "System call error ~A (~A)"
-                       errno (sb-int:strerror errno))))))
+             (let ((errno (sb-posix:syscall-errno c))
+                   (name (sb-posix:syscall-name c)))
+               (if name
+                   (format s "Error in ~S: ~A (~A)"
+                           name
+                           (sb-int:strerror errno)
+                           errno)
+                   (format s "Error in syscall: ~A (~A)"
+                           (sb-int:strerror errno)
+                           errno))))))
 
-(defun syscall-error ()
-  (error 'sb-posix:syscall-error :errno (get-errno)))
+(declaim (ftype (function (&optional symbol) nil) syscall-error))
+(defun syscall-error (&optional name)
+  (error 'sb-posix:syscall-error
+         :name name
+         :errno (get-errno)))
 
 (defun unsupported-error (lisp-name c-name)
   (error "~S is unsupported by SBCL on this platform due to lack of ~A()."
@@ -121,11 +136,24 @@
                        (open-with-mode pathname flags mode)
                        (open-without-mode pathname flags))))))
     (def #-win32 "open" #+win32 "_open"))
+(define-call* "read" int minusp
+    (fd file-descriptor) (buf (* t)) (count int))
 (define-call "rename" int minusp (oldpath filename) (newpath filename))
 (define-call* "rmdir" int minusp (pathname filename))
 (define-call* "unlink" int minusp (pathname filename))
 (define-call #-netbsd "opendir" #+netbsd "_opendir"
     (* t) null-alien (pathname filename))
+(define-call* "write" int minusp
+    (fd file-descriptor) (buf (* t)) (count int))
+#+inode64
+(define-call ("readdir" :c-name "readdir$INODE64" :options :largefile)
+  (* dirent)
+  ;; readdir() has the worst error convention in the world.  It's just
+  ;; too painful to support.  (return is NULL _and_ errno "unchanged"
+  ;; is not an error, it's EOF).
+  not
+  (dir (* t)))
+#-inode64
 (define-call (#-netbsd "readdir" #+netbsd "_readdir" :options :largefile)
   (* dirent)
   ;; readdir() has the worst error convention in the world.  It's just
@@ -178,7 +206,7 @@
                                                                        (function ,result-type system-area-pointer))
                                                          (sb-alien::vector-sap arg))))
                               (when (,errorp result)
-                                (syscall-error))
+                                (syscall-error ',lisp-name))
                               ;; FIXME: We'd rather return pathnames, but other
                               ;; SB-POSIX functions like this return strings...
                               (let ((pathname (sb-ext:octets-to-string
@@ -253,48 +281,57 @@
 
   ;; uid, gid
   (define-call "geteuid" uid-t never-fails) ; "always successful", it says
+  #-sunos
   (define-call "getresuid" uid-t never-fails)
   (define-call "getuid" uid-t never-fails)
   (define-call "seteuid" int minusp (uid uid-t))
+  #-sunos
   (define-call "setfsuid" int minusp (uid uid-t))
   (define-call "setreuid" int minusp (ruid uid-t) (euid uid-t))
+  #-sunos
   (define-call "setresuid" int minusp (ruid uid-t) (euid uid-t) (suid uid-t))
   (define-call "setuid" int minusp (uid uid-t))
   (define-call "getegid" gid-t never-fails)
   (define-call "getgid" gid-t never-fails)
+  #-sunos
   (define-call "getresgid" gid-t never-fails)
   (define-call "setegid" int minusp (gid gid-t))
+  #-sunos
   (define-call "setfsgid" int minusp (gid gid-t))
   (define-call "setgid" int minusp (gid gid-t))
   (define-call "setregid" int minusp (rgid gid-t) (egid gid-t))
+  #-sunos
   (define-call "setresgid" int minusp (rgid gid-t) (egid gid-t) (sgid gid-t))
 
   ;; processes, signals
   (define-call "alarm" int never-fails (seconds unsigned))
 
+  ;; exit and abort, not much point inlining these
+  (define-simple-call abort void)
+  (define-simple-call exit void (status int))
+  (define-simple-call _exit void (status int))
 
-
+  ;; FIXME this is a lie, of course this can fail, but there's no
+  ;; error handling here yet!
   #+mach-exception-handler
-  (progn
-    ;; FIXME this is a lie, of course this can fail, but there's no
-    ;; error handling here yet!
-    (define-call "setup_mach_exceptions" void never-fails)
-    (define-call ("posix_fork" :c-name "fork") pid-t minusp)
-    (defun fork ()
-      (tagbody
-         (sb-thread::with-all-threads-lock
-           (when (cdr sb-thread::*all-threads*)
-             (go :error))
-           (let ((pid (posix-fork)))
-             (when (= pid 0)
-               (setup-mach-exceptions))
-             (return-from fork pid)))
-       :error
-         (error "Cannot fork with multiple threads running.")))
-    (export 'fork :sb-posix))
-
-  #-mach-exception-handler
-  (define-call "fork" pid-t minusp)
+  (define-call "setup_mach_exceptions" void never-fails)
+  (define-call ("posix_fork" :c-name "fork") pid-t minusp)
+  (defun fork ()
+    "Forks the current process, returning 0 in the new process and the PID of
+the child process in the parent. Forking while multiple threads are running is
+not supported."
+    (tagbody
+       (sb-thread::with-all-threads-lock
+         (when (cdr sb-thread::*all-threads*)
+           (go :error))
+         (let ((pid (posix-fork)))
+           #+mach-exception-handler
+           (when (= pid 0)
+             (setup-mach-exceptions))
+           (return-from fork pid)))
+     :error
+       (error "Cannot fork with multiple threads running.")))
+  (export 'fork :sb-posix)
 
   (define-call "getpgid" pid-t minusp (pid pid-t))
   (define-call "getppid" pid-t never-fails)
@@ -335,12 +372,12 @@
     "Returns the resolved target of a symbolic link as a string."
     (flet ((%readlink (path buf length)
              (alien-funcall
-              (extern-alien "readlink" (function int c-string (* t) int))
+              (extern-alien "readlink" (function int (c-string :not-null t) (* t) int))
               path buf length)))
       (with-growing-c-string (buf size)
         (let ((count (%readlink (filename pathspec) buf size)))
           (cond ((minusp count)
-                 (syscall-error))
+                 (syscall-error 'readlink))
                 ((< 0 count size)
                  (buf count))))))))
 
@@ -358,7 +395,7 @@
           (cond (result
                  (buf))
                 ((/= (get-errno) sb-posix:erange)
-                 (syscall-error))))))))
+                 (syscall-error 'getcwd))))))))
 
 #-win32
 (progn
@@ -372,7 +409,7 @@
                   (extern-alien "wait" (function pid-t (* int)))
                   (sb-sys:vector-sap ptr)))))
      (if (minusp pid)
-         (syscall-error)
+         (syscall-error 'wait)
          (values pid (aref ptr 0))))))
 
 #-win32
@@ -390,7 +427,7 @@
                                                     pid-t (* int) int))
                   pid (sb-sys:vector-sap ptr) options))))
      (if (minusp pid)
-         (syscall-error)
+         (syscall-error 'waitpid)
          (values pid (aref ptr 0)))))
  ;; waitpid macros
  (define-call "wifexited" boolean never-fails (status int))
@@ -414,8 +451,29 @@
  (define-call "munmap" int minusp
    (start sb-sys:system-area-pointer) (length unsigned))
 
+#-win32
 (define-call "msync" int minusp
   (addr sb-sys:system-area-pointer) (length unsigned) (flags int)))
+#+win32
+(progn
+  ;; No attempt is made to offer a full mmap-like interface on Windows.
+  ;; It would be possible to do so (and has been done by AK on his
+  ;; branch), but the use case is unclear to me.  However, the following
+  ;; definitions are needed to keep existing code in sb-simple-streams
+  ;; running. --DFL
+  (defconstant PROT-READ #x02)
+  (defconstant PROT-WRITE #x04)
+  (defconstant PROT-EXEC #x10)
+  (defconstant PROT-NONE 0)
+  (defconstant MAP-SHARED 0)
+  (defconstant MAP-PRIVATE 1)
+  (defconstant MS-ASYNC nil)
+  (defconstant MS-SYNC nil)
+  (export                            ;export on the fly like define-call
+   (defun msync (address length flags)
+     (declare (ignore flags))
+     (when (zerop (sb-win32:flush-view-of-file address length))
+       (sb-win32::win32-error "FlushViewOfFile")))))
 
 ;;; mlockall, munlockall
 (define-call "mlockall" int minusp (flags int))
@@ -471,10 +529,14 @@
               nil
               (,conv r)))))))
 
-(define-obj-call "getpwnam" login-name (function (* alien-passwd) c-string) alien-to-passwd)
-(define-obj-call "getpwuid" uid (function (* alien-passwd) uid-t) alien-to-passwd)
-(define-obj-call "getgrnam" login-name (function (* alien-group) c-string) alien-to-group)
-(define-obj-call "getgrgid" gid (function (* alien-group) gid-t) alien-to-group)
+(define-obj-call "getpwnam" login-name (function (* alien-passwd) (c-string :not-null t))
+                 alien-to-passwd)
+(define-obj-call "getpwuid" uid (function (* alien-passwd) uid-t)
+                 alien-to-passwd)
+(define-obj-call "getgrnam" login-name (function (* alien-group) (c-string :not-null t))
+                 alien-to-group)
+(define-obj-call "getgrgid" gid (function (* alien-group) gid-t)
+                 alien-to-group)
 
 
 #-win32
@@ -503,6 +565,8 @@
                          bytes.  For symbolic links, the length
                          in bytes of the filename contained in
                          the symbolic link.")
+   (rdev :initarg :rdev :reader stat-rdev
+          :documentation "For devices the device number.")
    (atime :initarg :atime :reader stat-atime
           :documentation "Time of last access.")
    (mtime :initarg :mtime :reader stat-mtime
@@ -514,7 +578,9 @@
 
 (defmacro define-stat-call (name arg designator-fun type)
   ;; FIXME: this isn't the documented way of doing this, surely?
-  (let ((lisp-name (lisp-for-c-symbol name)))
+  (let ((lisp-name (lisp-for-c-symbol name))
+        (real-name #+inode64 (format nil "~A$INODE64" name)
+                   #-inode64 name))
     `(progn
       (export ',lisp-name :sb-posix)
       (declaim (inline ,lisp-name))
@@ -522,21 +588,21 @@
         (declare (type (or null stat) stat))
         (with-alien-stat a-stat ()
           (let ((r (alien-funcall
-                    (extern-alien ,(real-c-name (list name :options :largefile)) ,type)
+                    (extern-alien ,(real-c-name (list real-name :options :largefile)) ,type)
                     (,designator-fun ,arg)
                     a-stat)))
             (when (minusp r)
-              (syscall-error))
+              (syscall-error ',lisp-name))
             (alien-to-stat a-stat stat)))))))
 
 (define-stat-call #-win32 "stat" #+win32 "_stat"
                   pathname filename
-                  (function int c-string (* alien-stat)))
+                  (function int (c-string :not-null t) (* alien-stat)))
 
 #-win32
 (define-stat-call "lstat"
                   pathname filename
-                  (function int c-string (* alien-stat)))
+                  (function int (c-string :not-null t) (* alien-stat)))
 ;;; No symbolic links on Windows, so use stat
 #+win32
 (progn
@@ -572,7 +638,7 @@
                (extern-alien "pipe" (function int (* int)))
                (sb-sys:vector-sap filedes2)))))
      (when (minusp r)
-       (syscall-error)))
+       (syscall-error 'pipe)))
    (values (aref filedes2 0) (aref filedes2 1))))
 
 #-win32
@@ -586,7 +652,7 @@
    (lflag :initarg :lflag :accessor sb-posix:termios-lflag
           :documentation "Local modes.")
    (cc :initarg :cc :accessor sb-posix:termios-cc :array-length nccs
-       :documentation "Control characters"))
+       :documentation "Control characters."))
   (:documentation "Instances of this class represent I/O
                    characteristics of the terminal."))
 
@@ -605,7 +671,7 @@
                    (function int int int (* alien-termios)))
                   fd actions a-termios)))
          (when (minusp r)
-           (syscall-error)))
+           (syscall-error 'tcsetattr)))
        (values))))
  (export 'tcgetattr :sb-posix)
  (declaim (inline tcgetattr))
@@ -618,9 +684,14 @@
                (file-descriptor fd)
                a-termios)))
        (when (minusp r)
-         (syscall-error))
+         (syscall-error 'tcgetattr))
        (setf termios (alien-to-termios a-termios termios))))
    termios)
+ (define-call "tcdrain" int minusp (fd file-descriptor))
+ (define-call "tcflow" int minusp (fd file-descriptor) (action int))
+ (define-call "tcflush" int minusp (fd file-descriptor) (queue-selector int))
+ (define-call "tcgetsid" pid-t minusp (fd file-descriptor))
+ (define-call "tcsendbreak" int minusp (fd file-descriptor) (duration int))
  (export 'cfsetispeed :sb-posix)
  (declaim (inline cfsetispeed))
  (defun cfsetispeed (speed &optional termios)
@@ -632,7 +703,7 @@
                a-termios
                speed)))
        (when (minusp r)
-         (syscall-error))
+         (syscall-error 'cfsetispeed))
        (setf termios (alien-to-termios a-termios termios))))
    termios)
  (export 'cfsetospeed :sb-posix)
@@ -646,7 +717,7 @@
                a-termios
                speed)))
        (when (minusp r)
-         (syscall-error))
+         (syscall-error 'cfsetospeed))
        (setf termios (alien-to-termios a-termios termios))))
    termios)
  (export 'cfgetispeed :sb-posix)
@@ -677,12 +748,13 @@
                                                (function time-t (* time-t)))
                                  nil)))
       (if (minusp result)
-          (syscall-error)
+          (syscall-error 'time)
           result)))
   (export 'utime :sb-posix)
   (defun utime (filename &optional access-time modification-time)
-    (let ((fun (extern-alien "utime" (function int c-string
-                                               (* alien-utimbuf))))
+    (let ((fun (extern-alien #-netbsd "utime" #+netbsd "_utime"
+                             (function int (c-string :not-null t)
+                                       (* alien-utimbuf))))
           (name (filename filename)))
       (if (not (and access-time modification-time))
           (alien-funcall fun name nil)
@@ -691,7 +763,7 @@
                   (slot utimbuf 'modtime) (or modification-time 0))
             (let ((result (alien-funcall fun name (alien-sap utimbuf))))
               (if (minusp result)
-                  (syscall-error)
+                  (syscall-error 'utime)
                   result))))))
   (export 'utimes :sb-posix)
   (defun utimes (filename &optional access-time modification-time)
@@ -701,9 +773,9 @@
                (values integer (cl:truncate (* fractional 1000000)))))
            (maybe-syscall-error (value)
              (if (minusp value)
-                 (syscall-error)
+                 (syscall-error 'utimes)
                  value)))
-      (let ((fun (extern-alien "utimes" (function int c-string
+      (let ((fun (extern-alien "utimes" (function int (c-string :not-null t)
                                                   (* (array alien-timeval 2)))))
             (name (filename filename)))
         (if (not (and access-time modification-time))
@@ -723,15 +795,54 @@
 
 ;;; environment
 
-(export 'getenv :sb-posix)
+(eval-when (:compile-toplevel :load-toplevel)
+  ;; Do this at compile-time as Win32 code below refers to it as
+  ;; sb-posix:getenv.
+  (export 'getenv :sb-posix))
 (defun getenv (name)
   (let ((r (alien-funcall
-            (extern-alien "getenv" (function (* char) c-string))
+            (extern-alien "getenv" (function (* char) (c-string :not-null t)))
             name)))
     (declare (type (alien (* char)) r))
     (unless (null-alien r)
       (cast r c-string))))
-(define-call "putenv" int minusp (string c-string))
+#-win32
+(progn
+  (define-call "setenv" int minusp
+               (name (c-string :not-null t))
+               (value (c-string :not-null t))
+               (overwrite int))
+  (define-call "unsetenv" int minusp (name (c-string :not-null t)))
+  (export 'putenv :sb-posix)
+  (defun putenv (string)
+    (declare (string string))
+    ;; We don't want to call actual putenv: the string passed to putenv ends
+    ;; up in environ, and we any string we allocate GC might move.
+    ;;
+    ;; This makes our wrapper nonconformant if you squit hard enough, but
+    ;; users who care about that should really be calling putenv() directly in
+    ;; order to be able to manage memory sanely.
+    (let ((p (position #\= string))
+          (n (length string)))
+      (if p
+          (if (= p n)
+              (unsetenv (subseq string 0 p))
+              (setenv (subseq string 0 p) (subseq string (1+ p)) 1))
+          (error "Invalid argument to putenv: ~S" string)))))
+#+win32
+(progn
+  ;; Windows doesn't define a POSIX setenv, but happily their _putenv is sane.
+  (define-call* "putenv" int minusp (string (c-string :not-null t)))
+  (export 'setenv :sb-posix)
+  (defun setenv (name value overwrite)
+    (declare (string name value))
+    (if (and (zerop overwrite) (sb-posix:getenv name))
+        0
+        (putenv (concatenate 'string name "=" value))))
+  (export 'unsetenv :sb-posix)
+  (defun unsetenv (name)
+    (declare (string name))
+    (putenv (concatenate 'string name "="))))
 
 ;;; syslog
 #-win32
@@ -741,7 +852,7 @@
   (export 'closelog :sb-posix)
   (defun openlog (ident options &optional (facility log-user))
     (alien-funcall (extern-alien
-                    "openlog" (function void c-string int int))
+                    "openlog" (function void (c-string :not-null t) int int))
                    ident options facility))
   (defun syslog (priority format &rest args)
     "Send a message to the syslog facility, with severity level
@@ -749,7 +860,9 @@ PRIORITY.  The message will be formatted as by CL:FORMAT (rather
 than C's printf) with format string FORMAT and arguments ARGS."
     (flet ((syslog1 (priority message)
              (alien-funcall (extern-alien
-                             "syslog" (function void int c-string c-string))
+                             "syslog" (function void int
+                                                (c-string :not-null t)
+                                                (c-string :not-null t)))
                             priority "%s" message)))
       (syslog1 priority (apply #'format nil format args))))
   (define-call "closelog" void never-fails))

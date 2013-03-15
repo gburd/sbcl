@@ -21,7 +21,7 @@
 
 ;;; TODO
 ;;; 1) structs don't have within-file location info.  problem for the
-;;;   structure itself, accessors and the predicate
+;;;   structure itself, accessors, the copier and the predicate
 ;;; 3) error handling.  Signal random errors, or handle and resignal 'our'
 ;;;   error, or return NIL?
 ;;; 4) FIXMEs
@@ -31,6 +31,7 @@
   (:export "ALLOCATION-INFORMATION"
            "FUNCTION-ARGLIST"
            "FUNCTION-LAMBDA-LIST"
+           "FUNCTION-TYPE"
            "DEFTYPE-LAMBDA-LIST"
            "VALID-FUNCTION-NAME-P"
            "FIND-DEFINITION-SOURCE"
@@ -44,6 +45,7 @@
            "DEFINITION-NOT-FOUND" "DEFINITION-NAME"
            "FIND-FUNCTION-CALLEES"
            "FIND-FUNCTION-CALLERS"
+           "MAP-ROOT"
            "WHO-BINDS"
            "WHO-CALLS"
            "WHO-REFERENCES"
@@ -95,7 +97,8 @@ include the pathname of the file and the position of the definition."
   (elt (sb-c::compiled-debug-info-fun-map debug-info) 0))
 
 (defun valid-function-name-p (name)
-  "True if NAME denotes a function name that can be passed to MACRO-FUNCTION or FDEFINITION "
+  "True if NAME denotes a valid function name, ie. one that can be passed to
+FBOUNDP."
   (and (sb-int:valid-function-name-p name) t))
 
 ;;;; Finding definitions
@@ -189,7 +192,8 @@ If an unsupported TYPE is requested, the function will return NIL.
        ((:function :generic-function)
         (when (and (fboundp name)
                    (or (not (symbolp name))
-                       (not (macro-function name))))
+                       (not (macro-function name))
+                       (special-operator-p name)))
           (let ((fun (real-fdefinition name)))
             (when (eq (not (typep fun 'generic-function))
                       (not (eq type :generic-function)))
@@ -353,12 +357,15 @@ If an unsupported TYPE is requested, the function will return NIL.
            ((struct-predicate-p object)
             (find-definition-source
              (struct-predicate-structure-class object)))
+           ((struct-copier-p object)
+            (find-definition-source
+             (struct-copier-structure-class object)))
            (t
             (find-function-definition-source object))))
     ((or condition standard-object structure-object)
      (find-definition-source (class-of object)))
     (t
-     (error "Don't know how to retrieve source location for a ~S~%"
+     (error "Don't know how to retrieve source location for a ~S"
             (type-of object)))))
 
 (defun find-function-definition-source (function)
@@ -373,9 +380,8 @@ If an unsupported TYPE is requested, the function will return NIL.
      ;; :COMPILE-TOPLEVEL).  Until that's fixed, don't return a
      ;; DEFINITION-SOURCE with a pathname.  (When that's fixed, take
      ;; out the (not (debug-source-form ...)) test.
-     (if (and (sb-c::debug-source-namestring debug-source)
-              (not (sb-c::debug-source-form debug-source)))
-         (parse-namestring (sb-c::debug-source-namestring debug-source)))
+     (when (stringp (sb-c::debug-source-namestring debug-source))
+       (parse-namestring (sb-c::debug-source-namestring debug-source)))
      :character-offset
      (if tlf
          (elt (sb-c::debug-source-start-positions debug-source) tlf))
@@ -410,6 +416,8 @@ If an unsupported TYPE is requested, the function will return NIL.
   (sb-vm::%simple-fun-self #'(setf definition-source-pathname)))
 (defvar *struct-predicate*
   (sb-vm::%simple-fun-self #'definition-source-p))
+(defvar *struct-copier*
+  (sb-vm::%simple-fun-self #'copy-definition-source))
 
 (defun struct-accessor-p (function)
   (let ((self (sb-vm::%simple-fun-self function)))
@@ -417,18 +425,19 @@ If an unsupported TYPE is requested, the function will return NIL.
     (member self (list *struct-slotplace-reader*
                        *struct-slotplace-writer*))))
 
+(defun struct-copier-p (function)
+  (let ((self (sb-vm::%simple-fun-self function)))
+    ;; FIXME there may be other structure copier functions
+    (member self (list *struct-copier*))))
+
 (defun struct-predicate-p (function)
   (let ((self (sb-vm::%simple-fun-self function)))
     ;; FIXME there may be other structure predicate functions
     (member self (list *struct-predicate*))))
 
-(defun function-arglist (function)
-  "Deprecated alias for FUNCTION-LAMBDA-LIST."
+(sb-int:define-deprecated-function :late "1.0.24.5" function-arglist function-lambda-list
+    (function)
   (function-lambda-list function))
-
-(define-compiler-macro function-arglist (function)
-  (sb-int:deprecation-warning 'function-arglist 'function-lambda-list)
-  `(function-lambda-list ,function))
 
 (defun function-lambda-list (function)
   "Describe the lambda list for the extended function designator FUNCTION.
@@ -465,6 +474,36 @@ value."
            (sb-int:info :type :lambda-list typespec-operator))))
     (t (values nil nil))))
 
+(defun function-type (function-designator)
+  "Returns the ftype of FUNCTION-DESIGNATOR, or NIL."
+  (flet ((ftype-of (function-designator)
+           (sb-kernel:type-specifier
+            (sb-int:info :function :type function-designator))))
+    (etypecase function-designator
+      (symbol
+       (when (and (fboundp function-designator)
+                  (not (macro-function function-designator))
+                  (not (special-operator-p function-designator)))
+         (ftype-of function-designator)))
+      (cons
+       (when (and (sb-int:legal-fun-name-p function-designator)
+                  (fboundp function-designator))
+         (ftype-of function-designator)))
+      (generic-function
+       (function-type (sb-pcl:generic-function-name function-designator)))
+      (function
+       ;; Give declared type in globaldb priority over derived type
+       ;; because it contains more accurate information e.g. for
+       ;; struct-accessors.
+       (let ((type (function-type (sb-kernel:%fun-name
+                                   (sb-impl::%fun-fun function-designator)))))
+         (if type
+             type
+             (sb-impl::%fun-type function-designator)))))))
+
+;;; FIXME: These three are pretty terrible. Can we place have some proper metadata
+;;; instead.
+
 (defun struct-accessor-structure-class (function)
   (let ((self (sb-vm::%simple-fun-self function)))
     (cond
@@ -473,6 +512,16 @@ value."
         (sb-kernel::classoid-name
          (sb-kernel::layout-classoid
           (sb-kernel:%closure-index-ref function 1)))))
+      )))
+
+(defun struct-copier-structure-class (function)
+  (let ((self (sb-vm::%simple-fun-self function)))
+    (cond
+      ((member self (list *struct-copier*))
+       (find-class
+        (sb-kernel::classoid-name
+         (sb-kernel::layout-classoid
+          (sb-kernel:%closure-index-ref function 0)))))
       )))
 
 (defun struct-predicate-structure-class (function)
@@ -598,7 +647,7 @@ constant pool."
             (loop for i from 0 below (length array) by 2
                   for xref-name = (aref array i)
                   for xref-path = (aref array (1+ i))
-                  do (when (eql xref-name wanted-name)
+                  do (when (equal xref-name wanted-name)
                        (let ((source-location
                               (find-function-definition-source simple-fun)))
                          ;; Use the more accurate source path from
@@ -758,6 +807,15 @@ For :HEAP objects the secondary value is a plist:
     even if :PINNED in NIL if the GC has not had the need to mark the the page
     as pinned. (GENCGC and :SPACE :DYNAMIC only.)
 
+  :WRITE-PROTECTED
+    Indicates that the page on which the object starts is write-protected,
+    which indicates for :BOXED objects that it hasn't been written to since
+    the last GC of its generation. (GENCGC and :SPACE :DYNAMIC only.)
+
+  :PAGE
+    The index of the page the object resides on. (GENGC and :SPACE :DYNAMIC
+    only.)
+
 For :STACK objects secondary value is the thread on whose stack the object is
 allocated.
 
@@ -784,12 +842,12 @@ Experimental: interface subject to change."
                (let* ((addr (sb-kernel:get-lisp-obj-address object))
                       (space
                        (cond ((< sb-vm:read-only-space-start addr
-                                 (* sb-vm:*read-only-space-free-pointer*
-                                    sb-vm:n-word-bytes))
+                                 (ash sb-vm:*read-only-space-free-pointer*
+                                      sb-vm:n-fixnum-tag-bits))
                               :read-only)
                              ((< sb-vm:static-space-start addr
-                                 (* sb-vm:*static-space-free-pointer*
-                                    sb-vm:n-word-bytes))
+                                 (ash sb-vm:*static-space-free-pointer*
+                                      sb-vm:n-fixnum-tag-bits))
                               :static)
                              ((< (sb-kernel:current-dynamic-space-start) addr
                                  (sb-sys:sap-int (sb-kernel:dynamic-space-free-pointer)))
@@ -805,7 +863,8 @@ Experimental: interface subject to change."
                                    :write-protected (logbitp 0 flags)
                                    :boxed (logbitp 2 flags)
                                    :pinned (logbitp 5 flags)
-                                   :large (logbitp 6 flags)))))
+                                   :large (logbitp 6 flags)
+                                   :page index))))
                        (list :space space))
                    #-gencgc
                    (list :space space))))))
@@ -835,3 +894,142 @@ Experimental: interface subject to change."
                      (values :stack sb-thread::*current-thread*))))
                :foreign)))))
 
+(defun map-root (function object &key simple (ext t))
+  "Call FUNCTION with all non-immediate objects pointed to by OBJECT.
+Returns OBJECT.
+
+If SIMPLE is true (default is NIL), elides those pointers that are not
+notionally part of certain built-in objects, but backpointers to a
+conceptual parent: eg. elides the pointer from a SYMBOL to the
+corresponding PACKAGE.
+
+If EXT is true (default is T), includes some pointers that are not
+actually contained in the object, but found in certain well-known
+indirect containers: FDEFINITIONs, EQL specializers, classes, and
+thread-local symbol values in other threads fall into this category.
+
+NOTE: calling MAP-ROOT with a THREAD does not currently map over
+conservative roots from the thread registers and interrupt contexts.
+
+Experimental: interface subject to change."
+  (let ((fun (coerce function 'function))
+        (seen (sb-int:alloc-xset)))
+    (flet ((call (part)
+             (when (and (member (sb-kernel:lowtag-of part)
+                                `(,sb-vm:instance-pointer-lowtag
+                                  ,sb-vm:list-pointer-lowtag
+                                  ,sb-vm:fun-pointer-lowtag
+                                  ,sb-vm:other-pointer-lowtag))
+                        (not (sb-int:xset-member-p part seen)))
+               (sb-int:add-to-xset part seen)
+               (funcall fun part))))
+      (when ext
+        (let ((table sb-pcl::*eql-specializer-table*))
+          (call (sb-int:with-locked-system-table (table)
+                  (gethash object table)))))
+      (etypecase object
+        ((or bignum float sb-sys:system-area-pointer fixnum))
+        (sb-ext:weak-pointer
+         (call (sb-ext:weak-pointer-value object)))
+        (cons
+         (call (car object))
+         (call (cdr object))
+         (when (and ext (ignore-errors (fboundp object)))
+           (call (fdefinition object))))
+        (ratio
+         (call (numerator object))
+         (call (denominator object)))
+        (complex
+         (call (realpart object))
+         (call (realpart object)))
+        (sb-vm::instance
+         (let* ((len (sb-kernel:%instance-length object))
+                (nuntagged (if (typep object 'structure-object)
+                               (sb-kernel:layout-n-untagged-slots
+                                (sb-kernel:%instance-layout object))
+                               0)))
+           (dotimes (i (- len nuntagged))
+             (call (sb-kernel:%instance-ref object i))))
+         #+sb-thread
+         (when (typep object 'sb-thread:thread)
+           (cond ((eq object sb-thread:*current-thread*)
+                  (dolist (value (sb-thread::%thread-local-references))
+                    (call value))
+                  (sb-vm::map-stack-references #'call))
+                 (t
+                  ;; KLUDGE: INTERRUPT-THREAD is Not Nice (tm), but
+                  ;; the alternative would be stopping the world...
+                  #+sb-thread
+                  (let ((sem (sb-thread:make-semaphore))
+                        (refs nil))
+                    (handler-case
+                        (progn
+                          (sb-thread:interrupt-thread
+                           object
+                           (lambda ()
+                             (setf refs (sb-thread::%thread-local-references))
+                             (sb-vm::map-stack-references (lambda (x) (push x refs)))
+                             (sb-thread:signal-semaphore sem)))
+                          (sb-thread:wait-on-semaphore sem))
+                      (sb-thread:interrupt-thread-error ()))
+                    (mapc #'call refs))))))
+        (array
+         (if (simple-vector-p object)
+             (dotimes (i (length object))
+               (call (aref object i)))
+             (when (sb-kernel:array-header-p object)
+               (call (sb-kernel::%array-data-vector object))
+               (call (sb-kernel::%array-displaced-p object))
+               (unless simple
+                 (call (sb-kernel::%array-displaced-from object))))))
+        (sb-kernel:code-component
+         (call (sb-kernel:%code-entry-points object))
+         (call (sb-kernel:%code-debug-info object))
+         (loop for i from sb-vm:code-constants-offset
+               below (sb-kernel:get-header-data object)
+               do (call (sb-kernel:code-header-ref object i))))
+        (sb-kernel:fdefn
+         (call (sb-kernel:fdefn-name object))
+         (call (sb-kernel:fdefn-fun object)))
+        (sb-kernel:simple-fun
+         (unless simple
+           (call (sb-kernel:%simple-fun-next object)))
+         (call (sb-kernel:fun-code-header object))
+         (call (sb-kernel:%simple-fun-name object))
+         (call (sb-kernel:%simple-fun-arglist object))
+         (call (sb-kernel:%simple-fun-type object))
+         (call (sb-kernel:%simple-fun-info object)))
+        (sb-kernel:closure
+         (call (sb-kernel:%closure-fun object))
+         (sb-kernel:do-closure-values (x object)
+           (call x)))
+        (sb-kernel:funcallable-instance
+         (call (sb-kernel:%funcallable-instance-function object))
+         (loop for i from 1 below (- (1+ (sb-kernel:get-closure-length object))
+                                     sb-vm::funcallable-instance-info-offset)
+               do (call (sb-kernel:%funcallable-instance-info object i))))
+        (symbol
+         (when ext
+           (dolist (thread (sb-thread:list-all-threads))
+             (call (sb-thread:symbol-value-in-thread object thread nil))))
+         (handler-case
+             ;; We don't have GLOBAL-BOUNDP, and there's no ERRORP arg.
+             (call (sb-ext:symbol-global-value object))
+           (unbound-variable ()))
+         (when (and ext (ignore-errors (fboundp object)))
+           (call (fdefinition object))
+           (call (macro-function object))
+           (let ((class (find-class object nil)))
+             (when class (call class))))
+         (call (symbol-plist object))
+         (call (symbol-name object))
+         (unless simple
+           (call (symbol-package object))))
+        (sb-kernel::random-class
+         (case (sb-kernel:widetag-of object)
+           (#.sb-vm::value-cell-header-widetag
+            (call (sb-kernel::value-cell-ref object)))
+           (t
+            (warn "~&MAP-ROOT: Unknown widetag ~S: ~S~%"
+                  (sb-kernel:widetag-of object) object)))))))
+  object)

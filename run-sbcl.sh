@@ -14,14 +14,26 @@
 set -e
 
 BASE=`dirname "$0"`
+if (readlink -f "${BASE}") >/dev/null 2>&1; then
+    BASE=`readlink -f ${BASE}`
+else
+    opwd=`pwd`
+    cd "${BASE}"
+    BASE=`pwd`
+    cd "${opwd}"
+fi
+if [ "$OSTYPE" = "cygwin" ]
+then
+    BASE=`cygpath -w "$BASE"`
+fi
 CORE_DEFINED=no
 
 for arg in $*; do
     case $arg in
-        (--core)
+        --core)
           CORE_DEFINED=yes
           ;;
-        (--help)
+        --help)
           echo "usage: run-sbcl.sh sbcl-options*"
           echo
           echo "Runs SBCL from the build directory or binary tarball without need for"
@@ -40,7 +52,7 @@ if [ "$CORE_DEFINED" = "no" ]; then
 fi
 
 if [ -x "$BASE"/src/runtime/sbcl -a -f "$BASE"/output/sbcl.core ]; then
-    echo "(running SBCL from: `pwd`)"
+    echo "(running SBCL from: $BASE)" 1>&2
     SBCL_HOME="$BASE"/contrib "$BASE"/src/runtime/sbcl $ARGUMENTS "$@"
 else
     echo "No built SBCL here ($BASE): run 'sh make.sh' first!"

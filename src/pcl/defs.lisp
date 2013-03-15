@@ -155,16 +155,14 @@
 ;;;
 ;;; FIXME: SB-KERNEL has fast-and-not-quite-precise type code for use
 ;;; in the compiler. Could we share some of it here?
+(defvar *in-*subtypep* nil)
+
 (defun *subtypep (type1 type2)
   (if (equal type1 type2)
       (values t t)
       (if (eq **boot-state** 'early)
           (values (eq type1 type2) t)
-          (let ((*in-precompute-effective-methods-p* t))
-            (declare (special *in-precompute-effective-methods-p*))
-            ;; FIXME: *IN-PRECOMPUTE-EFFECTIVE-METHODS-P* is not a
-            ;; good name. It changes the way
-            ;; CLASS-APPLICABLE-USING-CLASS-P works.
+          (let ((*in-*subtypep* t))
             (setq type1 (*normalize-type type1))
             (setq type2 (*normalize-type type2))
             (case (car type2)
@@ -359,7 +357,7 @@
     :accessor gf-dfun-state)
    ;; Used to make DFUN-STATE & FIN-FUNCTION updates atomic.
    (%lock
-    :initform (sb-thread::make-spinlock :name "GF lock")
+    :initform (sb-thread:make-mutex :name "GF lock")
     :reader gf-lock)
    ;; Set to true by ADD-METHOD, REMOVE-METHOD; to false by
    ;; MAYBE-UPDATE-INFO-FOR-GF.
@@ -379,7 +377,13 @@
                  :reader method-specializers)
    (lambda-list :initform () :initarg :lambda-list :reader method-lambda-list)
    (%function :initform nil :initarg :function :reader method-function)
-   (%documentation :initform nil :initarg :documentation)))
+   (%documentation :initform nil :initarg :documentation)
+   ;; True IFF method is known to have no CALL-NEXT-METHOD in it, or
+   ;; just a plain (CALL-NEXT-METHOD).
+   (simple-next-method-call
+    :initform nil
+    :initarg simple-next-method-call
+    :reader simple-next-method-call-p)))
 
 (defclass accessor-method (standard-method)
   ((slot-name :initform nil :initarg :slot-name
@@ -455,9 +459,6 @@
     :initarg :initargs
     :accessor slot-definition-initargs)
    (%type :initform t :initarg :type :accessor slot-definition-type)
-   (%type-check-function :initform nil
-                         :initarg type-check-function
-                         :accessor slot-definition-type-check-function)
    (%documentation
     :initform nil :initarg :documentation
     ;; KLUDGE: we need a reader for bootstrapping purposes, in
@@ -503,14 +504,29 @@
   ())
 
 (defclass effective-slot-definition (slot-definition)
-  ((reader-function ; (lambda (object) ...)
-    :accessor slot-definition-reader-function)
-   (writer-function ; (lambda (new-value object) ...)
-    :accessor slot-definition-writer-function)
-   (boundp-function ; (lambda (object) ...)
-    :accessor slot-definition-boundp-function)
-   (accessor-flags
-    :initform 0)))
+  ((accessor-flags
+    :initform 0)
+   (info
+    :accessor slot-definition-info)))
+
+;;; We use a structure here, because fast slot-accesses to this information
+;;; are critical to making SLOT-VALUE-USING-CLASS &co fast: places that need
+;;; these functions can access the SLOT-INFO directly, avoiding the overhead
+;;; of accessing a standard-instance.
+(defstruct (slot-info (:constructor make-slot-info
+                                    (&key slotd
+                                          typecheck
+                                          (type t)
+                                          (reader
+                                           (uninitialized-accessor-function :reader slotd))
+                                          (writer
+                                           (uninitialized-accessor-function :writer slotd))
+                                          (boundp
+                                           (uninitialized-accessor-function :boundp slotd)))))
+  (typecheck nil :type (or null function))
+  (reader (missing-arg) :type function)
+  (writer (missing-arg) :type function)
+  (boundp (missing-arg) :type function))
 
 (defclass standard-direct-slot-definition (standard-slot-definition
                                            direct-slot-definition)
@@ -576,13 +592,10 @@
 
 (defvar *eql-specializer-table* (make-hash-table :test 'eql))
 
-(defvar *eql-specializer-table-lock*
-  (sb-thread::make-spinlock :name "EQL-specializer table lock"))
-
 (defun intern-eql-specializer (object)
   ;; Need to lock, so that two threads don't get non-EQ specializers
   ;; for an EQL object.
-  (sb-thread::with-spinlock (*eql-specializer-table-lock*)
+  (with-locked-system-table (*eql-specializer-table*)
     (or (gethash object *eql-specializer-table*)
         (setf (gethash object *eql-specializer-table*)
               (make-instance 'eql-specializer :object object)))))

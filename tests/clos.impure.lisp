@@ -11,8 +11,9 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+(load "compiler-test-util.lisp")
 (defpackage "CLOS-IMPURE"
-  (:use "CL" "ASSERTOID" "TEST-UTIL"))
+  (:use "CL" "ASSERTOID" "TEST-UTIL" "COMPILER-TEST-UTIL"))
 (in-package "CLOS-IMPURE")
 
 ;;; It should be possible to do DEFGENERIC and DEFMETHOD referring to
@@ -70,6 +71,15 @@
 (defgeneric foo4 (x &rest z &key y))
 (assert (expect-error (defgeneric foo5 (x &rest))))
 (assert (expect-error (defmethod foo6 (x &rest))))
+
+;;; legal method specializers
+(defclass bug-525916-1 () ())
+(defclass bug-525916-2 () ())
+(with-test (:name :bug-525916)
+(assert (expect-error (defmethod invalid ((arg)) arg)))
+(assert (expect-error (defmethod invalid (nil) 1)))
+(assert (expect-error (defmethod invalid ((arg . bug-525916-1)) arg)))
+(assert (expect-error (defmethod invalid ((arg bug-525916-1 bug-525916-2)) arg))))
 
 ;;; more lambda-list checking
 ;;;
@@ -346,10 +356,14 @@
 ;;; DOCUMENTATION's argument-precedence-order wasn't being faithfully
 ;;; preserved through the bootstrap process until sbcl-0.7.8.39.
 ;;; (thanks to Gerd Moellmann)
-(let ((answer (documentation '+ 'function)))
-  (assert (stringp answer))
-  (defmethod documentation ((x (eql '+)) y) "WRONG")
-  (assert (string= (documentation '+ 'function) answer)))
+(with-test (:name :documentation-argument-precedence-order)
+  (defun foo022 ()
+    "Documentation"
+    t)
+  (let ((answer (documentation 'foo022 'function)))
+    (assert (stringp answer))
+    (defmethod documentation ((x (eql 'foo022)) y) "WRONG")
+    (assert (string= (documentation 'foo022 'function) answer))))
 
 ;;; only certain declarations are permitted in DEFGENERIC
 (macrolet ((assert-program-error (form)
@@ -1102,7 +1116,9 @@
             (assert (= (method-on-defined-type-and-class 3) 4)))))
 
 ;; bug 281
-(let ((sb-pcl::*max-emf-precomputation-methods* 0))
+(let (#+nil ; no more sb-pcl::*max-emf-precomputation-methods* as of
+            ; sbcl-1.0.41.x
+      (sb-pcl::*max-emf-precomputation-methods* 0))
   (eval '(defgeneric bug-281 (x)
           (:method-combination +)
           (:method ((x symbol)) 1)
@@ -1776,5 +1792,244 @@
       (setf array (make-array 4)))
     bug-485019)
   (bug-485019 (make-instance 'bug-485019)))
+
+;;; The compiler didn't propagate the declarared type before applying
+;;; the transform for (SETF SLOT-VALUE), so the generic accessor was used.
+(defstruct foo-520366
+  slot)
+(defun quux-520366 (cont)
+  (funcall cont))
+(defun bar-520366 (foo-struct)
+  (declare (type foo-520366 foo-struct))
+  (with-slots (slot) foo-struct
+    (tagbody
+       (quux-520366 #'(lambda ()
+                        (setf slot :value)
+                        (go TAG)))
+     TAG)))
+(with-test (:name :bug-520366)
+  (let ((callees (find-named-callees #'bar-520366)))
+    (assert (equal (list #'quux-520366) callees))))
+
+(defgeneric no-applicable-method/retry (x))
+(defmethod no-applicable-method/retry ((x string))
+  "string")
+(with-test (:name :no-applicable-method/retry)
+  (assert (equal "cons"
+                 (handler-bind ((error
+                                 (lambda (c)
+                                   (declare (ignore c))
+                                   (let ((r (find-restart 'sb-pcl::retry)))
+                                     (when r
+                                       (eval `(defmethod no-applicable-method/retry ((x cons))
+                                                "cons"))
+                                       (invoke-restart r))))))
+                   (no-applicable-method/retry (cons t t))))))
+
+(defgeneric no-primary-method/retry (x))
+(defmethod no-primary-method/retry :before (x) (assert x))
+(with-test (:name :no-primary-method/retry)
+  (assert (equal "ok!"
+                 (handler-bind ((error
+                                 (lambda (c)
+                                   (declare (ignore c))
+                                   (let ((r (find-restart 'sb-pcl::retry)))
+                                     (when r
+                                       (eval `(defmethod no-primary-method/retry (x)
+                                                "ok!"))
+                                       (invoke-restart r))))))
+                   (no-primary-method/retry (cons t t))))))
+
+;;; test that a cacheing strategy for make-instance initargs checking
+;;; can handle class redefinitions
+(defclass cacheing-initargs-redefinitions-check ()
+  ((slot :initarg :slot)))
+(defun cacheing-initargs-redefinitions-check-fun (&optional (initarg :slot))
+  (declare (notinline make-instance))
+  (make-instance 'cacheing-initargs-redefinitions-check)
+  (make-instance 'cacheing-initargs-redefinitions-check initarg 3))
+(with-test (:name :make-instance-initargs)
+  (make-instance 'cacheing-initargs-redefinitions-check)
+  (make-instance 'cacheing-initargs-redefinitions-check :slot 3)
+  (cacheing-initargs-redefinitions-check-fun :slot)
+  (assert (raises-error? (cacheing-initargs-redefinitions-check-fun :slot2))))
+(defclass cacheing-initargs-redefinitions-check ()
+  ((slot :initarg :slot2)))
+(with-test (:name :make-instance-redefined-initargs)
+  (make-instance 'cacheing-initargs-redefinitions-check)
+  (make-instance 'cacheing-initargs-redefinitions-check :slot2 3)
+  (cacheing-initargs-redefinitions-check-fun :slot2)
+  (assert (raises-error? (cacheing-initargs-redefinitions-check-fun :slot))))
+(defmethod initialize-instance :after ((class cacheing-initargs-redefinitions-check) &key slot)
+  nil)
+(with-test (:name :make-instance-new-method-initargs)
+  (make-instance 'cacheing-initargs-redefinitions-check)
+  (make-instance 'cacheing-initargs-redefinitions-check :slot2 3)
+  (cacheing-initargs-redefinitions-check-fun :slot2)
+  (let ((thing (cacheing-initargs-redefinitions-check-fun :slot)))
+    (assert (not (slot-boundp thing 'slot)))))
+
+(with-test (:name :defmethod-specializer-builtin-class-alias)
+  (let ((alias (gensym)))
+    (setf (find-class alias) (find-class 'symbol))
+    (eval `(defmethod lp-618387 ((s ,alias))
+             (symbol-name s)))
+    (assert (equal "FOO" (funcall 'lp-618387 :foo)))))
+
+(with-test (:name :pcl-spurious-ignore-warnings)
+  (defgeneric no-spurious-ignore-warnings (req &key key))
+  (handler-bind ((warning (lambda (x) (error "~A" x))))
+    (eval
+     '(defmethod no-spurious-ignore-warnings ((req number) &key key)
+       (declare (ignore key))
+       (check-type req integer))))
+  (defgeneric should-get-an-ignore-warning (req &key key))
+  (let ((warnings 0))
+    (handler-bind ((warning (lambda (c) (setq warnings 1) (muffle-warning c))))
+      (eval '(defmethod should-get-an-ignore-warning ((req integer) &key key)
+              (check-type req integer))))
+    (assert (= warnings 1))))
+
+(defgeneric generic-function-pretty-arglist-optional-and-key (req &optional opt &key key)
+  (:method (req &optional opt &key key)
+    (list req opt key)))
+
+(with-test (:name :generic-function-pretty-arglist-optional-and-key)
+  (handler-bind ((warning #'error))
+    ;; Used to signal a style-warning
+    (assert (equal '(req &optional opt &key key)
+                   (sb-pcl::generic-function-pretty-arglist
+                    #'generic-function-pretty-arglist-optional-and-key)))))
+
+(with-test (:name :bug-894202)
+  (assert (eq :good
+              (handler-case
+                  (let ((name (gensym "FOO"))
+                        (decl (gensym "BAR")))
+                    (eval `(defgeneric ,name ()
+                             (declare (,decl)))))
+                (warning ()
+                  :good)))))
+
+(with-test (:name :bug-898331)
+  (handler-bind ((warning #'error))
+    (eval `(defgeneric bug-898331 (request type remaining-segment-requests all-requests)))
+    (eval `(defmethod bug-898331 ((request cons) (type (eql :cancel))
+                                  remaining-segment-requests
+                                  all-segment-requests)
+             (declare (ignore all-segment-requests))
+             (check-type request t)))))
+
+(with-test (:name :bug-1001799)
+  ;; compilation of the defmethod used to cause infinite recursion
+  (let ((pax (gensym "PAX"))
+        (pnr (gensym "PNR"))
+        (sup (gensym "SUP"))
+        (frob (gensym "FROB"))
+        (sb-ext:*evaluator-mode* :compile))
+    (eval
+     `(progn
+        (declaim (optimize (speed 1) (space 1) (safety 3) (debug 3) (compilation-speed 1)))
+        (defclass ,pax (,sup)
+          ((,pnr :type (or null ,pnr))))
+        (defclass ,pnr (,sup)
+          ((,pax :type (or null ,pax))))
+        (defclass ,sup ()
+          ())
+        (defmethod ,frob ((pnr ,pnr))
+          (slot-value pnr ',pax))))))
+
+(with-test (:name :bug-1099708)
+  (defclass bug-1099708 ()
+    ((slot-1099708 :initarg :slot-1099708)))
+  ;; caused infinite equal testing in function name lookup
+  (eval
+   '(progn
+     (defun make-1099708-1 ()
+       (make-instance 'bug-1099708 :slot-1099708 '#1= (1 2 . #1#)))
+     (defun make-1099708-2 ()
+       (make-instance 'bug-1099708 :slot-1099708 '#2= (1 2 . #2#)))))
+  (assert (not (eql (slot-value (make-1099708-1) 'slot-1099708)
+                    (slot-value (make-1099708-2) 'slot-1099708)))))
+
+(with-test (:name :bug-1099708b-list)
+  (defclass bug-1099708b-list ()
+    ((slot-1099708b-list :initarg :slot-1099708b-list)))
+  (eval
+   '(progn
+     (defun make-1099708b-list-1 ()
+       (make-instance 'bug-1099708b-list :slot-1099708b-list '(some value)))
+     (defun make-1099708b-list-2 ()
+       (make-instance 'bug-1099708b-list :slot-1099708b-list '(some value)))))
+  (assert (eql (slot-value (make-1099708b-list-1) 'slot-1099708b-list)
+               (slot-value (make-1099708b-list-1) 'slot-1099708b-list)))
+  (assert (eql (slot-value (make-1099708b-list-2) 'slot-1099708b-list)
+               (slot-value (make-1099708b-list-2) 'slot-1099708b-list)))
+  (assert (not (eql (slot-value (make-1099708b-list-1) 'slot-1099708b-list)
+                    (slot-value (make-1099708b-list-2) 'slot-1099708b-list)))))
+
+(with-test (:name :bug-1099708b-string)
+  (defclass bug-1099708b-string ()
+    ((slot-1099708b-string :initarg :slot-1099708b-string)))
+  (eval
+   '(progn
+     (defun make-1099708b-string-1 ()
+       (make-instance 'bug-1099708b-string :slot-1099708b-string "string"))
+     (defun make-1099708b-string-2 ()
+       (make-instance 'bug-1099708b-string :slot-1099708b-string "string"))))
+  (assert (eql (slot-value (make-1099708b-string-1) 'slot-1099708b-string)
+               (slot-value (make-1099708b-string-1) 'slot-1099708b-string)))
+  (assert (eql (slot-value (make-1099708b-string-2) 'slot-1099708b-string)
+               (slot-value (make-1099708b-string-2) 'slot-1099708b-string)))
+  (assert (not (eql (slot-value (make-1099708b-string-1) 'slot-1099708b-string)
+                    (slot-value (make-1099708b-string-2) 'slot-1099708b-string)))))
+
+(with-test (:name :bug-1099708b-bitvector)
+  (defclass bug-1099708b-bitvector ()
+    ((slot-1099708b-bitvector :initarg :slot-1099708b-bitvector)))
+  (eval
+   '(progn
+     (defun make-1099708b-bitvector-1 ()
+       (make-instance 'bug-1099708b-bitvector :slot-1099708b-bitvector #*1011))
+     (defun make-1099708b-bitvector-2 ()
+       (make-instance 'bug-1099708b-bitvector :slot-1099708b-bitvector #*1011))))
+  (assert (eql (slot-value (make-1099708b-bitvector-1) 'slot-1099708b-bitvector)
+               (slot-value (make-1099708b-bitvector-1) 'slot-1099708b-bitvector)))
+  (assert (eql (slot-value (make-1099708b-bitvector-2) 'slot-1099708b-bitvector)
+               (slot-value (make-1099708b-bitvector-2) 'slot-1099708b-bitvector)))
+  (assert (not (eql (slot-value (make-1099708b-bitvector-1) 'slot-1099708b-bitvector)
+                    (slot-value (make-1099708b-bitvector-2) 'slot-1099708b-bitvector)))))
+
+(with-test (:name :bug-1099708b-pathname)
+  (defclass bug-1099708b-pathname ()
+    ((slot-1099708b-pathname :initarg :slot-1099708b-pathname)))
+  (eval
+   '(progn
+     (defun make-1099708b-pathname-1 ()
+       (make-instance 'bug-1099708b-pathname :slot-1099708b-pathname #p"pn"))
+     (defun make-1099708b-pathname-2 ()
+       (make-instance 'bug-1099708b-pathname :slot-1099708b-pathname #p"pn"))))
+  (assert (eql (slot-value (make-1099708b-pathname-1) 'slot-1099708b-pathname)
+               (slot-value (make-1099708b-pathname-1) 'slot-1099708b-pathname)))
+  (assert (eql (slot-value (make-1099708b-pathname-2) 'slot-1099708b-pathname)
+               (slot-value (make-1099708b-pathname-2) 'slot-1099708b-pathname)))
+  (assert (not (eql (slot-value (make-1099708b-pathname-1) 'slot-1099708b-pathname)
+                    (slot-value (make-1099708b-pathname-2) 'slot-1099708b-pathname)))))
+
+(with-test (:name :bug-1099708c-list)
+  (defclass bug-1099708c-list ()
+    ((slot-1099708c-list :initarg :slot-1099708c-list)))
+  (eval
+   '(progn
+     (defun make-1099708c-list-1 ()
+       (make-instance 'bug-1099708c-list :slot-1099708c-list #1='(some value)))
+     (defun make-1099708c-list-2 ()
+       (make-instance 'bug-1099708c-list :slot-1099708c-list #1#))))
+  (assert (eql (slot-value (make-1099708c-list-1) 'slot-1099708c-list)
+               (slot-value (make-1099708c-list-1) 'slot-1099708c-list)))
+  (assert (eql (slot-value (make-1099708c-list-2) 'slot-1099708c-list)
+               (slot-value (make-1099708c-list-2) 'slot-1099708c-list)))
+  (assert (eql (slot-value (make-1099708c-list-1) 'slot-1099708c-list)
+               (slot-value (make-1099708c-list-2) 'slot-1099708c-list))))
 
 ;;;; success

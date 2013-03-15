@@ -121,6 +121,24 @@
       (when nfp
         (inst addi val nfp (bytes-needed-for-non-descriptor-stack-frame))))))
 
+;;; Accessing a slot from an earlier stack frame is definite hackery.
+(define-vop (ancestor-frame-ref)
+  (:args (frame-pointer :scs (descriptor-reg))
+         (variable-home-tn :load-if nil))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:policy :fast-safe)
+  (:generator 4
+    (aver (sc-is variable-home-tn control-stack))
+    (loadw value frame-pointer (tn-offset variable-home-tn))))
+(define-vop (ancestor-frame-set)
+  (:args (frame-pointer :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:results (variable-home-tn :load-if nil))
+  (:policy :fast-safe)
+  (:generator 4
+    (aver (sc-is variable-home-tn control-stack))
+    (storew value frame-pointer (tn-offset variable-home-tn))))
+
 (define-vop (xep-allocate-frame)
   (:info start-lab copy-more-arg-follows)
   (:ignore copy-more-arg-follows)
@@ -258,7 +276,7 @@ default-value-8
           (note-this-location vop :single-value-return)
           (move csp-tn ocfp-tn)
           (inst nop))
-        (inst compute-code-from-lra code-tn code-tn lra-label temp))
+        (inst compute-code-from-lra code-tn lra-tn lra-label temp))
       (let ((regs-defaulted (gen-label))
             (defaulting-done (gen-label))
             (default-stack-vals (gen-label)))
@@ -314,7 +332,7 @@ default-value-8
                   (inst b defaulting-done)
                   (trace-table-entry trace-table-normal))))))
 
-        (inst compute-code-from-lra code-tn code-tn lra-label temp)))
+        (inst compute-code-from-lra code-tn lra-tn lra-label temp)))
   (values))
 
 
@@ -344,7 +362,7 @@ default-value-8
       (inst b variable-values)
       (inst nop))
 
-    (inst compute-code-from-lra code-tn code-tn lra-label temp)
+    (inst compute-code-from-lra code-tn lra-tn lra-label temp)
     (inst addi csp-tn csp-tn 4)
     (storew (first *register-arg-tns*) csp-tn -1)
     (inst subi start csp-tn 4)
@@ -355,7 +373,7 @@ default-value-8
     (assemble (*elsewhere*)
       (trace-table-entry trace-table-fun-prologue)
       (emit-label variable-values)
-      (inst compute-code-from-lra code-tn code-tn lra-label temp)
+      (inst compute-code-from-lra code-tn lra-tn lra-label temp)
       (do ((arg *register-arg-tns* (rest arg))
            (i 0 (1+ i)))
           ((null arg))
@@ -381,6 +399,15 @@ default-value-8
               nvals)
   (:temporary (:scs (non-descriptor-reg)) temp))
 
+
+;;; This hook in the codegen pass lets us insert code before fall-thru entry
+;;; points, local-call entry points, and tail-call entry points.  The default
+;;; does nothing.
+(defun emit-block-header (start-label trampoline-label fall-thru-p alignp)
+  (declare (ignore fall-thru-p alignp))
+  (when trampoline-label
+    (emit-label trampoline-label))
+  (emit-label start-label))
 
 
 ;;;; Local call with unknown values convention return:
@@ -650,9 +677,8 @@ default-value-8
                             :from (:argument ,(if (eq return :tail) 0 1))
                             :to :eval)
                        lexenv))
-     ,@(unless named
-         '((:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
-                       function)))
+     (:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
+                 function)
      (:temporary (:sc any-reg :offset nargs-offset :to :eval)
                  nargs-pass)
 
@@ -751,12 +777,10 @@ default-value-8
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
                     ;; Get the symbol-value of SB!IMPL::*STEPPING*
-                    (loadw stepping
-                           null-tn
-                           (+ symbol-value-slot
-                              (truncate (static-symbol-offset 'sb!impl::*stepping*)
-                                        n-word-bytes))
-                           other-pointer-lowtag)
+                    #!-sb-thread
+                    (load-symbol-value stepping sb!impl::*stepping*)
+                    #!+sb-thread
+                    (loadw stepping thread-base-tn thread-stepping-slot)
                     (inst cmpw stepping null-tn)
                     ;; If it's not null, trap.
                     (inst beq step-done-label)
@@ -784,8 +808,17 @@ default-value-8
                    ;; FUNCTION is loaded, but before ENTRY-POINT is
                    ;; calculated.
                    (insert-step-instrumenting name-pass)
-                   (loadw entry-point name-pass fdefn-raw-addr-slot
-                          other-pointer-lowtag)
+                   ;; The raw-addr (ENTRY-POINT) will be one of:
+                   ;; closure_tramp, undefined_tramp, or somewhere
+                   ;; within a simple-fun object.  If the latter, then
+                   ;; it is essential (due to it being an interior
+                   ;; pointer) that the function itself be in a
+                   ;; register before the raw-addr is loaded.
+                   (sb!assem:without-scheduling ()
+                     (loadw function name-pass fdefn-fun-slot
+                            other-pointer-lowtag)
+                     (loadw entry-point name-pass fdefn-raw-addr-slot
+                            other-pointer-lowtag))
                    (do-next-filler))
                  `((sc-case arg-fun
                      (descriptor-reg (move lexenv arg-fun))
@@ -882,14 +915,16 @@ default-value-8
 
 ;;; Return a single value using the unknown-values convention.
 (define-vop (return-single)
-  (:args (old-fp :scs (any-reg))
-         (return-pc :scs (descriptor-reg))
+  (:args (old-fp :scs (any-reg) :to :eval)
+         (return-pc :scs (descriptor-reg) :target lra)
          (value))
   (:ignore value)
+  (:temporary (:sc descriptor-reg :offset lra-offset :from (:argument 1)) lra)
   (:temporary (:scs (interior-reg)) lip)
   (:vop-var vop)
   (:generator 6
     (trace-table-entry trace-table-fun-epilogue)
+    (move lra return-pc)
     ;; Clear the number stack.
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
@@ -900,7 +935,7 @@ default-value-8
     (move csp-tn cfp-tn)
     (move cfp-tn old-fp)
     ;; Out of here.
-    (lisp-return return-pc lip :offset 2)
+    (lisp-return lra lip :offset 2)
     (trace-table-entry trace-table-normal)))
 
 ;;; Do unknown-values return of a fixed number of values.  The Values are
@@ -918,7 +953,7 @@ default-value-8
 (define-vop (return)
   (:args
    (old-fp :scs (any-reg))
-   (return-pc :scs (descriptor-reg) :to (:eval 1))
+   (return-pc :scs (descriptor-reg) :to (:eval 1) :target lra)
    (values :more t))
   (:ignore values)
   (:info nvals)
@@ -926,12 +961,14 @@ default-value-8
   (:temporary (:sc descriptor-reg :offset a1-offset :from (:eval 0)) a1)
   (:temporary (:sc descriptor-reg :offset a2-offset :from (:eval 0)) a2)
   (:temporary (:sc descriptor-reg :offset a3-offset :from (:eval 0)) a3)
+  (:temporary (:sc descriptor-reg :offset lra-offset :from (:eval 1)) lra)
   (:temporary (:sc any-reg :offset nargs-offset) nargs)
   (:temporary (:sc any-reg :offset ocfp-offset) val-ptr)
   (:temporary (:scs (interior-reg)) lip)
   (:vop-var vop)
   (:generator 6
     (trace-table-entry trace-table-fun-epilogue)
+    (move lra return-pc)
     ;; Clear the number stack.
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
@@ -943,7 +980,7 @@ default-value-8
            (move csp-tn cfp-tn)
            (move cfp-tn old-fp)
            ;; Out of here.
-           (lisp-return return-pc lip :offset 2))
+           (lisp-return lra lip :offset 2))
           (t
            ;; Establish the values pointer and values count.
            (move val-ptr cfp-tn)
@@ -957,7 +994,7 @@ default-value-8
              (dolist (reg (subseq (list a0 a1 a2 a3) nvals))
                (move reg null-tn)))
            ;; And away we go.
-           (lisp-return return-pc lip)))
+           (lisp-return lra lip)))
     (trace-table-entry trace-table-normal)))
 
 ;;; Do unknown-values return of an arbitrary number of values (passed
@@ -981,6 +1018,7 @@ default-value-8
   (:vop-var vop)
   (:generator 13
     (trace-table-entry trace-table-fun-epilogue)
+    (move lra lra-arg)
     (let ((not-single (gen-label)))
       ;; Clear the number stack.
       (let ((cur-nfp (current-nfp-tn vop)))
@@ -999,7 +1037,6 @@ default-value-8
       ;; Nope, not the single case.
       (emit-label not-single)
       (move old-fp old-fp-arg)
-      (move lra lra-arg)
       (move vals vals-arg)
       (move nvals nvals-arg)
       (inst lr temp (make-fixup 'return-multiple :assembly-routine))
@@ -1227,12 +1264,10 @@ default-value-8
   (:vop-var vop)
   (:generator 3
     ;; Get the symbol-value of SB!IMPL::*STEPPING*
-    (loadw stepping
-           null-tn
-           (+ symbol-value-slot
-              (truncate (static-symbol-offset 'sb!impl::*stepping*)
-                        n-word-bytes))
-           other-pointer-lowtag)
+    #!-sb-thread
+    (load-symbol-value stepping sb!impl::*stepping*)
+    #!+sb-thread
+    (loadw stepping thread-base-tn thread-stepping-slot)
     (inst cmpw stepping null-tn)
     ;; If it's not null, trap.
     (inst beq DONE)

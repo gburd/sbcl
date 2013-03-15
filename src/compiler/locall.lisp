@@ -47,7 +47,7 @@
   (declare (type combination call) (type clambda fun))
   (loop for arg in (basic-combination-args call)
         for var in (lambda-vars fun)
-        for dx = (lambda-var-dynamic-extent var)
+        for dx = (leaf-dynamic-extent var)
         when (and dx arg (not (lvar-dynamic-extent arg)))
         append (handle-nested-dynamic-extent-lvars dx arg) into dx-lvars
         finally (when dx-lvars
@@ -163,9 +163,7 @@
           ,(if (policy *lexenv* (zerop verify-arg-count))
                `(declare (ignore ,n-supplied))
                `(%verify-arg-count ,n-supplied ,nargs))
-          (locally
-            (declare (optimize (merge-tail-calls 3)))
-            (%funcall ,fun ,@temps)))))
+          (%funcall ,fun ,@temps))))
     (optional-dispatch
      (let* ((min (optional-dispatch-min-args fun))
             (max (optional-dispatch-max-args fun))
@@ -190,9 +188,7 @@
                     ,(with-unique-names (n-context n-count)
                        `(multiple-value-bind (,n-context ,n-count)
                             (%more-arg-context ,n-supplied ,max)
-                          (locally
-                            (declare (optimize (merge-tail-calls 3)))
-                            (%funcall ,more ,@temps ,n-context ,n-count)))))))
+                          (%funcall ,more ,@temps ,n-context ,n-count))))))
              (t
               (%arg-count-error ,n-supplied)))))))))
 
@@ -209,25 +205,29 @@
   (declare (type functional fun))
   (aver (null (functional-entry-fun fun)))
   (with-ir1-environment-from-node (lambda-bind (main-entry fun))
-    (let ((res (ir1-convert-lambda (make-xep-lambda-expression fun)
+    (let ((xep (ir1-convert-lambda (make-xep-lambda-expression fun)
                                    :debug-name (debug-name
                                                 'xep (leaf-debug-name fun))
                                    :system-lambda t)))
-      (setf (functional-kind res) :external
-            (leaf-ever-used res) t
-            (functional-entry-fun res) fun
-            (functional-entry-fun fun) res
+      (setf (functional-kind xep) :external
+            (leaf-ever-used xep) t
+            (functional-entry-fun xep) fun
+            (functional-entry-fun fun) xep
             (component-reanalyze *current-component*) t)
       (reoptimize-component *current-component* :maybe)
-      (etypecase fun
-        (clambda
-         (locall-analyze-fun-1 fun))
-        (optional-dispatch
-         (dolist (ep (optional-dispatch-entry-points fun))
-           (locall-analyze-fun-1 (force ep)))
-         (when (optional-dispatch-more-entry fun)
-           (locall-analyze-fun-1 (optional-dispatch-more-entry fun)))))
-      res)))
+      (locall-analyze-xep-entry-point fun)
+      xep)))
+
+(defun locall-analyze-xep-entry-point (fun)
+  (declare (type functional fun))
+  (etypecase fun
+    (clambda
+     (locall-analyze-fun-1 fun))
+    (optional-dispatch
+     (dolist (ep (optional-dispatch-entry-points fun))
+       (locall-analyze-fun-1 (force ep)))
+     (when (optional-dispatch-more-entry fun)
+       (locall-analyze-fun-1 (optional-dispatch-more-entry fun))))))
 
 ;;; Notice a REF that is not in a local-call context. If the REF is
 ;;; already to an XEP, then do nothing, otherwise change it to the
@@ -556,14 +556,15 @@
 ;;; function that rearranges the arguments and calls the entry point.
 ;;; We analyze the new function and the entry point immediately so
 ;;; that everything gets converted during the single pass.
-(defun convert-hairy-fun-entry (ref call entry vars ignores args)
+(defun convert-hairy-fun-entry (ref call entry vars ignores args indef)
   (declare (list vars ignores args) (type ref ref) (type combination call)
            (type clambda entry))
   (let ((new-fun
          (with-ir1-environment-from-node call
            (ir1-convert-lambda
             `(lambda ,vars
-               (declare (ignorable ,@ignores))
+               (declare (ignorable ,@ignores)
+                        (indefinite-extent ,@indef))
                (%funcall ,entry ,@args))
             :debug-name (debug-name 'hairy-function-entry
                                     (lvar-fun-debug-name
@@ -678,6 +679,22 @@
                      (call-args t)))
                   (:rest
                    (call-args `(list ,@more-temps))
+                   ;; &REST arguments may be accompanied by extra
+                   ;; context and count arguments. We know this by
+                   ;; the ARG-INFO-DEFAULT. Supply 0 and 0 or
+                   ;; don't convert at all depending.
+                   (let ((more (arg-info-default info)))
+                     (when more
+                       (unless (eq t more)
+                         (destructuring-bind (context count &optional used) more
+                           (declare (ignore context count))
+                           (when used
+                             ;; We've already converted to use the more context
+                             ;; instead of the rest list.
+                             (return-from convert-more-call))))
+                       (call-args 0)
+                       (call-args 0)
+                       (setf (arg-info-default info) t)))
                    (return))
                   (:keyword
                    (return)))
@@ -694,7 +711,9 @@
 
         (convert-hairy-fun-entry ref call (optional-dispatch-main-entry fun)
                                  (append temps more-temps)
-                                 (ignores) (call-args)))))
+                                 (ignores) (call-args)
+                                 (when (optional-rest-p fun)
+                                   more-temps)))))
 
   (values))
 
@@ -1010,7 +1029,13 @@
   ;; with anonymous things, and suppressing inlining
   ;; for such things can easily give Python acute indigestion, so
   ;; we don't.)
-  (when (leaf-has-source-name-p clambda)
+  ;;
+  ;; A functional that is already inline-expanded in this componsne definitely
+  ;; deserves let-conversion -- and in case of main entry points for inline
+  ;; expanded optional dispatch, the main-etry isn't explicitly marked :INLINE
+  ;; even if the function really is.
+  (when (and (leaf-has-source-name-p clambda)
+             (not (functional-inline-expanded clambda)))
     ;; ANSI requires that explicit NOTINLINE be respected.
     (or (eq (lambda-inlinep clambda) :notinline)
         ;; If (= LET-CONVERSION 0) we can guess that inlining

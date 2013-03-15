@@ -55,35 +55,53 @@
                    :complaint "can't embed #\\Nul or #\\/ in Unix namestring"
                    :namestring namestring
                    :offset position))))
-      ;; Now we have everything we want. So return it.
-      (values nil ; no host for Unix namestrings
-              nil ; no device for Unix namestrings
-              (collect ((dirs))
-                (dolist (piece pieces)
-                  (let ((piece-start (car piece))
-                        (piece-end (cdr piece)))
-                    (unless (= piece-start piece-end)
-                      (cond ((string= namestring ".."
-                                      :start1 piece-start
-                                      :end1 piece-end)
-                             (dirs :up))
-                            ((string= namestring "**"
-                                      :start1 piece-start
-                                      :end1 piece-end)
-                             (dirs :wild-inferiors))
-                            (t
-                             (dirs (maybe-make-pattern namestring
-                                                       piece-start
-                                                       piece-end)))))))
-                (cond (absolute
-                       (cons :absolute (dirs)))
-                      ((dirs)
-                       (cons :relative (dirs)))
-                      (t
-                       nil)))
-              name
-              type
-              version))))
+
+      (let (home)
+        ;; Deal with ~ and ~user
+        (when (car pieces)
+          (destructuring-bind (start . end) (car pieces)
+            (when (and (not absolute)
+                       (not (eql start end))
+                       (string= namestring "~"
+                                :start1 start
+                                :end1 (1+ start)))
+              (setf absolute t)
+              (if (> end (1+ start))
+                  (setf home (list :home (subseq namestring (1+ start) end)))
+                  (setf home :home))
+              (pop pieces))))
+
+        ;; Now we have everything we want. So return it.
+        (values nil                  ; no host for Unix namestrings
+                nil                  ; no device for Unix namestrings
+                (collect ((dirs))
+                  (dolist (piece pieces)
+                    (let ((piece-start (car piece))
+                          (piece-end (cdr piece)))
+                      (unless (= piece-start piece-end)
+                        (cond ((string= namestring ".."
+                                        :start1 piece-start
+                                        :end1 piece-end)
+                               (dirs :up))
+                              ((string= namestring "**"
+                                        :start1 piece-start
+                                        :end1 piece-end)
+                               (dirs :wild-inferiors))
+                              (t
+                               (dirs (maybe-make-pattern namestring
+                                                         piece-start
+                                                         piece-end)))))))
+                  (cond (absolute
+                         (if home
+                             (list* :absolute home (dirs))
+                             (cons :absolute (dirs))))
+                        ((dirs)
+                         (cons :relative (dirs)))
+                        (t
+                         nil)))
+                name
+                type
+                version)))))
 
 (defun parse-native-unix-namestring (namestring start end as-directory)
   (declare (type simple-string namestring)
@@ -132,35 +150,6 @@
   ;; 2002-05-09
   "")
 
-(defun unparse-unix-directory-list (directory)
-  (declare (type list directory))
-  (collect ((pieces))
-    (when directory
-      (ecase (pop directory)
-        (:absolute
-         (pieces "/"))
-        (:relative
-         ;; nothing special
-         ))
-      (dolist (dir directory)
-        (typecase dir
-          ((member :up)
-           (pieces "../"))
-          ((member :back)
-           (error ":BACK cannot be represented in namestrings."))
-          ((member :wild-inferiors)
-           (pieces "**/"))
-          ((or simple-string pattern (member :wild))
-           (pieces (unparse-physical-piece dir))
-           (pieces "/"))
-          (t
-           (error "invalid directory component: ~S" dir)))))
-    (apply #'concatenate 'simple-string (pieces))))
-
-(defun unparse-unix-directory (pathname)
-  (declare (type pathname pathname))
-  (unparse-unix-directory-list (%pathname-directory pathname)))
-
 (defun unparse-unix-file (pathname)
   (declare (type pathname pathname))
   (collect ((strings))
@@ -195,7 +184,7 @@
 (defun unparse-unix-namestring (pathname)
   (declare (type pathname pathname))
   (concatenate 'simple-string
-               (unparse-unix-directory pathname)
+               (unparse-physical-directory pathname)
                (unparse-unix-file pathname)))
 
 (defun unparse-native-unix-namestring (pathname as-file)
@@ -212,15 +201,29 @@
     (coerce
      (with-output-to-string (s)
        (when directory
-         (ecase (car directory)
-           (:absolute (write-char #\/ s))
+         (ecase (pop directory)
+           (:absolute
+            (let ((next (pop directory)))
+              (cond ((eq :home next)
+                     (write-string (user-homedir-namestring) s))
+                    ((and (consp next) (eq :home (car next)))
+                     (let ((where (user-homedir-namestring (second next))))
+                       (if where
+                           (write-string where s)
+                           (error "User homedir unknown for: ~S" (second next)))))
+                    (next
+                     (push next directory)))
+              (write-char #\/ s)))
            (:relative)))
-       (loop for (piece . subdirs) on (cdr directory)
+       (loop for (piece . subdirs) on directory
           do (typecase piece
-               ((member :up) (write-string ".." s))
-               (string (write-string piece s))
-               (t (error "ungood directory segment in NATIVE-NAMESTRING: ~S"
-                         piece)))
+               ((member :up)
+                (write-string ".." s))
+               (string
+                (write-string piece s))
+               (t
+                (error "ungood directory segment in NATIVE-NAMESTRING: ~S"
+                       piece)))
           if (or subdirs (stringp name))
           do (write-char #\/ s)
           else
@@ -268,7 +271,7 @@
                      pathname-directory)
                     (t
                      (bug "Bad fallthrough in ~S" 'unparse-unix-enough)))))
-        (strings (unparse-unix-directory-list result-directory)))
+        (strings (unparse-physical-directory-list result-directory)))
       (let* ((pathname-type (%pathname-type pathname))
              (type-needed (and pathname-type
                                (not (eq pathname-type :unspecific))))

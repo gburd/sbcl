@@ -31,17 +31,26 @@
 #include "genesis/symbol.h"
 
 #define BREAKPOINT_INST 0xcc    /* INT3 */
+#define UD2_INST 0x0b0f         /* UD2 */
+
+#ifndef LISP_FEATURE_UD2_BREAKPOINTS
+#define BREAKPOINT_WIDTH 1
+#else
+#define BREAKPOINT_WIDTH 2
+#endif
 
 unsigned long fast_random_state = 1;
 
 void arch_init(void)
 {}
 
+#ifndef _WIN64
 os_vm_address_t
 arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
 {
     return (os_vm_address_t)code->si_addr;
 }
+#endif
 
 
 /*
@@ -69,6 +78,8 @@ context_eflags_addr(os_context_t *context)
     return &context->sc_rflags;
 #elif defined __NetBSD__
     return CONTEXT_ADDR_FROM_STEM(RFLAGS);
+#elif defined _WIN64
+    return (os_context_register_t*)&context->win32_context->EFlags;
 #else
 #error unsupported OS
 #endif
@@ -103,6 +114,10 @@ void arch_skip_instruction(os_context_t *context)
         case trap_FunEndBreakpoint: /* not tested */
             break;
 
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+        case trap_GlobalSafepoint:
+        case trap_CspSafepoint:
+#endif
         case trap_PendingInterrupt:
         case trap_Halt:
         case trap_SingleStepAround:
@@ -155,8 +170,14 @@ arch_install_breakpoint(void *pc)
 {
     unsigned int result = *(unsigned int*)pc;
 
+#ifndef LISP_FEATURE_UD2_BREAKPOINTS
     *(char*)pc = BREAKPOINT_INST;               /* x86 INT3       */
     *((char*)pc+1) = trap_Breakpoint;           /* Lisp trap code */
+#else
+    *(char*)pc = UD2_INST & 0xff;
+    *((char*)pc+1) = UD2_INST >> 8;
+    *((char*)pc+2) = trap_Breakpoint;
+#endif
 
     return result;
 }
@@ -166,6 +187,9 @@ arch_remove_breakpoint(void *pc, unsigned int orig_inst)
 {
     *((char *)pc) = orig_inst & 0xff;
     *((char *)pc + 1) = (orig_inst & 0xff00) >> 8;
+#if BREAKPOINT_WIDTH > 1
+    *((char *)pc + 2) = (orig_inst & 0xff0000) >> 16;
+#endif
 }
 
 /* When single stepping, single_stepping holds the original instruction
@@ -183,8 +207,7 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
     unsigned int *pc = (unsigned int*)(*os_context_pc_addr(context));
 
     /* Put the original instruction back. */
-    *((char *)pc) = orig_inst & 0xff;
-    *((char *)pc + 1) = (orig_inst & 0xff00) >> 8;
+    arch_remove_breakpoint(pc, orig_inst);
 
 #ifdef CANNOT_GET_TO_SINGLE_STEP_FLAG
     /* Install helper instructions for the single step:
@@ -209,16 +232,16 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
 void
 arch_handle_breakpoint(os_context_t *context)
 {
-    --*os_context_pc_addr(context);
+    *os_context_pc_addr(context) -= BREAKPOINT_WIDTH;
     handle_breakpoint(context);
 }
 
 void
 arch_handle_fun_end_breakpoint(os_context_t *context)
 {
-    --*os_context_pc_addr(context);
+    *os_context_pc_addr(context) -= BREAKPOINT_WIDTH;
     *os_context_pc_addr(context) =
-        (unsigned long)handle_fun_end_breakpoint(context);
+        (uword_t)handle_fun_end_breakpoint(context);
 }
 
 void
@@ -232,36 +255,43 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
 
 
 void
+restore_breakpoint_from_single_step(os_context_t * context)
+{
+#ifdef CANNOT_GET_TO_SINGLE_STEP_FLAG
+    /* Un-install single step helper instructions. */
+    *(single_stepping-3) = single_step_save1;
+    *(single_stepping-2) = single_step_save2;
+    *(single_stepping-1) = single_step_save3;
+#else
+    *context_eflags_addr(context) &= ~0x100;
+#endif
+    /* Re-install the breakpoint if possible. */
+    if (((char *)*os_context_pc_addr(context) >
+         (char *)single_stepping) &&
+        ((char *)*os_context_pc_addr(context) <=
+         (char *)single_stepping + BREAKPOINT_WIDTH)) {
+        fprintf(stderr, "warning: couldn't reinstall breakpoint\n");
+    } else {
+        arch_install_breakpoint(single_stepping);
+    }
+
+    single_stepping = NULL;
+    return;
+}
+
+void
 sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 {
     unsigned int trap;
 
-    if (single_stepping && (signal==SIGTRAP))
-    {
-#ifdef CANNOT_GET_TO_SINGLE_STEP_FLAG
-        /* Un-install single step helper instructions. */
-        *(single_stepping-3) = single_step_save1;
-        *(single_stepping-2) = single_step_save2;
-        *(single_stepping-1) = single_step_save3;
-#else
-        *context_eflags_addr(context) ^= 0x100;
-#endif
-        /* Re-install the breakpoint if possible. */
-        if ((char *)*os_context_pc_addr(context) ==
-            (char *)single_stepping + 1) {
-            fprintf(stderr, "warning: couldn't reinstall breakpoint\n");
-        } else {
-            *((char *)single_stepping) = BREAKPOINT_INST;       /* x86 INT3 */
-            *((char *)single_stepping+1) = trap_Breakpoint;
-        }
-
-        single_stepping = NULL;
+    if (single_stepping) {
+        restore_breakpoint_from_single_step(context);
         return;
     }
 
     /* This is just for info in case the monitor wants to print an
      * approximation. */
-    current_control_stack_pointer =
+    access_control_stack_pointer(arch_os_get_current_thread()) =
         (lispobj *)*os_context_sp_addr(context);
 
     /* On entry %eip points just after the INT3 byte and aims at the
@@ -278,8 +308,8 @@ sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
     /* Triggering SIGTRAP using int3 is unreliable on OS X/x86, so
      * we need to use illegal instructions for traps.
      */
-#if defined(LISP_FEATURE_DARWIN) && !defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
-    if (*((unsigned short *)*os_context_pc_addr(context)) == 0x0b0f) {
+#if defined(LISP_FEATURE_UD2_BREAKPOINTS) && !defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
+    if (*((unsigned short *)*os_context_pc_addr(context)) == UD2_INST) {
         *os_context_pc_addr(context) += 2;
         return sigtrap_handler(signal, siginfo, context);
     }
@@ -353,12 +383,12 @@ arch_install_interrupt_handlers()
      * OS I haven't tested on?) and we have to go back to the old CMU
      * CL way, I hope there will at least be a comment to explain
      * why.. -- WHN 2001-06-07 */
-#if !defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
+#if !defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER) && !defined(LISP_FEATURE_WIN32)
     undoably_install_low_level_interrupt_handler(SIGILL , sigill_handler);
     undoably_install_low_level_interrupt_handler(SIGTRAP, sigtrap_handler);
 #endif
 
-#ifdef X86_64_SIGFPE_FIXUP
+#if defined(X86_64_SIGFPE_FIXUP) && !defined(LISP_FEATURE_WIN32)
     undoably_install_low_level_interrupt_handler(SIGFPE, sigfpe_handler);
 #endif
 
@@ -373,7 +403,7 @@ arch_install_interrupt_handlers()
 void
 arch_write_linkage_table_jmp(char * reloc, void * fun)
 {
-    unsigned long addr = (unsigned long) fun;
+    uword_t addr = (uword_t) fun;
     int i;
 
     *reloc++ = 0xFF; /* Opcode for near jump to absolute reg/mem64. */
@@ -395,7 +425,7 @@ arch_write_linkage_table_jmp(char * reloc, void * fun)
 void
 arch_write_linkage_table_ref(void * reloc, void * data)
 {
-    *(unsigned long *)reloc = (unsigned long)data;
+    *(uword_t *)reloc = (uword_t)data;
 }
 
 #endif

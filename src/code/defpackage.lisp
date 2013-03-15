@@ -34,19 +34,21 @@
    following: ~{~&~4T~A~}
    All options except ~{~A, ~}and :DOCUMENTATION can be used multiple
    times."
-  '((:nicknames "{package-name}*")
-    (:size "<integer>")
+  '((:use "{package-name}*")
+    (:export "{symbol-name}*")
+    (:import-from "<package-name> {symbol-name}*")
     (:shadow "{symbol-name}*")
     (:shadowing-import-from "<package-name> {symbol-name}*")
-    (:use "{package-name}*")
-    (:import-from "<package-name> {symbol-name}*")
-    (:intern "{symbol-name}*")
-    (:export "{symbol-name}*")
-    #!+sb-package-locks (:implement "{package-name}*")
+    (:local-nicknames "{local-nickname actual-package-name}*")
     #!+sb-package-locks (:lock "boolean")
-    (:documentation "doc-string"))
+    #!+sb-package-locks (:implement "{package-name}*")
+    (:documentation "doc-string")
+    (:intern "{symbol-name}*")
+    (:size "<integer>")
+    (:nicknames "{package-name}*"))
   '(:size #!+sb-package-locks :lock))
   (let ((nicknames nil)
+        (local-nicknames nil)
         (size nil)
         (shadows nil)
         (shadowing-imports nil)
@@ -69,6 +71,14 @@
       (case (car option)
         (:nicknames
          (setf nicknames (stringify-package-designators (cdr option))))
+        (:local-nicknames
+         (setf local-nicknames
+               (append local-nicknames
+                       (mapcar (lambda (spec)
+                                 (destructuring-bind (nick name) spec
+                                   (cons (stringify-package-designator nick)
+                                         (stringify-package-designator name))))
+                               (cdr option)))))
         (:size
          (cond (size
                 (error 'simple-program-error
@@ -142,7 +152,8 @@
     `(eval-when (:compile-toplevel :load-toplevel :execute)
        (%defpackage ,(stringify-string-designator package) ',nicknames ',size
                     ',shadows ',shadowing-imports ',(if use-p use :default)
-                    ',imports ',interns ',exports ',implement ',lock ',doc
+                    ',imports ',interns ',exports ',implement ',local-nicknames
+                    ',lock ',doc
                     (sb!c:source-location)))))
 
 (defun check-disjoint (&rest args)
@@ -208,11 +219,11 @@
                        shadows shadowing-imports
                        use
                        imports interns
-                       exports
-                       implement lock doc-string)
+                       exports implement local-nicknames
+                       lock doc-string)
   (declare #!-sb-package-locks
            (ignore implement lock))
-  (enter-new-nicknames package nicknames)
+  (%enter-new-nicknames package nicknames)
   ;; 1. :shadow and :shadowing-import-from
   ;;
   ;; shadows is a list of strings, shadowing-imports is a list of symbols.
@@ -245,52 +256,132 @@
       (add-implementation-package package p))
     ;; Handle lock
     (setf (package-lock package) lock))
+  ;; Local nicknames. Throw out the old ones.
+  (setf (package-%local-nicknames package) nil)
+  (dolist (spec local-nicknames)
+    (add-package-local-nickname (car spec) (cdr spec) package))
   package)
+
+(declaim (type list *on-package-variance*))
+(defvar *on-package-variance* '(:warn t)
+  "Specifies behavior when redefining a package using DEFPACKAGE and the
+definition is in variance with the current state of the package.
+
+The value should be of the form:
+
+  (:WARN [T | packages-names] :ERROR [T | package-names])
+
+specifying which packages get which behaviour -- with T signifying the default unless
+otherwise specified. If default is not specified, :WARN is used.
+
+:WARN keeps as much state as possible and causes SBCL to signal a full warning.
+
+:ERROR causes SBCL to signal an error when the variant DEFPACKAGE form is executed,
+with restarts provided for user to specify what action should be taken.
+
+Example:
+
+  (setf *on-package-variance* '(:warn (:swank :swank-backend) :error t))
+
+specifies to signal a warning if SWANK package is in variance, and an error otherwise.")
+
+(defun note-package-variance (&rest args &key package &allow-other-keys)
+  (let ((pname (package-name package)))
+    (destructuring-bind (&key warn error) *on-package-variance*
+      (let ((what (cond ((and (listp error) (member pname error :test #'string=))
+                         :error)
+                        ((and (listp warn) (member pname warn :test #'string=))
+                         :warn)
+                        ((eq t error)
+                         :error)
+                        (t
+                         :warn))))
+        (ecase what
+          (:error
+           (apply #'error 'sb!kernel::package-at-variance-error args))
+          (:warn
+           (apply #'warn 'sb!kernel::package-at-variance args)))))))
 
 (defun update-package-with-variance (package name nicknames source-location
                                      shadows shadowing-imports
                                      use
                                      imports interns
                                      exports
-                                     implement lock doc-string)
-  (let ((old-exports nil)
-        (old-shadows (package-%shadowing-symbols package))
-        (old-use (package-use-list package))
-        (no-longer-used nil))
-    (unless (string= (the string (package-name package)) name)
-      (error 'simple-package-error
-             :package name
-             :format-control "~A is a nickname for the package ~A"
-             :format-arguments (list name (package-name name))))
-    (do-external-symbols (symbol package)
-      (push symbol old-exports))
-    (setf old-shadows (set-difference old-shadows (append shadows
-                                                          shadowing-imports)
-                                      :test #'string=))
-    (setf no-longer-used (set-difference old-use use))
-    (setf use (set-difference use old-use))
-    (setf old-exports (set-difference old-exports exports :test #'string=))
-    (when old-shadows
-      (warn 'package-at-variance
-            :format-control "~A also shadows the following symbols:~%  ~S"
-            :format-arguments (list name old-shadows)))
+                                     implement local-nicknames
+                                     lock doc-string)
+  (unless (string= (the string (package-name package)) name)
+    (error 'simple-package-error
+           :package name
+           :format-control "~A is a nickname for the package ~A"
+           :format-arguments (list name (package-name name))))
+  (let ((no-longer-shadowed
+          (set-difference (package-%shadowing-symbols package)
+                          (append shadows shadowing-imports)
+                          :test #'string=)))
+    (when no-longer-shadowed
+      (restart-case
+          (let ((*package* (find-package :keyword)))
+            (note-package-variance
+             :format-control "~A also shadows the following symbols:~%  ~S"
+             :format-arguments (list name no-longer-shadowed)
+             :package package))
+        (drop-them ()
+          :report "Stop shadowing them by uninterning them."
+          (dolist (sym no-longer-shadowed)
+            (unintern sym package)))
+        (keep-them ()
+          :report "Keep shadowing them."))))
+  (let ((no-longer-used (set-difference (package-use-list package) use)))
     (when no-longer-used
-      (dolist (unused-package no-longer-used)
-        (unuse-package unused-package package))
-      (warn 'package-at-variance
-            :format-control "~A used to use the following packages:~%  ~S"
-            :format-arguments (list name no-longer-used)))
-    (when old-exports
-      (warn 'package-at-variance
+      (restart-case
+          (note-package-variance
+           :format-control "~A also uses the following packages:~%  ~A"
+           :format-arguments (list name (mapcar #'package-name no-longer-used))
+           :package package)
+        (drop-them ()
+          :report "Stop using them."
+          (unuse-package no-longer-used package))
+        (keep-them ()
+          :report "Keep using them."))))
+  (let (old-exports)
+    (do-external-symbols (s package)
+      (push s old-exports))
+    (let ((no-longer-exported (set-difference old-exports exports :test #'string=)))
+     (when no-longer-exported
+       (restart-case
+           (note-package-variance
             :format-control "~A also exports the following symbols:~%  ~S"
-            :format-arguments (list name old-exports)))
-    (update-package package nicknames source-location
-                    shadows shadowing-imports
-                    use imports interns exports
-                    implement lock doc-string)))
+            :format-arguments (list name no-longer-exported)
+            :package package)
+         (drop-them ()
+           :report "Unexport them."
+           (unexport no-longer-exported package))
+         (keep-them ()
+           :report "Keep exporting them.")))))
+  (let ((old-implements
+          (set-difference (package-implements-list package)
+                          (mapcar #'find-undeleted-package-or-lose implement))))
+    (when old-implements
+      (restart-case
+          (note-package-variance
+           :format-control "~A is also an implementation package for:~% ~{~S~^~%  ~}"
+           :format-arguments (list name old-implements)
+           :package package)
+        (drop-them ()
+          :report "Stop being an implementation package for them."
+          (dolist (p old-implements)
+            (remove-implementation-package package p)))
+        (keep-them ()
+          :report "Keep exporting them."))))
+  (update-package package nicknames source-location
+                  shadows shadowing-imports
+                  use imports interns exports
+                  implement local-nicknames
+                  lock doc-string))
 
 (defun %defpackage (name nicknames size shadows shadowing-imports
-                    use imports interns exports implement lock doc-string
+                    use imports interns exports implement local-nicknames
+                    lock doc-string
                     source-location)
   (declare (type simple-string name)
            (type list nicknames shadows shadowing-imports
@@ -299,25 +390,29 @@
            (type (or simple-string null) doc-string)
            #!-sb-package-locks
            (ignore implement lock))
-  (let* ((existing-package (find-package name))
-         (use (use-list-packages existing-package use))
-         (shadowing-imports (import-list-symbols shadowing-imports))
-         (imports (import-list-symbols imports)))
-    (if existing-package
-        (update-package-with-variance existing-package name
-                                      nicknames source-location
-                                      shadows shadowing-imports
-                                      use imports interns exports
-                                      implement lock doc-string)
-        (let ((package (make-package name
-                                     :use nil
-                                     :internal-symbols (or size 10)
-                                     :external-symbols (length exports))))
-          (update-package package
-                          nicknames source-location
-                          shadows shadowing-imports
-                          use imports interns exports
-                          implement lock doc-string)))))
+  (with-package-graph ()
+    (let* ((existing-package (find-package name))
+           (use (use-list-packages existing-package use))
+           (shadowing-imports (import-list-symbols shadowing-imports))
+           (imports (import-list-symbols imports)))
+      (if existing-package
+          (update-package-with-variance existing-package name
+                                        nicknames source-location
+                                        shadows shadowing-imports
+                                        use imports interns exports
+                                        implement local-nicknames
+                                        lock doc-string)
+          (let ((package (make-package name
+                                       :use nil
+                                       :internal-symbols (or size 10)
+                                       :external-symbols (length exports))))
+            (update-package package
+                            nicknames
+                            source-location
+                            shadows shadowing-imports
+                            use imports interns exports
+                            implement local-nicknames
+                            lock doc-string))))))
 
 (defun find-or-make-symbol (name package)
   (multiple-value-bind (symbol how) (find-symbol name package)

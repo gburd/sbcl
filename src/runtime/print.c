@@ -24,6 +24,187 @@
 #include "sbcl.h"
 #include "print.h"
 #include "runtime.h"
+#include <stdarg.h>
+#include "thread.h"              /* genesis/primitive-objects.h needs this */
+#include <errno.h>
+#include <stdlib.h>
+
+/* FSHOW and odxprint provide debugging output for low-level information
+ * (signal handling, exceptions, safepoints) which is hard to debug by
+ * other means.
+ *
+ * If enabled at all, environment variables control whether calls of the
+ * form odxprint(name, ...) are enabled at run-time, e.g. using
+ * SBCL_DYNDEBUG="fshow fshow_signal safepoints".
+ *
+ * In the case of FSHOW and FSHOW_SIGNAL, old-style code from runtime.h
+ * can also be used to enable or disable these more aggressively.
+ */
+
+struct dyndebug_config dyndebug_config = {
+    QSHOW == 2, QSHOW_SIGNALS == 2
+};
+
+void
+dyndebug_init()
+{
+#define DYNDEBUG_NFLAGS (sizeof(struct dyndebug_config) / sizeof(int))
+#define dyndebug_init1(lowercase, uppercase)                    \
+    do {                                                        \
+        int *ptr = &dyndebug_config.dyndebug_##lowercase;       \
+        ptrs[n] = ptr;                                          \
+        names[n] = #lowercase;                                  \
+        char *val = getenv("SBCL_DYNDEBUG__" uppercase);        \
+        *ptr = val && strlen(val);                              \
+        n++;                                                    \
+    } while (0)
+    int n = 0;
+    char *names[DYNDEBUG_NFLAGS];
+    int *ptrs[DYNDEBUG_NFLAGS];
+
+    dyndebug_init1(fshow,          "FSHOW");
+    dyndebug_init1(fshow_signal,   "FSHOW_SIGNAL");
+    dyndebug_init1(gencgc_verbose, "GENCGC_VERBOSE");
+    dyndebug_init1(safepoints,     "SAFEPOINTS");
+    dyndebug_init1(seh,            "SEH");
+    dyndebug_init1(misc,           "MISC");
+    dyndebug_init1(pagefaults,     "PAGEFAULTS");
+    dyndebug_init1(io,             "IO");
+    dyndebug_init1(runtime_link,   "RUNTIME_LINK");
+
+    int n_output_flags = n;
+    dyndebug_init1(backtrace_when_lost, "BACKTRACE_WHEN_LOST");
+    dyndebug_init1(sleep_when_lost,     "SLEEP_WHEN_LOST");
+
+    if (n != DYNDEBUG_NFLAGS)
+        fprintf(stderr, "Bug in dyndebug_init\n");
+
+#if defined(LISP_FEATURE_GENCGC)
+    gencgc_verbose = dyndebug_config.dyndebug_gencgc_verbose;
+#endif
+
+    char *featurelist = getenv("SBCL_DYNDEBUG");
+    if (featurelist) {
+        int err = 0;
+        featurelist = strdup(featurelist);
+        char *ptr = featurelist;
+        for (;;) {
+            char *token = strtok(ptr, " ");
+            if (!token) break;
+            unsigned i;
+            if (!strcmp(token, "all"))
+                for (i = 0; i < n_output_flags; i++)
+                    *ptrs[i] = 1;
+            else {
+                for (i = 0; i < DYNDEBUG_NFLAGS; i++)
+                    if (!strcmp(token, names[i])) {
+                        *ptrs[i] = 1;
+                        break;
+                    }
+                if (i == DYNDEBUG_NFLAGS) {
+                    fprintf(stderr, "No such dyndebug flag: `%s'\n", token);
+                    err = 1;
+                }
+            }
+            ptr = 0;
+        }
+        free(featurelist);
+        if (err) {
+            fprintf(stderr, "Valid flags are:\n");
+            fprintf(stderr, "  all  ;enables all of the following:\n");
+            unsigned i;
+            for (i = 0; i < DYNDEBUG_NFLAGS; i++) {
+                if (i == n_output_flags)
+                    fprintf(stderr, "Additional options:\n");
+                fprintf(stderr, "  %s\n", names[i]);
+            }
+        }
+    }
+
+#undef dyndebug_init1
+#undef DYNDEBUG_NFLAGS
+}
+
+/* Temporarily, odxprint merely performs the equivalent of a traditional
+ * FSHOW call, i.e. it merely formats to stderr.  Ultimately, it should
+ * be restored to its full win32 branch functionality, where output to a
+ * file or to the debugger can be selected at runtime. */
+
+void vodxprint_fun(const char *, va_list);
+
+void
+odxprint_fun(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vodxprint_fun(fmt, args);
+    va_end(args);
+}
+
+void
+vodxprint_fun(const char *fmt, va_list args)
+{
+#ifdef LISP_FEATURE_WIN32
+    DWORD lastError = GetLastError();
+#endif
+    int original_errno = errno;
+
+    QSHOW_BLOCK;
+
+    char buf[1024];
+
+#ifdef LISP_FEATURE_SB_THREAD
+    struct thread *arch_os_get_current_thread(void);
+    struct thread *self = arch_os_get_current_thread();
+    void *pth = self ? (void *) self->os_thread : 0;
+    snprintf(buf, sizeof(buf), "[%p/%p] ", self, pth);
+#endif
+
+    int n = strlen(buf);
+    vsnprintf(buf + n, sizeof(buf) - n - 1, fmt, args);
+    /* buf is now zero-terminated (even in case of overflow).
+     * Our caller took care of the newline (if any) through `fmt'. */
+
+    /* A sufficiently POSIXy implementation of stdio will provide
+     * per-FILE locking, as defined in the spec for flockfile.  At least
+     * glibc complies with this.  Hence we do not need to perform
+     * locking ourselves here.  (Should it turn out, of course, that
+     * other libraries opt for speed rather than safety, we need to
+     * revisit this decision.) */
+    fputs(buf, stderr);
+
+#ifdef LISP_FEATURE_WIN32
+    /* stdio's stderr is line-bufferred, i.e. \n ought to flush it.
+     * Unfortunately, MinGW does not behave the way I would expect it
+     * to.  Let's be safe: */
+    fflush(stderr);
+#endif
+
+    QSHOW_UNBLOCK;
+
+#ifdef LISP_FEATURE_WIN32
+    SetLastError(lastError);
+#endif
+    errno = original_errno;
+}
+
+/* Translate the rather awkward syntax
+ *   FSHOW((stderr, "xyz"))
+ * into the new and cleaner
+ *   odxprint("xyz").
+ * If we were willing to clean up all existing call sites, we could remove
+ * this wrapper function.  (This is a function, because I don't know how to
+ * strip the extra parens in a macro.) */
+void
+fshow_fun(void __attribute__((__unused__)) *ignored,
+          const char *fmt,
+          ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vodxprint_fun(fmt, args);
+    va_end(args);
+}
 
 /* This file can be skipped if we're not supporting LDB. */
 #if defined(LISP_FEATURE_SB_LDB)
@@ -31,7 +212,12 @@
 #include "monitor.h"
 #include "vars.h"
 #include "os.h"
+#ifdef LISP_FEATURE_GENCGC
 #include "gencgc-alloc-region.h" /* genesis/thread.h needs this */
+#endif
+#if defined(LISP_FEATURE_WIN32)
+# include "win32-thread-private-events.h" /* genesis/thread.h needs this */
+#endif
 #include "genesis/static-symbols.h"
 #include "genesis/primitive-objects.h"
 #include "genesis/static-symbols.h"
@@ -101,8 +287,18 @@ static void newline(char *label)
 }
 
 
+static void print_unknown(lispobj obj)
+{
+  printf("unknown object: %p", (void *)obj);
+}
+
 static void brief_fixnum(lispobj obj)
 {
+    /* KLUDGE: Rather than update the tables in print_obj(), we
+       declare all fixnum-or-unknown tags to be fixnums and sort it
+       out here with a guard clause. */
+    if (!fixnump(obj)) return print_unknown(obj);
+
 #ifndef LISP_FEATURE_ALPHA
     printf("%ld", ((long)obj)>>2);
 #else
@@ -112,6 +308,11 @@ static void brief_fixnum(lispobj obj)
 
 static void print_fixnum(lispobj obj)
 {
+    /* KLUDGE: Rather than update the tables in print_obj(), we
+       declare all fixnum-or-unknown tags to be fixnums and sort it
+       out here with a guard clause. */
+    if (!fixnump(obj)) return print_unknown(obj);
+
 #ifndef LISP_FEATURE_ALPHA
     printf(": %ld", ((long)obj)>>2);
 #else
@@ -220,13 +421,6 @@ static void brief_list(lispobj obj)
         putchar(')');
     }
 }
-
-#ifdef LISP_FEATURE_X86_64
-static void print_unknown(lispobj obj)
-{
-  printf("unknown object: %p", (void *)obj);
-}
-#endif
 
 static void print_list(lispobj obj)
 {
@@ -496,14 +690,11 @@ static void print_otherptr(lispobj obj)
             case SIMPLE_ARRAY_UNSIGNED_BYTE_8_WIDETAG:
             case SIMPLE_ARRAY_UNSIGNED_BYTE_15_WIDETAG:
             case SIMPLE_ARRAY_UNSIGNED_BYTE_16_WIDETAG:
-#ifdef SIMPLE_ARRAY_UNSIGNED_BYTE_29_WIDETAG
-            case SIMPLE_ARRAY_UNSIGNED_BYTE_29_WIDETAG:
-#endif
+
+            case SIMPLE_ARRAY_UNSIGNED_FIXNUM_WIDETAG:
+
             case SIMPLE_ARRAY_UNSIGNED_BYTE_31_WIDETAG:
             case SIMPLE_ARRAY_UNSIGNED_BYTE_32_WIDETAG:
-#ifdef SIMPLE_ARRAY_UNSIGNED_BYTE_60_WIDETAG
-            case SIMPLE_ARRAY_UNSIGNED_BYTE_60_WIDETAG:
-#endif
 #ifdef SIMPLE_ARRAY_UNSIGNED_BYTE_63_WIDETAG
             case SIMPLE_ARRAY_UNSIGNED_BYTE_63_WIDETAG:
 #endif
@@ -516,14 +707,11 @@ static void print_otherptr(lispobj obj)
 #ifdef SIMPLE_ARRAY_SIGNED_BYTE_16_WIDETAG
             case SIMPLE_ARRAY_SIGNED_BYTE_16_WIDETAG:
 #endif
-#ifdef SIMPLE_ARRAY_SIGNED_BYTE_30_WIDETAG
-            case SIMPLE_ARRAY_SIGNED_BYTE_30_WIDETAG:
-#endif
+
+            case SIMPLE_ARRAY_FIXNUM_WIDETAG:
+
 #ifdef SIMPLE_ARRAY_SIGNED_BYTE_32_WIDETAG
             case SIMPLE_ARRAY_SIGNED_BYTE_32_WIDETAG:
-#endif
-#ifdef SIMPLE_ARRAY_SIGNED_BYTE_61_WIDETAG
-            case SIMPLE_ARRAY_SIGNED_BYTE_61_WIDETAG:
 #endif
 #ifdef SIMPLE_ARRAY_SIGNED_BYTE_64_WIDETAG
             case SIMPLE_ARRAY_SIGNED_BYTE_64_WIDETAG:
@@ -611,15 +799,15 @@ static void print_obj(char *prefix, lispobj obj)
 {
 #ifdef LISP_FEATURE_X86_64
     static void (*verbose_fns[])(lispobj obj)
-        = {print_fixnum, print_struct, print_otherimm, print_unknown,
-           print_unknown, print_unknown, print_otherimm, print_list,
-           print_fixnum, print_otherptr, print_otherimm, print_unknown,
-           print_unknown, print_unknown, print_otherimm, print_otherptr};
+        = {print_fixnum, print_otherimm, print_fixnum, print_struct,
+           print_fixnum, print_otherimm, print_fixnum, print_list,
+           print_fixnum, print_otherimm, print_fixnum, print_otherptr,
+           print_fixnum, print_otherimm, print_fixnum, print_otherptr};
     static void (*brief_fns[])(lispobj obj)
-        = {brief_fixnum, brief_struct, brief_otherimm, print_unknown,
-           print_unknown,  print_unknown, brief_otherimm, brief_list,
-           brief_fixnum, brief_otherptr, brief_otherimm, print_unknown,
-           print_unknown,  print_unknown,brief_otherimm, brief_otherptr};
+        = {brief_fixnum, brief_otherimm, brief_fixnum, brief_struct,
+           brief_fixnum, brief_otherimm, brief_fixnum, brief_list,
+           brief_fixnum, brief_otherimm, brief_fixnum, brief_otherptr,
+           brief_fixnum, brief_otherimm, brief_fixnum, brief_otherptr};
 #else
     static void (*verbose_fns[])(lispobj obj)
         = {print_fixnum, print_struct, print_otherimm, print_list,
@@ -699,6 +887,7 @@ void brief_print(lispobj obj)
     cur_depth = 0;
     max_depth = 1;
     max_lines = 5000;
+    cur_lines = 0;
 
     print_obj("", obj);
     putchar('\n');

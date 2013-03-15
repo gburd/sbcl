@@ -22,7 +22,7 @@
          (output
           (with-output-to-string (s)
             (setf proc (run-program program arguments
-                                    :search (not (eql #\. (char program 0)))
+                                    :environment (test-util::test-env)
                                     :output s)))))
     (unless (zerop (process-exit-code proc))
       (error "Bad exit code: ~S~%Output:~% ~S"
@@ -32,50 +32,48 @@
 
 (defvar *required-alignment*
   #+(and ppc darwin) 16
-  #+(and ppc linux) 8
+  #+(and ppc (not darwin)) 8
   #+x86-64 16
   #+mips 8
   #+(and x86 (not darwin)) 4
   #+(and x86 darwin) 16
-  #-(or x86 x86-64 mips (and ppc (or darwin linux))) (error "Unknown platform"))
+  #-(or x86 x86-64 mips ppc) (error "Unknown platform"))
 
 ;;;; Build the offset-tool as regular excutable, and run it with
 ;;;; fork/exec, so that no lisp is on the stack. This is our known-good
 ;;;; number.
 
-(run "cc"
-     #+(and (or linux freebsd) (or x86-64 ppc mips)) "-fPIC"
-     #+(and x86-64 darwin) "-arch" #+(and x86-64 darwin) "x86_64"
-     "stack-alignment-offset.c" "-o" "stack-alignment-offset")
+#-win32
+(progn
+  (run "/bin/sh" "run-compiler.sh" "-sbcl-pic"
+       "stack-alignment-offset.c" "-o" "stack-alignment-offset")
 
-(defparameter *good-offset*
-  (parse-integer (run "./stack-alignment-offset"
-                      (princ-to-string *required-alignment*))))
+  (defparameter *good-offset*
+    (parse-integer (run "./stack-alignment-offset"
+                        (princ-to-string *required-alignment*))))
 
-;;;; Build the tool again, this time as a shared object, and load it
+  ;; Build the tool again, this time as a shared object, and load it
 
-(run "cc" "stack-alignment-offset.c"
-     #+(and (not darwin) (or x86-64 ppc mips)) "-fPIC"
-     #+(and x86-64 darwin) "-arch" #+(and x86-64 darwin) "x86_64"
-     #+darwin "-bundle" #-darwin "-shared"
-     "-o" "stack-alignment-offset.so")
+  (run "/bin/sh" "run-compiler.sh" "-sbcl-pic" "-sbcl-shared"
+       "stack-alignment-offset.c" "-o" "stack-alignment-offset.so")
 
-(load-shared-object (truename "stack-alignment-offset.so"))
+  (load-shared-object (truename "stack-alignment-offset.so"))
 
-(define-alien-routine stack-alignment-offset int (alignment int))
-(define-alien-routine trampoline int (callback (function int)))
+  (define-alien-routine stack-alignment-offset int (alignment int))
+  (define-alien-routine trampoline int (callback (function int))))
 
 ;;;; Now get the offset by calling from lisp, first with a regular foreign function
 ;;;; call, then with an intervening callback.
 
-(with-test (:name :regular)
+(with-test (:name :regular :fails-on :win32)
   (assert (= *good-offset* (stack-alignment-offset *required-alignment*))))
 
-(with-test (:name :callback)
+(with-test (:name :callback :fails-on :win32)
   (assert (= *good-offset* (trampoline (alien-lambda int ()
                                        (stack-alignment-offset *required-alignment*))))))
 
-(delete-file "stack-alignment-offset")
-(delete-file "stack-alignment-offset.so")
+(when (probe-file "stack-alignment-offset.so")
+  (delete-file "stack-alignment-offset")
+  (delete-file "stack-alignment-offset.so"))
 
 ;;;; success!

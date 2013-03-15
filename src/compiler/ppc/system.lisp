@@ -42,7 +42,7 @@
     (inst beq done)
     ;; Okay, it is an immediate.  If fixnum, we want zero.  Otherwise,
     ;; we want the low 8 bits.
-    (inst andi. result object #b11)
+    (inst andi. result object fixnum-tag-mask)
     (inst beq done)
     ;; It wasn't a fixnum, so get the low 8 bits.
     (inst andi. result object widetag-mask)
@@ -112,7 +112,7 @@
     (inst andi. t1 t1 widetag-mask)
     (sc-case data
       (any-reg
-       (inst slwi t2 data (- n-widetag-bits 2))
+       (inst slwi t2 data (- n-widetag-bits n-fixnum-tag-bits))
        (inst or t1 t1 t2))
       (immediate
        (inst ori t1 t1 (ash (tn-value data) n-widetag-bits)))
@@ -130,22 +130,6 @@
     ;; FIXME: It would be better if this would mask the lowtag,
     ;; and shift the result into a positive fixnum like on x86.
     (inst rlwinm res ptr n-fixnum-tag-bits 1 n-positive-fixnum-bits)))
-
-(define-vop (make-other-immediate-type)
-  (:args (val :scs (any-reg descriptor-reg))
-         (type :scs (any-reg descriptor-reg immediate)
-               :target temp))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:generator 2
-    (sc-case type
-      (immediate
-       (inst slwi temp val n-widetag-bits)
-       (inst ori res temp (tn-value type)))
-      (t
-       (inst srawi temp type 2)
-       (inst slwi res val (- n-widetag-bits 2))
-       (inst or res res temp)))))
 
 
 ;;;; Allocation
@@ -217,6 +201,29 @@
   (:generator 1
     (inst unimp pending-interrupt-trap)))
 
+#!+sb-safepoint
+(define-vop (insert-safepoint)
+  (:policy :fast-safe)
+  (:translate sb!kernel::gc-safepoint)
+  (:generator 0
+    (emit-safepoint)))
+
+#!+sb-thread
+(defknown current-thread-offset-sap ((unsigned-byte 64))
+  system-area-pointer (flushable))
+
+#!+sb-thread
+(define-vop (current-thread-offset-sap)
+  (:results (sap :scs (sap-reg)))
+  (:result-types system-area-pointer)
+  (:translate current-thread-offset-sap)
+  (:args (n :scs (unsigned-reg) :target sap))
+  (:arg-types unsigned-num)
+  (:policy :fast-safe)
+  (:generator 2
+    (inst slwi n n word-shift)
+    (inst lwzx sap thread-base-tn n)))
+
 (define-vop (halt)
   (:generator 1
     (inst unimp halt-trap)))
@@ -234,3 +241,44 @@
       (inst lwz count count-vector offset)
       (inst addi count count 1)
       (inst stw count count-vector offset))))
+
+;;;; Memory barrier support
+
+#!+memory-barrier-vops
+(define-vop (%compiler-barrier)
+  (:policy :fast-safe)
+  (:translate %compiler-barrier)
+  (:generator 3))
+
+#!+memory-barrier-vops
+(define-vop (%memory-barrier)
+  (:policy :fast-safe)
+  (:translate %memory-barrier)
+  (:generator 3
+     (inst sync)))
+
+#!+memory-barrier-vops
+(define-vop (%read-barrier)
+  (:policy :fast-safe)
+  (:translate %read-barrier)
+  (:generator 3
+     (inst sync)))
+
+#!+memory-barrier-vops
+(define-vop (%write-barrier)
+  (:policy :fast-safe)
+  (:translate %write-barrier)
+  (:generator 3
+    (inst sync)))
+
+#!+memory-barrier-vops
+(define-vop (%data-dependency-barrier)
+  (:policy :fast-safe)
+  (:translate %data-dependency-barrier)
+  (:generator 3))
+
+;;;; Dummy definition for a spin-loop hint VOP
+(define-vop (spin-loop-hint)
+  (:translate spin-loop-hint)
+  (:policy :fast-safe)
+  (:generator 0))

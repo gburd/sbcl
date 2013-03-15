@@ -106,7 +106,10 @@
   #!+sb-package-locks
   (%implementation-packages nil :type list)
   ;; Definition source location
-  (source-location nil :type (or null sb!c:definition-source-location)))
+  (source-location nil :type (or null sb!c:definition-source-location))
+  ;; Local package nicknames.
+  (%local-nicknames nil :type list)
+  (%locally-nicknamed-by nil :type list))
 
 ;;;; iteration macros
 
@@ -369,3 +372,8 @@ of :INHERITED :EXTERNAL :INTERNAL."
                                                         (t (,',init-macro :inherited)
                                                            (setf ,',counter nil)))))))))))))
                 ,@body))))))))
+
+(defmacro-mundanely with-package-graph ((&key) &body forms)
+  `(flet ((thunk () ,@forms))
+     (declare (dynamic-extent #'thunk))
+     (call-with-package-graph #'thunk)))

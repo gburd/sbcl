@@ -12,7 +12,7 @@
 ;;;; more information.
 
 (when (eq sb-ext:*evaluator-mode* :interpret)
-  (sb-ext:quit :unix-status 104))
+  (sb-ext:exit :code 104))
 
 (load "compiler-test-util.lisp")
 (use-package :ctu)
@@ -21,21 +21,32 @@
       sb-ext:*stack-allocate-dynamic-extent* t)
 
 (defmacro defun-with-dx (name arglist &body body)
-  `(defun ,name ,arglist
-     ,@body))
+  (let ((debug-name (sb-int:symbolicate name "-HIGH-DEBUG"))
+        (default-name (sb-int:symbolicate name "-DEFAULT")))
+    `(progn
+       (defun ,debug-name ,arglist
+         (declare (optimize debug))
+         ,@body)
+       (defun ,default-name ,arglist
+        ,@body)
+       (defun ,name (&rest args)
+         (apply #',debug-name args)
+         (apply #',default-name args)))))
 
 (declaim (notinline opaque-identity))
 (defun opaque-identity (x)
   x)
 
 ;;; &REST lists
+
 (defun-with-dx dxlength (&rest rest)
   (declare (dynamic-extent rest))
   (length rest))
 
-(assert (= (dxlength 1 2 3) 3))
-(assert (= (dxlength t t t t t t) 6))
-(assert (= (dxlength) 0))
+(with-test (:name (:dx-&rest :basics))
+  (assert (= (dxlength 1 2 3) 3))
+  (assert (= (dxlength t t t t t t) 6))
+  (assert (= (dxlength) 0)))
 
 (defun callee (list)
   (destructuring-bind (a b c d e f &rest g) list
@@ -44,15 +55,20 @@
 (defun-with-dx dxcaller (&rest rest)
   (declare (dynamic-extent rest))
   (callee rest))
-(assert (= (dxcaller 1 2 3 4 5 6 7) 22))
+
+(with-test (:name (:dx-&rest :pass-down-to-callee :tail-call))
+  (assert (= (dxcaller 1 2 3 4 5 6 7) 22)))
 
 (defun-with-dx dxcaller-align-1 (x &rest rest)
   (declare (dynamic-extent rest))
   (+ x (callee rest)))
-(assert (= (dxcaller-align-1 17 1 2 3 4 5 6 7) 39))
-(assert (= (dxcaller-align-1 17 1 2 3 4 5 6 7 8) 40))
+
+(with-test (:name (:dx-&rest :pass-down-to-callee :non-tail-call))
+  (assert (= (dxcaller-align-1 17 1 2 3 4 5 6 7) 39))
+  (assert (= (dxcaller-align-1 17 1 2 3 4 5 6 7 8) 40)))
 
 ;;; %NIP-VALUES
+
 (defun-with-dx test-nip-values ()
   (flet ((bar (x &rest y)
            (declare (dynamic-extent y))
@@ -63,16 +79,20 @@
       (bar 1 2 3 4 5 6)
       (bar -1 'a 'b))))
 
-(assert (equal (multiple-value-list (test-nip-values)) '(1 5 a)))
+(with-test (:name (:nip-values))
+  (assert (equal (multiple-value-list (test-nip-values)) '(1 5 a))))
 
 ;;; LET-variable substitution
+
 (defun-with-dx test-let-var-subst1 (x)
   (let ((y (list x (1- x))))
     (opaque-identity :foo)
     (let ((z (the list y)))
       (declare (dynamic-extent z))
       (length z))))
-(assert (eql (test-let-var-subst1 17) 2))
+
+(with-test (:name (:let-variable-substitution))
+  (assert (eql (test-let-var-subst1 17) 2)))
 
 (defun-with-dx test-let-var-subst2 (x)
   (let ((y (list x (1- x))))
@@ -80,16 +100,22 @@
     (opaque-identity :foo)
     (let ((z (the list y)))
       (length z))))
-(assert (eql (test-let-var-subst2 17) 2))
+
+(with-test (:name (:let-variable-substitution-2))
+  (assert (eql (test-let-var-subst2 17) 2)))
+
 
 ;;; DX propagation through LET-return.
+
 (defun-with-dx test-lvar-subst (x)
   (let ((y (list x (1- x))))
     (declare (dynamic-extent y))
     (second (let ((z (the list y)))
               (opaque-identity :foo)
               z))))
-(assert (eql (test-lvar-subst 11) 10))
+
+(with-test (:name (:dx-propagation-through-let-return))
+  (assert (eql (test-lvar-subst 11) 10)))
 
 ;;; this code is incorrect, but the compiler should not fail
 (defun-with-dx test-let-var-subst-incorrect (x)
@@ -101,17 +127,20 @@
       z)))
 
 ;;; alignment
+
 (defvar *x*)
 (defun-with-dx test-alignment-dx-list (form)
   (multiple-value-prog1 (eval form)
     (let ((l (list 1 2 3 4)))
       (declare (dynamic-extent l))
       (setq *x* (copy-list l)))))
-(dotimes (n 64)
-  (let* ((res (loop for i below n collect i))
-         (form `(values ,@res)))
-    (assert (equal (multiple-value-list (test-alignment-dx-list form)) res))
-    (assert (equal *x* '(1 2 3 4)))))
+
+(with-test (:name (:dx-list :alignment))
+  (dotimes (n 64)
+    (let* ((res (loop for i below n collect i))
+           (form `(values ,@res)))
+      (assert (equal (multiple-value-list (test-alignment-dx-list form)) res))
+      (assert (equal *x* '(1 2 3 4))))))
 
 ;;; closure
 
@@ -126,7 +155,8 @@
     (declare (dynamic-extent #'f))
     (true #'f)))
 
-(assert (eq t (dxclosure 13)))
+(with-test (:name (:dx-closure))
+  (assert (eq t (dxclosure 13))))
 
 ;;; value-cells
 
@@ -155,11 +185,13 @@
   (let ((v (make-array (min n 1))))
     (declare (sb-int:truly-dynamic-extent v))
     (true v)
+    (true v)
     nil))
 
 (defun-with-dx make-array-on-stack-1 ()
   (let ((v (make-array '(42) :element-type 'single-float)))
     (declare (dynamic-extent v))
+    (true v)
     (true v)
     nil))
 
@@ -167,6 +199,7 @@
   (declare (integer n))
   (let ((v (make-array n :initial-contents x)))
     (declare (sb-int:truly-dynamic-extent v))
+    (true v)
     (true v)
     nil))
 
@@ -176,17 +209,62 @@
                        :element-type t :initial-contents x)))
     (declare (sb-int:truly-dynamic-extent v))
     (true v)
+    (true v)
     nil))
 
 (defun-with-dx make-array-on-stack-4 ()
   (let ((v (make-array 3 :initial-contents '(1 2 3))))
     (declare (sb-int:truly-dynamic-extent v))
     (true v)
+    (true v)
     nil))
 
 (defun-with-dx make-array-on-stack-5 ()
   (let ((v (make-array 3 :initial-element 12 :element-type t)))
     (declare (sb-int:truly-dynamic-extent v))
+    (true v)
+    (true v)
+    nil))
+
+(defun-with-dx make-array-on-stack-6 ()
+  (let ((v (make-array 3 :initial-element 12 :element-type '(unsigned-byte 8))))
+    (declare (sb-int:truly-dynamic-extent v))
+    (true v)
+    (true v)
+    nil))
+
+(defun-with-dx make-array-on-stack-7 ()
+  (let ((v (make-array 3 :initial-element 12 :element-type '(signed-byte 8))))
+    (declare (sb-int:truly-dynamic-extent v))
+    (true v)
+    (true v)
+    nil))
+
+(defun-with-dx make-array-on-stack-8 ()
+  (let ((v (make-array 3 :initial-element 12 :element-type 'word)))
+    (declare (sb-int:truly-dynamic-extent v))
+    (true v)
+    (true v)
+    nil))
+
+(defun-with-dx make-array-on-stack-9 ()
+  (let ((v (make-array 3 :initial-element 12.0 :element-type 'single-float)))
+    (declare (sb-int:truly-dynamic-extent v))
+    (true v)
+    (true v)
+    nil))
+
+(defun-with-dx make-array-on-stack-10 ()
+  (let ((v (make-array 3 :initial-element 12.0d0 :element-type 'double-float)))
+    (declare (sb-int:truly-dynamic-extent v))
+    (true v)
+    (true v)
+    nil))
+
+(defun-with-dx make-array-on-stack-11 ()
+  (let ((v (make-array (the integer (opaque-identity 3)) :initial-element 12.0d0 :element-type 'double-float)))
+    (declare (sb-int:truly-dynamic-extent v))
+    (true v)
     (true v)
     nil))
 
@@ -227,10 +305,14 @@
     (assert (eql s (fp-struct-1-s fp)))
     (assert (eql d (fp-struct-1-d fp)))))
 
-(test-fp-struct-1.1 123.456 876.243d0)
-(test-fp-struct-1.2 123.456 876.243d0)
-(test-fp-struct-1.3 123.456 876.243d0)
-(test-fp-struct-1.4 123.456 876.243d0)
+(with-test (:name (:test-fp-struct-1.1))
+  (test-fp-struct-1.1 123.456 876.243d0))
+(with-test (:name (:test-fp-struct-1.2))
+  (test-fp-struct-1.2 123.456 876.243d0))
+(with-test (:name (:test-fp-struct-1.3))
+  (test-fp-struct-1.3 123.456 876.243d0))
+(with-test (:name (:test-fp-struct-1.4))
+  (test-fp-struct-1.4 123.456 876.243d0))
 
 (declaim (inline make-fp-struct-2))
 (defstruct fp-struct-2
@@ -261,10 +343,14 @@
     (assert (eql s (fp-struct-2-s fp)))
     (assert (eql d (fp-struct-2-d fp)))))
 
-(test-fp-struct-2.1 123.456 876.243d0)
-(test-fp-struct-2.2 123.456 876.243d0)
-(test-fp-struct-2.3 123.456 876.243d0)
-(test-fp-struct-2.4 123.456 876.243d0)
+(with-test (:name (:test-fp-struct-2.1))
+  (test-fp-struct-2.1 123.456 876.243d0))
+(with-test (:name (:test-fp-struct-2.2))
+  (test-fp-struct-2.2 123.456 876.243d0))
+(with-test (:name (:test-fp-struct-2.3))
+  (test-fp-struct-2.3 123.456 876.243d0))
+(with-test (:name (:test-fp-struct-2.4))
+  (test-fp-struct-2.4 123.456 876.243d0))
 
 (declaim (inline make-cfp-struct-1))
 (defstruct cfp-struct-1
@@ -295,10 +381,14 @@
     (assert (eql s (cfp-struct-1-s cfp)))
     (assert (eql d (cfp-struct-1-d cfp)))))
 
-(test-cfp-struct-1.1 (complex 0.123 123.456) (complex 908132.41d0 876.243d0))
-(test-cfp-struct-1.2 (complex 0.123 123.456) (complex 908132.41d0 876.243d0))
-(test-cfp-struct-1.3 (complex 0.123 123.456) (complex 908132.41d0 876.243d0))
-(test-cfp-struct-1.4 (complex 0.123 123.456) (complex 908132.41d0 876.243d0))
+(with-test (:name (:test-cfp-struct-1.1))
+  (test-cfp-struct-1.1 (complex 0.123 123.456) (complex 908132.41d0 876.243d0)))
+(with-test (:name (:test-cfp-struct-1.2))
+  (test-cfp-struct-1.2 (complex 0.123 123.456) (complex 908132.41d0 876.243d0)))
+(with-test (:name (:test-cfp-struct-1.3))
+  (test-cfp-struct-1.3 (complex 0.123 123.456) (complex 908132.41d0 876.243d0)))
+(with-test (:name (:test-cfp-struct-1.4))
+  (test-cfp-struct-1.4 (complex 0.123 123.456) (complex 908132.41d0 876.243d0)))
 
 (declaim (inline make-cfp-struct-2))
 (defstruct cfp-struct-2
@@ -329,10 +419,14 @@
     (assert (eql s (cfp-struct-2-s cfp)))
     (assert (eql d (cfp-struct-2-d cfp)))))
 
-(test-cfp-struct-2.1 (complex 0.123 123.456) (complex 908132.41d0 876.243d0))
-(test-cfp-struct-2.2 (complex 0.123 123.456) (complex 908132.41d0 876.243d0))
-(test-cfp-struct-2.3 (complex 0.123 123.456) (complex 908132.41d0 876.243d0))
-(test-cfp-struct-2.4 (complex 0.123 123.456) (complex 908132.41d0 876.243d0))
+(with-test (:name (:test-cfp-struct-2.1))
+  (test-cfp-struct-2.1 (complex 0.123 123.456) (complex 908132.41d0 876.243d0)))
+(with-test (:name (:test-cfp-struct-2.2))
+  (test-cfp-struct-2.2 (complex 0.123 123.456) (complex 908132.41d0 876.243d0)))
+(with-test (:name (:test-cfp-struct-2.3))
+  (test-cfp-struct-2.3 (complex 0.123 123.456) (complex 908132.41d0 876.243d0)))
+(with-test (:name (:test-cfp-struct-2.4))
+  (test-cfp-struct-2.4 (complex 0.123 123.456) (complex 908132.41d0 876.243d0)))
 
 (declaim (inline make-foo1 make-foo2 make-foo3))
 (defstruct foo1 x)
@@ -349,19 +443,13 @@
   b
   c)
 
-(defmacro assert-eql (expected got)
-  `(let ((exp ,expected)
-         (got ,got))
-     (unless (eql exp got)
-       (error "Expected ~S, got ~S!" exp got))))
-
 (defun-with-dx make-foo2-on-stack (x y)
   (let ((foo (make-foo2 :y y :c 'c)))
     (declare (dynamic-extent foo))
-    (assert-eql 0.0 (foo2-x foo))
-    (assert-eql y (foo2-y foo))
-    (assert-eql 'c (foo2-c foo))
-    (assert-eql nil (foo2-b foo))))
+    (assert (eql 0.0 (foo2-x foo)))
+    (assert (eql y (foo2-y foo)))
+    (assert (eql 'c (foo2-c foo)))
+    (assert (eql nil (foo2-b foo)))))
 
 ;;; Check that constants work out as argument for all relevant
 ;;; slot types.
@@ -371,6 +459,7 @@
   (c 2 :type sb-vm:word)
   (d 3.0 :type single-float)
   (e 4.0d0 :type double-float))
+
 (defun-with-dx make-foo3-on-stack ()
   (let ((foo (make-foo3)))
     (declare (dynamic-extent foo))
@@ -450,31 +539,76 @@
 
 (defun dx-handler-bind (x)
   (handler-bind ((error
-                  (lambda (c) (break "OOPS: ~S caused ~S" x c)))
+                  #'(lambda (c)
+                      (break "OOPS: ~S caused ~S" x c)))
                  ((and serious-condition (not error))
-                  #'(lambda (c) (break "OOPS2: ~S did ~S" x c))))
+                  #'(lambda (c)
+                      (break "OOPS2: ~S did ~S" x c))))
     (/ 2 x)))
 
 (defun dx-handler-case (x)
   (assert (zerop (handler-case (/ 2 x)
                    (error (c)
-                     (break "OOPS: ~S caused ~S" x c))
+                     (break "OOPS: ~S caused ~S" x c)
+                     -1)
                    (:no-error (res)
                      (1- res))))))
 
-;;; with-spinlock and with-mutex should use DX and not cons
+(defvar *a-cons* (cons nil nil))
 
-(defvar *slock* (sb-thread::make-spinlock :name "slocklock"))
+(with-test (:name (:no-consing :dx-closures) :skipped-on '(not :stack-allocatable-closures))
+  (assert-no-consing (dxclosure 42)))
 
-(defun test-spinlock ()
-  (sb-thread::with-spinlock (*slock*)
-    (true *slock*)))
+(with-test (:name (:no-consing :dx-lists) :skipped-on '(not :stack-allocatable-lists))
+  (assert-no-consing (dxlength 1 2 3))
+  (assert-no-consing (dxlength t t t t t t))
+  (assert-no-consing (dxlength))
+  (assert-no-consing (dxcaller 1 2 3 4 5 6 7))
+  (assert-no-consing (test-nip-values))
+  (assert-no-consing (test-let-var-subst2 17))
+  (assert-no-consing (test-lvar-subst 11))
+  (assert-no-consing (nested-dx-lists))
+  (assert-consing (nested-dx-not-used *a-cons*))
+  (assert-no-consing (nested-evil-dx-used *a-cons*))
+  (assert-no-consing (multiple-dx-uses)))
 
-(defvar *mutex* (sb-thread::make-mutex :name "mutexlock"))
+(with-test (:name (:no-consing :dx-value-cell))
+  (assert-no-consing (dx-value-cell 13)))
 
-(defun test-mutex ()
-  (sb-thread:with-mutex (*mutex*)
-    (true *mutex*)))
+(with-test (:name (:no-consing :dx-fixed-objects) :skipped-on '(not :stack-allocatable-fixed-objects))
+  (assert-no-consing (cons-on-stack 42))
+  (assert-no-consing (make-foo1-on-stack 123))
+  (assert-no-consing (nested-good 42))
+  (assert-no-consing (nested-dx-conses))
+  (assert-no-consing (dx-handler-bind 2))
+  (assert-no-consing (dx-handler-case 2)))
+
+(with-test (:name (:no-consing :dx-vectors) :skipped-on '(not :stack-allocatable-vectors))
+  (assert-no-consing (force-make-array-on-stack 128))
+  (assert-no-consing (make-array-on-stack-1))
+  (assert-no-consing (make-array-on-stack-2 5 '(1 2.0 3 4.0 5)))
+  (assert-no-consing (make-array-on-stack-3 9 8 7))
+  (assert-no-consing (make-array-on-stack-4))
+  (assert-no-consing (make-array-on-stack-5))
+  (assert-no-consing (vector-on-stack :x :y)))
+
+(with-test (:name (:no-consing :specialized-dx-vectors)
+            :fails-on :x86
+            :skipped-on `(not (and :stack-allocatable-vectors
+                                   :c-stack-is-control-stack)))
+  (assert-no-consing (make-array-on-stack-6))
+  (assert-no-consing (make-array-on-stack-7))
+  (assert-no-consing (make-array-on-stack-8))
+  (assert-no-consing (make-array-on-stack-9))
+  (assert-no-consing (make-array-on-stack-10))
+  (assert-no-consing (make-array-on-stack-11)))
+
+(with-test (:name (:no-consing :dx-raw-instances) :skipped-on '(or (not :raw-instance-init-vops)
+                                                                   (not (and :gencgc :c-stack-is-control-stack))))
+  (let (a b)
+    (setf a 1.24 b 1.23d0)
+    (assert-no-consing (make-foo2-on-stack a b)))
+    (assert-no-consing (make-foo3-on-stack)))
 
 ;;; not really DX, but GETHASH and (SETF GETHASH) should not cons
 
@@ -483,76 +617,50 @@
 (defun test-hash-table ()
   (setf (gethash 5 *table*) 13)
   (gethash 5 *table*))
-
-(defvar *a-cons* (cons nil nil))
 
-(progn
-  #+stack-allocatable-closures
-  (assert-no-consing (dxclosure 42))
-  #+stack-allocatable-lists
-  (progn
-    (assert-no-consing (dxlength 1 2 3))
-    (assert-no-consing (dxlength t t t t t t))
-    (assert-no-consing (dxlength))
-    (assert-no-consing (dxcaller 1 2 3 4 5 6 7))
-    (assert-no-consing (test-nip-values))
-    (assert-no-consing (test-let-var-subst2 17))
-    (assert-no-consing (test-lvar-subst 11))
-    (assert-no-consing (nested-dx-lists))
-    (assert-consing (nested-dx-not-used *a-cons*))
-    (assert-no-consing (nested-evil-dx-used *a-cons*))
-    (assert-no-consing (multiple-dx-uses)))
-  (assert-no-consing (dx-value-cell 13))
-  #+stack-allocatable-fixed-objects
-  (progn
-    (assert-no-consing (cons-on-stack 42))
-    (assert-no-consing (make-foo1-on-stack 123))
-    (assert-no-consing (nested-good 42))
-    (assert-no-consing (nested-dx-conses))
-    (assert-no-consing (dx-handler-bind 2))
-    (assert-no-consing (dx-handler-case 2)))
-  #+stack-allocatable-vectors
-  (progn
-    (assert-no-consing (force-make-array-on-stack 128))
-    (assert-no-consing (make-array-on-stack-1))
-    (assert-no-consing (make-array-on-stack-2 5 '(1 2.0 3 4.0 5)))
-    (assert-no-consing (make-array-on-stack-3 9 8 7))
-    (assert-no-consing (make-array-on-stack-4))
-    (assert-no-consing (make-array-on-stack-5))
-    (assert-no-consing (vector-on-stack :x :y)))
-  (let (a b)
-    (setf a 1.24 b 1.23d0)
-    (#+raw-instance-init-vops assert-no-consing
-     #-raw-instance-init-vops progn
-     (make-foo2-on-stack a b)))
-  (#+raw-instance-init-vops assert-no-consing
-   #-raw-instance-init-vops progn
-   (make-foo3-on-stack))
-  ;; Not strictly DX..
-  (assert-no-consing (test-hash-table))
-  #+sb-thread
-  (progn
-    (assert-no-consing (test-spinlock))
-    (assert-no-consing (test-mutex))))
+;; This fails on threaded PPC because the hash-table implementation
+;; uses recursive system locks, which cons (see below for test
+;; (:no-consing :lock), which also fails on threaded PPC).
+;;
+;; -- That may have been the situation in 2010 when the above comment
+;; was written, but AFAICT now, hash tables use WITH-PINNED-OBJECTS,
+;; which conses on PPC and SPARC when GENCGC is enabled.  So neither is
+;; this actually about threading, nor about PPC.  Yet since we are
+;; failing most of this file on SPARC anyway (for some tests even on
+;; cheneygc), I won't bother to mark this particular test as failing.
+;; It would be nice if someone could go through this file and figure it
+;; all out... --DFL
+(with-test (:name (:no-consing :hash-tables) :fails-on '(and :ppc :sb-thread))
+  (assert-no-consing (test-hash-table)))
 
+;;; with-mutex should use DX and not cons
+
+(defvar *mutex* (sb-thread::make-mutex :name "mutexlock"))
+
+(defun test-mutex ()
+  (sb-thread:with-mutex (*mutex*)
+    (true *mutex*)))
+
+(with-test (:name (:no-consing :mutex) :fails-on :ppc :skipped-on '(not :sb-thread))
+  (assert-no-consing (test-mutex)))
 
+
 ;;; Bugs found by Paul F. Dietz
-(assert
- (eq
-  (funcall
-   (compile
-    nil
-    '(lambda (a b)
-      (declare (optimize (speed 2) (space 0) (safety 0)
-                (debug 1) (compilation-speed 3)))
-      (let* ((v5 (cons b b)))
-        (declare (dynamic-extent v5))
-        a)))
-   'x 'y)
-  'x))
 
-
-;;; other bugs
+(with-test (:name (:dx-bug-misc :pfdietz))
+  (assert
+   (eq
+    (funcall
+     (compile
+      nil
+      '(lambda (a b)
+        (declare (optimize (speed 2) (space 0) (safety 0)
+                  (debug 1) (compilation-speed 3)))
+        (let* ((v5 (cons b b)))
+          (declare (dynamic-extent v5))
+          a)))
+     'x 'y)
+    'x)))
 
 ;;; bug reported by Svein Ove Aas
 (defun svein-2005-ii-07 (x y)
@@ -560,13 +668,15 @@
   (let ((args (list* y 1 2 x)))
     (declare (dynamic-extent args))
     (apply #'aref args)))
-(assert (eql
-         (svein-2005-ii-07
-          '(0)
-          #3A(((1 1 1) (1 1 1) (1 1 1))
-              ((1 1 1) (1 1 1) (4 1 1))
-              ((1 1 1) (1 1 1) (1 1 1))))
-         4))
+
+(with-test (:name (:dx-bugs-misc :svein-2005-ii-07))
+  (assert (eql
+           (svein-2005-ii-07
+            '(0)
+            #3A(((1 1 1) (1 1 1) (1 1 1))
+                ((1 1 1) (1 1 1) (4 1 1))
+                ((1 1 1) (1 1 1) (1 1 1))))
+           4)))
 
 ;;; bug reported by Brian Downing: stack-allocated arrays were not
 ;;; filled with zeroes.
@@ -574,13 +684,14 @@
   (let ((a (make-array 11 :initial-element 0)))
     (declare (dynamic-extent a))
     (assert (every (lambda (x) (eql x 0)) a))))
-(with-test (:name :bdowning-2005-iv-16)
+
+(with-test (:name (:dx-bug-misc :bdowning-2005-iv-16))
   #+(or hppa mips x86 x86-64)
   (assert-no-consing (bdowning-2005-iv-16))
   (bdowning-2005-iv-16))
 
 (declaim (inline my-nconc))
-(defun-with-dx my-nconc (&rest lists)
+(defun my-nconc (&rest lists)
   (declare (dynamic-extent lists))
   (apply #'nconc lists))
 (defun-with-dx my-nconc-caller (a b c)
@@ -617,7 +728,9 @@
                (incf x z)))
         (declare (dynamic-extent #'mget #'mset))
         ((lambda (f g) (eval `(progn ,f ,g (values 4 5 6)))) #'mget #'mset)))))
-(assert (equal (bug419 42) '(1 2 3 4 5 6)))
+
+(with-test (:name (:dx-bug-misc :bug419))
+  (assert (equal (bug419 42) '(1 2 3 4 5 6))))
 
 ;;; Multiple DX arguments in a local function call
 (defun test-dx-flet-test (fun n f1 f2 f3)
@@ -631,6 +744,7 @@
   #+(or hppa mips x86 x86-64)
   (assert-no-consing (assert (eql n (funcall fun nil))))
   (assert (eql n (funcall fun nil))))
+
 (macrolet ((def (n f1 f2 f3)
              (let ((name (sb-pcl::format-symbol :cl-user "DX-FLET-TEST.~A" n)))
                `(progn
@@ -645,12 +759,14 @@
                       (f ,f2)
                       (f ,f3)
                       ,n))
-                  (test-dx-flet-test #',name ,n ,f1 ,f2 ,f3)))))
+                  (with-test (:name (:dx-flet-test ,n))
+                    (test-dx-flet-test #',name ,n ,f1 ,f2 ,f3))))))
   (def 0 (list :one) (list :two) (list :three))
   (def 1 (make-array 128) (list 1 2 3 4 5 6 7 8) (list 'list))
   (def 2 (list 1) (list 2 3) (list 4 5 6 7)))
 
-;;; Test that unknown-values coming after a DX value won't mess up the stack analysis
+;;; Test that unknown-values coming after a DX value won't mess up the
+;;; stack analysis
 (defun test-update-uvl-live-sets (x y z)
  (declare (optimize speed (safety 0)))
  (flet ((bar (a b)
@@ -665,7 +781,10 @@
                )                            ; uv pop
                14)
          ))))
-(assert (equal '((0 4) (3 ((1 2 3 5) 14))) (test-update-uvl-live-sets #() 4 5)))
+
+(with-test (:name (:update-uvl-live-sets))
+  (assert (equal '((0 4) (3 ((1 2 3 5) 14)))
+                 (test-update-uvl-live-sets #() 4 5))))
 
 (with-test (:name :regression-1.0.23.38)
   (compile nil '(lambda ()
@@ -701,8 +820,10 @@
 (with-test (:name :length-and-words-packed-in-same-tn)
   (assert (= 1 (length-and-words-packed-in-same-tn -3))))
 
-(with-test (:name :handler-case-bogus-compiler-note)
-  (handler-bind ((compiler-note #'error))
+(with-test (:name :handler-case-bogus-compiler-note :fails-on :ppc)
+  (handler-bind
+      ((compiler-note (lambda (note)
+                        (error "compiler issued note ~S during test" note))))
     ;; Taken from SWANK, used to signal a bogus stack allocation
     ;; failure note.
     (compile nil
@@ -732,11 +853,11 @@
     v))
 (defun barvector (x y z)
   (make-array 3 :initial-contents (list x y z)))
-(with-test (:name :dx-compiler-notes)
+(with-test (:name :dx-compiler-notes :fails-on :ppc)
   (flet ((assert-notes (j lambda)
            (let ((n 0))
              (handler-bind ((compiler-note (lambda (c)
-                                             (declare (ignore cc))
+                                             (declare (ignore c))
                                              (incf n))))
                (compile nil lambda)
                (unless (= j n)
@@ -773,7 +894,9 @@
                          nil)))
     (assert-notes 0 `(lambda (list)
                        (declare (optimize (space 0)))
-                       (sort list #'<)))
+                       (sort list (lambda (x y) ; shut unrelated notes up
+                                    (< (truly-the fixnum x)
+                                       (truly-the fixnum y))))))
     (assert-notes 0 `(lambda (other)
                        #'(lambda (s c n)
                            (ignore-errors (funcall other s c n)))))))
@@ -789,7 +912,7 @@
       (if sp
           (assert (= sp (sb-c::%primitive sb-c:current-stack-pointer)))
           (setf sp (sb-c::%primitive sb-c:current-stack-pointer))))))
-(with-test (:name :handler-case-eating-stack)
+(with-test (:name :handler-case-eating-stack :fails-on :ppc)
   (assert-no-consing (handler-case-eating-stack)))
 
 ;;; A nasty bug where RECHECK-DYNAMIC-EXTENT-LVARS thought something was going
@@ -807,10 +930,179 @@
     (let ((vec (vec (aref vec 0) (aref vec 1) (aref vec 2))))
       (declare (dynamic-extent vec))
       (funcall fun vec))))
-(with-test (:name :recheck-nested-dx-bug)
+(with-test (:name :recheck-nested-dx-bug :fails-on :ppc)
   (assert (funcall (bad-boy (vec 1.0 2.0 3.3))
                    (lambda (vec) (equalp vec (vec 1.0 2.0 3.3)))))
   (flet ((foo (x) (declare (ignore x))))
     (let ((bad-boy (bad-boy (vec 2.0 3.0 4.0))))
       (assert-no-consing (funcall bad-boy #'foo)))))
+
+(with-test (:name :bug-497321)
+  (flet ((test (lambda type)
+           (let ((n 0))
+             (handler-bind ((condition (lambda (c)
+                                         (incf n)
+                                         (unless (typep c type)
+                                           (error "wanted ~S for~%  ~S~%got ~S"
+                                                  type lambda (type-of c))))))
+               (compile nil lambda))
+             (assert (= n 1)))))
+    (test `(lambda () (declare (dynamic-extent #'bar)))
+          'style-warning)
+    (test `(lambda () (declare (dynamic-extent bar)))
+          'style-warning)
+    (test `(lambda (bar) (cons bar (lambda () (declare (dynamic-extent bar)))))
+          'sb-ext:compiler-note)
+    (test `(lambda ()
+             (flet ((bar () t))
+               (cons #'bar (lambda () (declare (dynamic-extent #'bar))))))
+          'sb-ext:compiler-note)))
+
+(with-test (:name :bug-586105 :fails-on '(not (and :stack-allocatable-vectors
+                                                   :stack-allocatable-lists)))
+  (flet ((test (x)
+           (let ((vec (make-array 1 :initial-contents (list (list x)))))
+             (declare (dynamic-extent vec))
+             (assert (eql x (car (aref vec 0)))))))
+    (assert-no-consing (test 42))))
 
+(defun bug-681092 ()
+  (declare (optimize speed))
+  (let ((c 0))
+    (flet ((bar () c))
+      (declare (dynamic-extent #'bar))
+      (do () ((list) (bar))
+        (setf c 10)
+        (return (bar))))))
+(with-test (:name :bug-681092)
+  (assert (= 10 (bug-681092))))
+
+;;;; &REST lists should stop DX propagation -- not required by ANSI,
+;;;; but required by sanity.
+
+(declaim (inline rest-stops-dx))
+(defun-with-dx rest-stops-dx (&rest args)
+  (declare (dynamic-extent args))
+  (apply #'opaque-identity args))
+
+(defun-with-dx rest-stops-dx-ok ()
+  (equal '(:foo) (rest-stops-dx (list :foo))))
+
+(with-test (:name :rest-stops-dynamic-extent)
+  (assert (rest-stops-dx-ok)))
+
+;;;; These tests aren't strictly speaking DX, but rather &REST -> &MORE
+;;;; conversion.
+(with-test (:name :rest-to-more-conversion)
+  (let ((f1 (compile nil `(lambda (f &rest args)
+                            (apply f args)))))
+    (assert-no-consing (assert (eql f1 (funcall f1 #'identity f1)))))
+  (let ((f2 (compile nil `(lambda (f1 f2 &rest args)
+                            (values (apply f1 args) (apply f2 args))))))
+    (assert-no-consing (multiple-value-bind (a b)
+                           (funcall f2 (lambda (x y z) (+ x y z)) (lambda (x y z) (- x y z))
+                                    1 2 3)
+                         (assert (and (eql 6 a) (eql -4 b))))))
+  (let ((f3 (compile nil `(lambda (f &optional x &rest args)
+                            (when x
+                              (apply f x args))))))
+    (assert-no-consing (assert (eql 42 (funcall f3
+                                                (lambda (a b c) (+ a b c))
+                                                11
+                                                10
+                                                21)))))
+  (let ((f4 (compile nil `(lambda (f &optional x &rest args &key y &allow-other-keys)
+                            (apply f y x args)))))
+    (assert-no-consing (funcall f4 (lambda (y x yk y2 b c)
+                                     (assert (eq y 'y))
+                                     (assert (= x 2))
+                                     (assert (eq :y yk))
+                                     (assert (eq y2 'y))
+                                     (assert (eq b 'b))
+                                     (assert (eq c 'c)))
+                                2 :y 'y 'b 'c)))
+  (let ((f5 (compile nil `(lambda (a b c &rest args)
+                            (apply #'list* a b c args)))))
+    (assert (equal '(1 2 3 4 5 6 7) (funcall f5 1 2 3 4 5 6 '(7)))))
+  (let ((f6 (compile nil `(lambda (x y)
+                            (declare (optimize speed))
+                            (concatenate 'string x y)))))
+    (assert (equal "foobar" (funcall f6 "foo" "bar"))))
+  (let ((f7 (compile nil `(lambda (&rest args)
+                            (lambda (f)
+                              (apply f args))))))
+    (assert (equal '(a b c d e f) (funcall (funcall f7 'a 'b 'c 'd 'e 'f) 'list))))
+  (let ((f8 (compile nil `(lambda (&rest args)
+                            (flet ((foo (f)
+                                     (apply f args)))
+                              #'foo)))))
+    (assert (equal '(a b c d e f) (funcall (funcall f8 'a 'b 'c 'd 'e 'f) 'list))))
+  (let ((f9 (compile nil `(lambda (f &rest args)
+                            (flet ((foo (g)
+                                     (apply g args)))
+                              (declare (dynamic-extent #'foo))
+                              (funcall f #'foo))))))
+    (assert (equal '(a b c d e f)
+                   (funcall f9 (lambda (f) (funcall f 'list)) 'a 'b 'c 'd 'e 'f))))
+  (let ((f10 (compile nil `(lambda (f &rest args)
+                            (flet ((foo (g)
+                                     (apply g args)))
+                              (funcall f #'foo))))))
+    (assert (equal '(a b c d e f)
+                   (funcall f10 (lambda (f) (funcall f 'list)) 'a 'b 'c 'd 'e 'f))))
+  (let ((f11 (compile nil `(lambda (x y z)
+                             (block out
+                               (labels ((foo (x &rest rest)
+                                          (apply (lambda (&rest rest2)
+                                                   (return-from out (values-list rest2)))
+                                                 x rest)))
+                                (if x
+                                    (foo x y z)
+                                    (foo y z x))))))))
+    (multiple-value-bind (a b c) (funcall f11 1 2 3)
+      (assert (eql a 1))
+      (assert (eql b 2))
+      (assert (eql c 3)))))
+
+(defun opaque-funcall (function &rest arguments)
+  (apply function arguments))
+
+(with-test (:name :implicit-value-cells)
+  (flet ((test-it (type input output)
+           (let ((f (compile nil `(lambda (x)
+                                    (declare (type ,type x))
+                                    (flet ((inc ()
+                                             (incf x)))
+                                      (declare (dynamic-extent #'inc))
+                                      (list (opaque-funcall #'inc) x))))))
+             (assert (equal (funcall f input)
+                            (list output output))))))
+    (let ((width sb-vm:n-word-bits))
+      (test-it t (1- most-positive-fixnum) most-positive-fixnum)
+      (test-it `(unsigned-byte ,(1- width)) (ash 1 (- width 2)) (1+ (ash 1 (- width 2))))
+      (test-it `(signed-byte ,width) (ash -1 (- width 2)) (1+ (ash -1 (- width 2))))
+      (test-it `(unsigned-byte ,width) (ash 1 (1- width)) (1+ (ash 1 (1- width))))
+      (test-it 'single-float 3f0 4f0)
+      (test-it 'double-float 3d0 4d0)
+      (test-it '(complex single-float) #c(3f0 4f0) #c(4f0 4f0))
+      (test-it '(complex double-float) #c(3d0 4d0) #c(4d0 4d0)))))
+
+(with-test (:name :sap-implicit-value-cells)
+  (let ((f (compile nil `(lambda (x)
+                           (declare (type system-area-pointer x))
+                           (flet ((inc ()
+                                    (setf x (sb-sys:sap+ x 16))))
+                             (declare (dynamic-extent #'inc))
+                             (list (opaque-funcall #'inc) x)))))
+        (width sb-vm:n-machine-word-bits))
+    (assert (every (lambda (x)
+                     (sb-sys:sap= x (sb-sys:int-sap (+ 16 (ash 1 (1- width))))))
+                   (funcall f (sb-sys:int-sap (ash 1 (1- width))))))))
+
+(with-test (:name :&more-bounds)
+  ;; lp#1154946
+  (assert (not (funcall (compile nil '(lambda (&rest args) (car args))))))
+  (assert (not (funcall (compile nil '(lambda (&rest args) (nth 6 args))))))
+  (assert (not (funcall (compile nil '(lambda (&rest args) (elt args 10))))))
+  (assert (not (funcall (compile nil '(lambda (&rest args) (cadr args))))))
+  (assert (not (funcall (compile nil '(lambda (&rest args) (third args)))))))

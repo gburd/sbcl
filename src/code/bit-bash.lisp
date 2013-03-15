@@ -13,7 +13,8 @@
 
 ;;;; types
 
-(deftype bit-offset () '(integer 0 (#.sb!vm:n-word-bits)))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (deftype bit-offset () '(integer 0 (#.sb!vm:n-word-bits))))
 
 ;;;; support routines
 
@@ -39,32 +40,34 @@
 ;;; at the "end" and removing bits from the "start". On big-endian
 ;;; machines this is a left-shift and on little-endian machines this
 ;;; is a right-shift.
-(defun shift-towards-start (number countoid)
-  (declare (type sb!vm:word number) (fixnum countoid))
-  (let ((count (ldb (byte (1- (integer-length sb!vm:n-word-bits)) 0) countoid)))
-    (declare (type bit-offset count))
-    (if (zerop count)
-        number
-        (ecase sb!c:*backend-byte-order*
-          (:big-endian
-           (ash (ldb (byte (- sb!vm:n-word-bits count) 0) number) count))
-          (:little-endian
-           (ash number (- count)))))))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun shift-towards-start (number countoid)
+    (declare (type sb!vm:word number) (fixnum countoid))
+    (let ((count (ldb (byte (1- (integer-length sb!vm:n-word-bits)) 0) countoid)))
+      (declare (type bit-offset count))
+      (if (zerop count)
+          number
+          (ecase sb!c:*backend-byte-order*
+            (:big-endian
+               (ash (ldb (byte (- sb!vm:n-word-bits count) 0) number) count))
+            (:little-endian
+               (ash number (- count))))))))
 
 ;;; Shift NUMBER by COUNT bits, adding zero bits at the "start" and
 ;;; removing bits from the "end". On big-endian machines this is a
 ;;; right-shift and on little-endian machines this is a left-shift.
-(defun shift-towards-end (number count)
-  (declare (type sb!vm:word number) (fixnum count))
-  (let ((count (ldb (byte (1- (integer-length sb!vm:n-word-bits)) 0) count)))
-    (declare (type bit-offset count))
-    (if (zerop count)
-        number
-        (ecase sb!c:*backend-byte-order*
-          (:big-endian
-           (ash number (- count)))
-          (:little-endian
-           (ash (ldb (byte (- sb!vm:n-word-bits count) 0) number) count))))))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun shift-towards-end (number count)
+    (declare (type sb!vm:word number) (fixnum count))
+    (let ((count (ldb (byte (1- (integer-length sb!vm:n-word-bits)) 0) count)))
+      (declare (type bit-offset count))
+      (if (zerop count)
+          number
+          (ecase sb!c:*backend-byte-order*
+            (:big-endian
+               (ash number (- count)))
+            (:little-endian
+               (ash (ldb (byte (- sb!vm:n-word-bits count) 0) number) count)))))))
 
 #!-sb-fluid (declaim (inline start-mask end-mask))
 
@@ -90,14 +93,14 @@
            (type index offset)
            (values sb!vm:word)
            (optimize (speed 3) (safety 0) #-sb-xc-host (inhibit-warnings 3)))
-  (sap-ref-word sap (the index (ash offset sb!vm:n-fixnum-tag-bits))))
+  (sap-ref-word sap (the index (ash offset sb!vm:word-shift))))
 (defun %set-word-sap-ref (sap offset value)
   (declare (type system-area-pointer sap)
            (type index offset)
            (type sb!vm:word value)
            (values sb!vm:word)
            (optimize (speed 3) (safety 0) (inhibit-warnings 3)))
-  (setf (sap-ref-word sap (the index (ash offset sb!vm:n-fixnum-tag-bits)))
+  (setf (sap-ref-word sap (the index (ash offset sb!vm:word-shift)))
         value))
 
 
@@ -117,15 +120,21 @@
         (declare (type system-area-pointer sap)
                  (type index offset)
                  (values system-area-pointer index))
-        (let ((address (sap-int sap)))
-          (values (int-sap #!-alpha (word-logical-andc2 address
-                                                        sb!vm:fixnum-tag-mask)
-                           #!+alpha (ash (ash address -2) 2))
+        (let ((address (sap-int sap))
+              (word-mask (1- (ash 1 word-shift))))
+          (values (int-sap #!-alpha (word-logical-andc2 address word-mask)
+                           ;; KLUDGE: WORD-LOGICAL-ANDC2 is defined in
+                           ;; terms of n-word-bits.  On all systems
+                           ;; where n-word-bits is not equal to
+                           ;; n-machine-word-bits we have to do this
+                           ;; another way.  At this time, these
+                           ;; systems are alphas, though there was
+                           ;; some talk about an x86-64 build option.
+                           #!+alpha (ash (ash address (- word-shift)) word-shift))
                   (+ ,(ecase bitsize
-                       (1 '(* (logand address sb!vm:fixnum-tag-mask) n-byte-bits))
-                       (2 '(* (logand address sb!vm:fixnum-tag-mask) (/ n-byte-bits 2)))
-                       (4 '(* (logand address sb!vm:fixnum-tag-mask) (/ n-byte-bits 4)))
-                       ((8 16 32 64) '(logand address sb!vm:fixnum-tag-mask)))
+                       ((1 2 4) `(* (logand address word-mask)
+                                    (/ n-byte-bits ,bitsize)))
+                       ((8 16 32 64) '(logand address word-mask)))
                      offset)))))))
 
 ;;; We cheat a little bit by using TRULY-THE in the copying function to
@@ -223,11 +232,16 @@
         (values))
 
       ;; common uses for constant-byte-bashing
+      (defknown ,array-fill-name (word simple-unboxed-array ,offset ,offset)
+          simple-unboxed-array
+          ()
+        :result-arg 1)
       (defun ,array-fill-name (value dst dst-offset length)
         (declare (type word value) (type ,offset dst-offset length))
         (declare (optimize (speed 3) (safety 1)))
         (,constant-bash-name dst dst-offset length value
-                             #'%vector-raw-bits #'%set-vector-raw-bits))
+                             #'%vector-raw-bits #'%set-vector-raw-bits)
+        dst)
       (defun ,system-area-fill-name (value dst dst-offset length)
         (declare (type word value) (type ,offset dst-offset length))
         (declare (optimize (speed 3) (safety 1)))
@@ -426,7 +440,7 @@
                            (flet ((get-next-src ()
                                     (setf prev next)
                                     (setf next (funcall src-ref-fn src
-                                                        (setf src-word-offset (incf src-word-offset))))))
+                                                        (incf src-word-offset)))))
                              (declare (inline get-next-src))
                              ,@(unless (= bytes-per-word 1)
                                 `((unless (zerop dst-byte-offset)
@@ -580,3 +594,100 @@
   (declare (type system-area-pointer sap))
   (declare (type fixnum offset))
   (copy-ub8-to-system-area bv 0 sap offset (length bv)))
+
+
+;;;; Bashing-Style search for bits
+;;;;
+;;;; Similar search would work well for base-strings as well.
+;;;; (Technically for all unboxed sequences of sub-word size elements,
+;;;; but somehow I doubt eg. octet vectors get POSITION or FIND used
+;;;; as much on them.)
+(defconstant +bit-position-base-mask+ (1- n-word-bits))
+(defconstant +bit-position-base-shift+ (integer-length +bit-position-base-mask+))
+(macrolet ((def (name frob)
+             `(defun ,name (vector from-end start end)
+                (declare (simple-bit-vector vector)
+                         (index start end)
+                         (optimize (speed 3) (safety 0)))
+                (unless (= start end)
+                  (let* ((last-word (ash end (- +bit-position-base-shift+)))
+                         (last-bits (logand end +bit-position-base-mask+))
+                         (first-word (ash start (- +bit-position-base-shift+)))
+                         (first-bits (logand start +bit-position-base-mask+))
+                         ;; These mask out everything but the interesting parts.
+                         (end-mask #!+little-endian (lognot (ash -1 last-bits))
+                                   #!+big-endian (ash -1 (- sb!vm:n-word-bits last-bits)))
+                         (start-mask #!+little-endian (ash -1 first-bits)
+                                     #!+big-endian (lognot (ash -1 (- sb!vm:n-word-bits first-bits)))))
+                    (declare (index last-word first-word))
+                    (flet ((#!+little-endian start-bit
+                            #!+big-endian end-bit (x)
+                             (declare (word x))
+                             (- #!+big-endian sb!vm:n-word-bits
+                                (integer-length (logand x (- x)))
+                                #!+little-endian 1))
+                           (#!+little-endian end-bit
+                            #!+big-endian start-bit (x)
+                             (declare (word x))
+                             (- #!+big-endian sb!vm:n-word-bits
+                                (integer-length x)
+                                #!+little-endian 1))
+                           (found (i word-offset)
+                             (declare (index i word-offset))
+                             (return-from ,name
+                               (logior i (truly-the
+                                          fixnum
+                                          (ash word-offset +bit-position-base-shift+)))))
+                           (get-word (offset)
+                             (,@frob (%vector-raw-bits vector offset))))
+                      (declare (inline start-bit end-bit get-word))
+                      (if from-end
+                          ;; Back to front
+                          (let* ((word-offset last-word)
+                                 (word (logand end-mask (get-word word-offset))))
+                            (declare (word word)
+                                     (index word-offset))
+                            (unless (zerop word)
+                              (when (= word-offset first-word)
+                                (setf word (logand word start-mask)))
+                              (unless (zerop word)
+                                (found (end-bit word) word-offset)))
+                            (decf word-offset)
+                            (loop
+                              (when (< word-offset first-word)
+                                (return-from ,name nil))
+                              (setf word (get-word word-offset))
+                              (unless (zerop word)
+                                (when (= word-offset first-word)
+                                  (setf word (logand word start-mask)))
+                                (unless (zerop word)
+                                  (found (end-bit word) word-offset)))
+                              (decf word-offset)))
+                          ;; Front to back
+                          (let* ((word-offset first-word)
+                                 (word (logand start-mask (get-word word-offset))))
+                            (declare (word word)
+                                     (index word-offset))
+                            (unless (zerop word)
+                              (when (= word-offset last-word)
+                                (setf word (logand word end-mask)))
+                              (unless (zerop word)
+                                (found (start-bit word) word-offset)))
+                            (incf word-offset)
+                            (loop
+                              (when (> word-offset last-word)
+                                (return-from ,name nil))
+                              (setf word (get-word word-offset))
+                              (unless (zerop word)
+                                (when (= word-offset last-word)
+                                  (setf word (logand word end-mask)))
+                                (unless (zerop word)
+                                  (found (start-bit word) word-offset)))
+                              (incf word-offset))))))))))
+  (def %bit-position/0 (logandc2 #.(1- (expt 2 n-word-bits))))
+  (def %bit-position/1 (identity)))
+(defun %bit-position (bit vector from-end start end)
+  (case bit
+    (0 (%bit-position/0 vector from-end start end))
+    (1 (%bit-position/1 vector from-end start end))
+    (otherwise nil)))

@@ -13,6 +13,8 @@
 
 (in-package "CL-USER")
 
+(load "compiler-test-util.lisp")
+
 ;;; The bug reported by Alexei Dejneka on sbcl-devel 2001-09-03
 ;;; is fixed now.
 (assert (equal (let ((hash (make-hash-table)))
@@ -247,3 +249,39 @@
 (loop with x of-type (simple-vector 1) = (make-array '(1))
       repeat 1
       return x)
+
+(with-test (:name :bug-540186)
+  (let ((fun (compile nil `(lambda (x)
+                             (loop for i from 0 below (length x)
+                                   for vec of-type vector = (aref x i)
+                                   collect vec)))))
+    (assert (equal '("foo" "bar")
+             (funcall fun
+                      (vector "foo" "bar"))))))
+
+(with-test (:name :bug-lp613871)
+  (multiple-value-bind (function warnings-p failure-p)
+      (compile nil '(lambda () (loop with nil = 1 repeat 2 collect t)))
+    (assert (null warnings-p))
+    (assert (null failure-p))
+    (assert (equal '(t t) (funcall function))))
+  (multiple-value-bind (function warnings-p failure-p)
+      (compile nil '(lambda () (loop with nil repeat 2 collect t)))
+    (assert (null warnings-p))
+    (assert (null failure-p))
+    (assert (equal '(t t) (funcall function)))))
+
+(with-test (:name :bug-654220-regression)
+  (assert (= 32640 (loop for i to 255
+                         sum i into sum of-type fixnum
+                         finally (return sum)))))
+
+(with-test (:name :of-type-character-init)
+  ;; The intention here is to if we initialize C to NIL before iteration start
+  ;; by looking for tell-tale types such as (OR NULL CHARACTER). ...not the
+  ;; most robust test ever, no.
+  (let* ((fun (compile nil `(lambda (x)
+                              (loop for c of-type character in x
+                                    collect (char-code c)))))
+         (consts (ctu:find-code-constants fun :type '(or symbol list))))
+    (assert (or (null consts) (equal 'character consts)))))

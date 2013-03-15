@@ -38,7 +38,14 @@
 
 (require :sb-posix)
 
-(with-test (:name (:signal :errno))
+(with-test (:name (:signal :errno)
+                  ;; This test asserts that nanosleep behaves correctly
+                  ;; for invalid values and sets EINVAL.  Well, we have
+                  ;; nanosleep on Windows, but it depends on the caller
+                  ;; (namely SLEEP) to produce known-good arguments, and
+                  ;; even if we wanted to check argument validity,
+                  ;; integration with `errno' is not to be expected.
+                  :skipped-on :win32)
   (let* (saved-errno
          (returning nil)
          (timer (make-timer (lambda ()
@@ -56,3 +63,37 @@
     (loop until returning)
     (loop repeat 1000000000)
     (assert (= saved-errno (sb-unix::get-errno)))))
+
+(with-test (:name :handle-interactive-interrupt
+                  ;; It is desirable to support C-c on Windows, but SIGINT
+                  ;; is not the mechanism to use on this platform.
+                  :skipped-on :win32)
+  (assert (eq :condition
+              (handler-case
+                  (progn
+                    (sb-thread::kill-safely
+                     (sb-thread::thread-os-thread sb-thread::*current-thread*)
+                     sb-unix:sigint)
+                    #+sb-safepoint-strictly
+                    ;; In this case, the signals handler gets invoked
+                    ;; indirectly through an INTERRUPT-THREAD.  Give it
+                    ;; enough time to hit.
+                    (sleep 1))
+                (sb-sys:interactive-interrupt ()
+                  :condition)))))
+
+(with-test (:name :bug-640516)
+  ;; On Darwin interrupting a SLEEP so that it took longer than
+  ;; the requested amount caused it to hang.
+  (assert
+   (handler-case
+       (sb-ext:with-timeout 10
+         (let (to)
+           (handler-bind ((sb-ext:timeout (lambda (c)
+                                            (unless to
+                                              (setf to t)
+                                              (sleep 2)
+                                              (continue c)))))
+             (sb-ext:with-timeout 0.1 (sleep 1) t))))
+     (sb-ext:timeout ()
+       nil))))

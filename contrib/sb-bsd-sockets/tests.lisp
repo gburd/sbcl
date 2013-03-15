@@ -3,6 +3,12 @@
 
 (in-package :sb-bsd-sockets-test)
 
+(defmacro deftest* ((name &key fails-on) form &rest results)
+  `(progn
+     (when (sb-impl::featurep ',fails-on)
+       (pushnew ',name sb-rt::*expected-failures*))
+     (deftest ,name ,form ,@results)))
+
 ;;; a real address
 (deftest make-inet-address
   (equalp (make-inet-address "127.0.0.1")  #(127 0 0 1))
@@ -20,6 +26,10 @@
   (integerp (get-protocol-by-name "udp"))
   t)
 
+;;; See https://bugs.launchpad.net/sbcl/+bug/659857
+;;; Apparently getprotobyname_r on FreeBSD says -1 and EINTR
+;;; for unknown protocols...
+#-(and freebsd sb-thread)
 (deftest get-protocol-by-name/error
   (handler-case (get-protocol-by-name "nonexistent-protocol")
     (unknown-protocol ()
@@ -40,7 +50,7 @@
       (and (> (socket-file-descriptor s) 1) t))
   t)
 
-(deftest make-inet-socket-wrong
+(deftest* (make-inet-socket-wrong)
     ;; fail to make a socket: check correct error return.  There's no nice
     ;; way to check the condition stuff on its own, which is a shame
     (handler-case
@@ -56,7 +66,7 @@
       (:no-error nil))
   t)
 
-(deftest make-inet-socket-keyword-wrong
+(deftest* (make-inet-socket-keyword-wrong)
     ;; same again with keywords
     (handler-case
         (make-instance 'inet-socket :type :stream :protocol :udp)
@@ -73,7 +83,7 @@
   t)
 
 
-(deftest non-block-socket
+(deftest* (non-block-socket)
   (let ((s (make-instance 'inet-socket :type :stream :protocol :tcp)))
     (setf (non-blocking-mode s) t)
     (non-blocking-mode s))
@@ -102,7 +112,7 @@
       (address-in-use-error () t)))
   t)
 
-(deftest simple-sockopt-test
+(deftest* (simple-sockopt-test)
   ;; test we can set SO_REUSEADDR on a socket and retrieve it, and in
   ;; the process that all the weird macros in sockopt happened right.
   (let ((s (make-instance 'inet-socket :type :stream :protocol (get-protocol-by-name "tcp"))))
@@ -167,8 +177,8 @@
 ;;; to look at /etc/syslog.conf or local equivalent to find out where
 ;;; the message ended up
 
+#-win32
 (deftest simple-local-client
-    #-win32
     (progn
       ;; SunOS (Solaris) and Darwin systems don't have a socket at
       ;; /dev/log.  We might also be building in a chroot or
@@ -301,4 +311,57 @@
        (format t "Received ~A bytes from ~A:~A - ~A ~%"
                len address port (subseq buf 0 (min 10 len)))))))
 
-
+#+sb-thread
+(deftest interrupt-io
+    (let (result)
+      (labels
+          ((client (port)
+             (setf result
+                   (let ((s (make-instance 'inet-socket
+                                           :type :stream
+                                           :protocol :tcp)))
+                     (socket-connect s #(127 0 0 1) port)
+                     (let ((stream (socket-make-stream s
+                                                       :input t
+                                                       :output t
+                                                       :buffering :none)))
+                       (handler-case
+                           (prog1
+                               (catch 'stop
+                                 (progn
+                                   (read-char stream)
+                                   (sleep 0.1)
+                                   (sleep 0.1)
+                                   (sleep 0.1)))
+                             (close stream))
+                         (error (c)
+                           c))))))
+           (server ()
+             (let ((s (make-instance 'inet-socket
+                                     :type :stream
+                                     :protocol :tcp)))
+               (setf (sockopt-reuse-address s) t)
+               (socket-bind s (make-inet-address "127.0.0.1") 0)
+               (socket-listen s 5)
+               (multiple-value-bind (* port)
+                   (socket-name s)
+                 (let* ((client (sb-thread:make-thread
+                                 (lambda () (client port))))
+                        (r (socket-accept s))
+                        (stream (socket-make-stream r
+                                                    :input t
+                                                    :output t
+                                                    :buffering :none))
+                        (ok :ok))
+                   (socket-close s)
+                   (sleep 5)
+                   (sb-thread:interrupt-thread client
+                                               (lambda () (throw 'stop ok)))
+                   (sleep 5)
+                   (setf ok :not-ok)
+                   (write-char #\x stream)
+                   (close stream)
+                   (socket-close r))))))
+        (server))
+      result)
+  :ok)

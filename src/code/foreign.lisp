@@ -16,8 +16,7 @@
 
 (defun extern-alien-name (name)
   (handler-case
-      #!+elf (coerce name 'base-string)
-      #!+(or mach-o win32) (concatenate 'base-string "_" name)
+      (coerce name 'base-string)
     (error ()
       (error "invalid external alien name: ~S" name))))
 
@@ -34,10 +33,7 @@
   (let ((extern (extern-alien-name name)))
     (values
      (or (gethash extern table)
-         (gethash (concatenate 'base-string
-                               #!+(and darwin (or x86 x86-64 ppc)) "_ldso_stub__"
-                               #!-(and darwin (or x86 x86-64 ppc)) "ldso_stub__"
-                               extern) table)))))
+         (gethash (concatenate 'base-string "ldso_stub__" extern) table)))))
 
 (defun find-foreign-symbol-address (name)
   "Returns the address of the foreign symbol NAME, or NIL. Does not enter the
@@ -57,7 +53,10 @@ Dynamic symbols are entered into the linkage-table if they aren't there already.
 
 On non-linkage-table ports signals an error if the symbol isn't found."
   (declare (ignorable datap))
-  (let ((static (find-foreign-symbol-in-table name  *static-foreign-symbols*)))
+  #!+sb-dynamic-core
+  (values (ensure-foreign-symbol-linkage name datap) t)
+  #!-sb-dynamic-core
+  (let ((static (find-foreign-symbol-in-table name *static-foreign-symbols*)))
     (if static
         (values static nil)
         #!+os-provides-dlopen
@@ -84,8 +83,7 @@ if the symbol isn't found."
   #!+linkage-table
   (multiple-value-bind (addr sharedp)
       (foreign-symbol-address symbol datap)
-    #+sb-xc-host
-    (aver (not sharedp))
+    #+sb-xc-host #!-sb-dynamic-core (aver (not sharedp)) ()
     ;; If the address is from linkage-table and refers to data
     ;; we need to do a bit of juggling. It is not the address of the
     ;; variable, but the address where the real address is stored.
@@ -107,7 +105,7 @@ if the symbol isn't found."
 ;;; Cleanups before saving a core
 #-sb-xc-host
 (defun foreign-deinit ()
-  #!+(and os-provides-dlopen (or (not linkage-table) win32))
+  #!+(and os-provides-dlopen (not linkage-table))
   (when (dynamic-foreign-symbols-p)
     (warn "~@<Saving cores with alien definitions referring to non-static ~
            foreign symbols is unsupported on this platform: references to ~
@@ -142,7 +140,10 @@ if the symbol isn't found."
                                (symbol-address unsigned)))
                  (dladdr (function unsigned unsigned (* (struct dl-info)))
                          :extern "dladdr"))
-      (let ((err (alien-funcall dladdr addr (addr info))))
+      (let ((err (without-gcing
+                   ;; On eg. Darwin GC can could otherwise interrupt
+                   ;; the call while dladdr is holding a lock.
+                   (alien-funcall dladdr addr (addr info)))))
         (if (zerop err)
             nil
             (slot info 'symbol))))
@@ -155,9 +156,17 @@ if the symbol isn't found."
 
 #-sb-xc-host
 (defun !foreign-cold-init ()
+  #!-sb-dynamic-core
   (dolist (symbol *!initial-foreign-symbols*)
     (setf (gethash (car symbol) *static-foreign-symbols*) (cdr symbol)))
-  #!+(and os-provides-dlopen (not win32))
+  #!+sb-dynamic-core
+  (loop for table-address from sb!vm::linkage-table-space-start
+          by sb!vm::linkage-table-entry-size
+          and reference in sb!vm::*required-runtime-c-symbols*
+        do (setf (gethash reference *linkage-info*)
+                 (make-linkage-info :datap (cdr reference)
+                      :address table-address)))
+  #!+os-provides-dlopen
   (setf *runtime-dlhandle* (dlopen-or-lose))
   #!+os-provides-dlopen
   (setf *shared-objects* nil))

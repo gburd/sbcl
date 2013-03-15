@@ -62,10 +62,51 @@
 
 ;;; Return an ETYPECASE form that does the type dispatch, ordering the
 ;;; cases for efficiency.
+;;; Check for some simple to detect problematic cases where the caller
+;;; used types that are not disjoint and where this may lead to
+;;; unexpected behaviour of the generated form, for example making
+;;; a clause unreachable, and throw an error if such a case is found.
+;;; An example:
+;;;   (number-dispatch ((var1 integer) (var2 float))
+;;;     ((fixnum single-float) a)
+;;;     ((integer float) b))
+;;; Even though the types are not reordered here, the generated form,
+;;; basically
+;;;   (etypecase var1
+;;;     (fixnum (etypecase var2
+;;;               (single-float a)))
+;;;     (integer (etypecase var2
+;;;                (float b))))
+;;; would fail at runtime if given var1 fixnum and var2 double-float,
+;;; even though the second clause matches this signature. To catch
+;;; this earlier than runtime we throw an error already here.
 (defun generate-number-dispatch (vars error-tags cases)
   (if vars
       (let ((var (first vars))
             (cases (sort cases #'type-test-order :key #'car)))
+        (flet ((error-if-sub-or-supertype (type1 type2)
+                 (when (or (subtypep type1 type2)
+                           (subtypep type2 type1))
+                   (error "Types not disjoint: ~S ~S." type1 type2)))
+               (error-if-supertype (type1 type2)
+                 (when (subtypep type2 type1)
+                   (error "Type ~S ordered before subtype ~S."
+                          type1 type2)))
+               (test-type-pairs (fun)
+                 ;; Apply FUN to all (ordered) pairs of types from the
+                 ;; cases.
+                 (mapl (lambda (cases)
+                         (when (cdr cases)
+                           (let ((type1 (caar cases)))
+                             (dolist (case (cdr cases))
+                               (funcall fun type1 (car case))))))
+                       cases)))
+          ;; For the last variable throw an error if a type is followed
+          ;; by a subtype, for all other variables additionally if a
+          ;; type is followed by a supertype.
+          (test-type-pairs (if (cdr vars)
+                               #'error-if-sub-or-supertype
+                               #'error-if-supertype)))
         `((typecase ,var
             ,@(mapcar (lambda (case)
                         `(,(first case)
@@ -92,6 +133,13 @@
 ;;; symbol. In this case, we apply the CAR of the form to the CDR and
 ;;; treat the result of the call as a list of cases. This process is
 ;;; not applied recursively.
+;;;
+;;; Be careful when using non-disjoint types in different cases for the
+;;; same variable. Some uses will behave as intended, others not, as the
+;;; variables are dispatched off sequentially and clauses are reordered
+;;; for efficiency. Some, but not all, problematic cases are detected
+;;; and lead to a compile time error; see GENERATE-NUMBER-DISPATCH above
+;;; for an example.
 (defmacro number-dispatch (var-specs &body cases)
   (let ((res (list nil))
         (vars (mapcar #'car var-specs))
@@ -300,17 +348,27 @@
   (denominator number))
 
 ;;;; arithmetic operations
+;;;;
+;;;; IMPORTANT NOTE: Accessing &REST arguments with NTH is actually extremely
+;;;; efficient in SBCL, as is taking their LENGTH -- so this code is very
+;;;; clever instead of being charmingly naive. Please check that "obvious"
+;;;; improvements don't actually ruin performance.
+;;;;
+;;;; (Granted that the difference between very clever and charmingly naivve
+;;;; can sometimes be sliced exceedingly thing...)
 
 (macrolet ((define-arith (op init doc)
              #!-sb-doc (declare (ignore doc))
-             `(defun ,op (&rest args)
-                #!+sb-doc ,doc
-                (if (null args) ,init
-                    (do ((args (cdr args) (cdr args))
-                         (result (car args) (,op result (car args))))
-                        ((null args) result)
-                      ;; to signal TYPE-ERROR when exactly 1 arg of wrong type:
-                      (declare (type number result)))))))
+             `(defun ,op (&rest numbers)
+                #!+sb-doc
+                ,doc
+                (if numbers
+                    (do ((result (nth 0 numbers) (,op result (nth i numbers)))
+                         (i 1 (1+ i)))
+                        ((>= i (length numbers))
+                         result)
+                      (declare (number result)))
+                    ,init))))
   (define-arith + 0
     "Return the sum of its arguments. With no args, returns 0.")
   (define-arith * 1
@@ -321,11 +379,9 @@
   "Subtract the second and all subsequent arguments from the first;
   or with one argument, negate the first argument."
   (if more-numbers
-      (do ((nlist more-numbers (cdr nlist))
-           (result number))
-          ((atom nlist) result)
-         (declare (list nlist))
-         (setq result (- result (car nlist))))
+      (let ((result number))
+        (dotimes (i (length more-numbers) result)
+          (setf result (- result (nth i more-numbers)))))
       (- number)))
 
 (defun / (number &rest more-numbers)
@@ -333,11 +389,9 @@
   "Divide the first argument by each of the following arguments, in turn.
   With one argument, return reciprocal."
   (if more-numbers
-      (do ((nlist more-numbers (cdr nlist))
-           (result number))
-          ((atom nlist) result)
-         (declare (list nlist))
-         (setq result (/ result (car nlist))))
+      (let ((result number))
+        (dotimes (i (length more-numbers) result)
+          (setf result (/ result (nth i more-numbers)))))
       (/ number)))
 
 (defun 1+ (number)
@@ -590,19 +644,26 @@
         (foreach single-float double-float #!+long-float long-float))
        (truncate-float (dispatch-type divisor))))))
 
+;; Only inline when no VOP exists
+#!-multiply-high-vops (declaim (inline %multiply-high))
+(defun %multiply-high (x y)
+  (declare (type word x y))
+  #!-multiply-high-vops
+  (values (sb!bignum:%multiply x y))
+  #!+multiply-high-vops
+  (%multiply-high x y))
+
 ;;; Declare these guys inline to let them get optimized a little.
 ;;; ROUND and FROUND are not declared inline since they seem too
 ;;; obscure and too big to inline-expand by default. Also, this gives
-;;; the compiler a chance to pick off the unary float case. Similarly,
-;;; CEILING and FLOOR are only maybe-inline for now, so that the
-;;; power-of-2 CEILING and FLOOR transforms get a chance.
-#!-sb-fluid (declaim (inline rem mod fceiling ffloor ftruncate))
-(declaim (maybe-inline ceiling floor))
-
-(defun floor (number &optional (divisor 1))
-  #!+sb-doc
-  "Return the greatest integer not greater than number, or number/divisor.
-  The second returned value is (mod number divisor)."
+;;; the compiler a chance to pick off the unary float case.
+;;;
+;;; CEILING and FLOOR are implemented in terms of %CEILING and %FLOOR
+;;; if no better transform can be found: they aren't inline directly,
+;;; since we want to try a transform specific to them before letting
+;;; the transform for TRUNCATE pick up the slack.
+#!-sb-fluid (declaim (inline rem mod fceiling ffloor ftruncate %floor %ceiling))
+(defun %floor (number divisor)
   ;; If the numbers do not divide exactly and the result of
   ;; (/ NUMBER DIVISOR) would be negative then decrement the quotient
   ;; and augment the remainder by the divisor.
@@ -614,10 +675,13 @@
         (values (1- tru) (+ rem divisor))
         (values tru rem))))
 
-(defun ceiling (number &optional (divisor 1))
+(defun floor (number &optional (divisor 1))
   #!+sb-doc
-  "Return the smallest integer not less than number, or number/divisor.
-  The second returned value is the remainder."
+  "Return the greatest integer not greater than number, or number/divisor.
+  The second returned value is (mod number divisor)."
+  (%floor number divisor))
+
+(defun %ceiling (number divisor)
   ;; If the numbers do not divide exactly and the result of
   ;; (/ NUMBER DIVISOR) would be positive then increment the quotient
   ;; and decrement the remainder by the divisor.
@@ -628,6 +692,12 @@
                  (plusp number)))
         (values (+ tru 1) (- rem divisor))
         (values tru rem))))
+
+(defun ceiling (number &optional (divisor 1))
+  #!+sb-doc
+  "Return the smallest integer not less than number, or number/divisor.
+  The second returned value is the remainder."
+  (%ceiling number divisor))
 
 (defun round (number &optional (divisor 1))
   #!+sb-doc
@@ -743,90 +813,63 @@
 (defun = (number &rest more-numbers)
   #!+sb-doc
   "Return T if all of its arguments are numerically equal, NIL otherwise."
-  (declare (truly-dynamic-extent more-numbers))
-  (the number number)
-  (do ((nlist more-numbers (cdr nlist)))
-      ((atom nlist) t)
-     (declare (list nlist))
-     (if (not (= (car nlist) number)) (return nil))))
+  (declare (number number))
+  (dotimes (i (length more-numbers) t)
+    (unless (= number (nth i more-numbers))
+      (return nil))))
 
 (defun /= (number &rest more-numbers)
   #!+sb-doc
   "Return T if no two of its arguments are numerically equal, NIL otherwise."
-  (declare (truly-dynamic-extent more-numbers))
-  (do* ((head (the number number) (car nlist))
-        (nlist more-numbers (cdr nlist)))
-       ((atom nlist) t)
-     (declare (list nlist))
-     (unless (do* ((nl nlist (cdr nl)))
-                  ((atom nl) t)
-               (declare (list nl))
-               (if (= head (car nl)) (return nil)))
-       (return nil))))
+  (declare (number number))
+  (if more-numbers
+      (do ((n number (nth i more-numbers))
+            (i 0 (1+ i)))
+          ((>= i (length more-numbers))
+           t)
+        (do ((j i (1+ j)))
+            ((>= j (length more-numbers)))
+          (when (= n (nth j more-numbers))
+            (return-from /= nil))))
+      t))
 
-(defun < (number &rest more-numbers)
-  #!+sb-doc
-  "Return T if its arguments are in strictly increasing order, NIL otherwise."
-  (declare (truly-dynamic-extent more-numbers))
-  (do* ((n (the number number) (car nlist))
-        (nlist more-numbers (cdr nlist)))
-       ((atom nlist) t)
-     (declare (list nlist))
-     (if (not (< n (car nlist))) (return nil))))
-
-(defun > (number &rest more-numbers)
-  #!+sb-doc
-  "Return T if its arguments are in strictly decreasing order, NIL otherwise."
-  (declare (truly-dynamic-extent more-numbers))
-  (do* ((n (the number number) (car nlist))
-        (nlist more-numbers (cdr nlist)))
-       ((atom nlist) t)
-     (declare (list nlist))
-     (if (not (> n (car nlist))) (return nil))))
-
-(defun <= (number &rest more-numbers)
-  #!+sb-doc
-  "Return T if arguments are in strictly non-decreasing order, NIL otherwise."
-  (declare (truly-dynamic-extent more-numbers))
-  (do* ((n (the number number) (car nlist))
-        (nlist more-numbers (cdr nlist)))
-       ((atom nlist) t)
-     (declare (list nlist))
-     (if (not (<= n (car nlist))) (return nil))))
-
-(defun >= (number &rest more-numbers)
-  #!+sb-doc
-  "Return T if arguments are in strictly non-increasing order, NIL otherwise."
-  (declare (truly-dynamic-extent more-numbers))
-  (do* ((n (the number number) (car nlist))
-        (nlist more-numbers (cdr nlist)))
-       ((atom nlist) t)
-     (declare (list nlist))
-     (if (not (>= n (car nlist))) (return nil))))
+(macrolet ((def (op doc)
+             #!-sb-doc (declare (ignore doc))
+             `(defun ,op (number &rest more-numbers)
+                #!+sb-doc ,doc
+                (let ((n number))
+                  (declare (number n))
+                  (dotimes (i (length more-numbers) t)
+                    (let ((arg (nth i more-numbers)))
+                      (if (,op n arg)
+                        (setf n arg)
+                        (return-from ,op nil))))))))
+  (def <  "Return T if its arguments are in strictly increasing order, NIL otherwise.")
+  (def >  "Return T if its arguments are in strictly decreasing order, NIL otherwise.")
+  (def <= "Return T if arguments are in strictly non-decreasing order, NIL otherwise.")
+  (def >= "Return T if arguments are in strictly non-increasing order, NIL otherwise."))
 
 (defun max (number &rest more-numbers)
   #!+sb-doc
   "Return the greatest of its arguments; among EQUALP greatest, return
 the first."
-  (declare (truly-dynamic-extent more-numbers))
-  (do ((nlist more-numbers (cdr nlist))
-       (result number))
-      ((null nlist) (return result))
-     (declare (list nlist))
-     (declare (type real number result))
-     (if (> (car nlist) result) (setq result (car nlist)))))
+  (let ((n number))
+    (declare (number n))
+    (dotimes (i (length more-numbers) n)
+      (let ((arg (nth i more-numbers)))
+        (when (> arg n)
+          (setf n arg))))))
 
 (defun min (number &rest more-numbers)
   #!+sb-doc
   "Return the least of its arguments; among EQUALP least, return
 the first."
-  (declare (truly-dynamic-extent more-numbers))
-  (do ((nlist more-numbers (cdr nlist))
-       (result number))
-      ((null nlist) (return result))
-     (declare (list nlist))
-     (declare (type real number result))
-     (if (< (car nlist) result) (setq result (car nlist)))))
+  (let ((n number))
+    (declare (number n))
+    (dotimes (i (length more-numbers) n)
+      (let ((arg (nth i more-numbers)))
+        (when (< arg n)
+          (setf n arg))))))
 
 (eval-when (:compile-toplevel :execute)
 
@@ -855,10 +898,10 @@ the first."
          ;; conversion.
          (multiple-value-bind (lo hi)
              (case '(dispatch-type y)
-               ('single-float
+               (single-float
                 (values most-negative-exactly-single-float-fixnum
                         most-positive-exactly-single-float-fixnum))
-               ('double-float
+               (double-float
                 (values most-negative-exactly-double-float-fixnum
                         most-positive-exactly-double-float-fixnum)))
            (if (<= lo y hi)
@@ -872,10 +915,10 @@ the first."
              ;; Likewise
              (multiple-value-bind (lo hi)
                  (case '(dispatch-type x)
-                   ('single-float
+                   (single-float
                     (values most-negative-exactly-single-float-fixnum
                             most-positive-exactly-single-float-fixnum))
-                   ('double-float
+                   (double-float
                     (values most-negative-exactly-double-float-fixnum
                             most-positive-exactly-double-float-fixnum)))
                (if (<= lo y hi)
@@ -964,45 +1007,21 @@ the first."
 
 ;;;; logicals
 
-(defun logior (&rest integers)
-  #!+sb-doc
-  "Return the bit-wise or of its arguments. Args must be integers."
-  (declare (list integers))
-  (if integers
-      (do ((result (pop integers) (logior result (pop integers))))
-          ((null integers) result)
-        (declare (integer result)))
-      0))
-
-(defun logxor (&rest integers)
-  #!+sb-doc
-  "Return the bit-wise exclusive or of its arguments. Args must be integers."
-  (declare (list integers))
-  (if integers
-      (do ((result (pop integers) (logxor result (pop integers))))
-          ((null integers) result)
-        (declare (integer result)))
-      0))
-
-(defun logand (&rest integers)
-  #!+sb-doc
-  "Return the bit-wise and of its arguments. Args must be integers."
-  (declare (list integers))
-  (if integers
-      (do ((result (pop integers) (logand result (pop integers))))
-          ((null integers) result)
-        (declare (integer result)))
-      -1))
-
-(defun logeqv (&rest integers)
-  #!+sb-doc
-  "Return the bit-wise equivalence of its arguments. Args must be integers."
-  (declare (list integers))
-  (if integers
-      (do ((result (pop integers) (logeqv result (pop integers))))
-          ((null integers) result)
-        (declare (integer result)))
-      -1))
+(macrolet ((def (op init doc)
+             #!-sb-doc (declare (ignore doc))
+             `(defun ,op (&rest integers)
+                #!+sb-doc ,doc
+                (if integers
+                    (do ((result (nth 0 integers) (,op result (nth i integers)))
+                         (i 1 (1+ i)))
+                        ((>= i (length integers))
+                         result)
+                      (declare (integer result)))
+                    ,init))))
+  (def logior 0 "Return the bit-wise or of its arguments. Args must be integers.")
+  (def logxor 0 "Return the bit-wise exclusive or of its arguments. Args must be integers.")
+  (def logand -1 "Return the bit-wise and of its arguments. Args must be integers.")
+  (def logeqv -1 "Return the bit-wise equivalence of its arguments. Args must be integers."))
 
 (defun lognot (number)
   #!+sb-doc
@@ -1069,9 +1088,9 @@ the first."
   #!+sb-doc
   "Predicate returns T if bit index of integer is a 1."
   (number-dispatch ((index integer) (integer integer))
-    ((fixnum fixnum) (if (> index #.(- sb!vm:n-word-bits sb!vm:n-lowtag-bits))
-                         (minusp integer)
-                         (not (zerop (logand integer (ash 1 index))))))
+    ((fixnum fixnum) (if (< index sb!vm:n-positive-fixnum-bits)
+                         (not (zerop (logand integer (ash 1 index))))
+                         (minusp integer)))
     ((fixnum bignum) (bignum-logbitp index integer))
     ((bignum (foreach fixnum bignum)) (minusp integer))))
 
@@ -1300,28 +1319,31 @@ the first."
   #!+sb-doc
   "Return the greatest common divisor of the arguments, which must be
   integers. Gcd with no arguments is defined to be 0."
-  (cond ((null integers) 0)
-        ((null (cdr integers)) (abs (the integer (car integers))))
-        (t
-         (do ((gcd (the integer (car integers))
-                   (gcd gcd (the integer (car rest))))
-              (rest (cdr integers) (cdr rest)))
-             ((null rest) gcd)
-           (declare (integer gcd)
-                    (list rest))))))
+  (case (length integers)
+    (0 0)
+    (1 (abs (the integer (nth 0 integers))))
+    (otherwise
+     (do ((result (nth 0 integers)
+                  (gcd result (the integer (nth i integers))))
+          (i 1 (1+ i)))
+         ((>= i (length integers))
+          result)
+       (declare (integer result))))))
 
 (defun lcm (&rest integers)
   #!+sb-doc
   "Return the least common multiple of one or more integers. LCM of no
   arguments is defined to be 1."
-  (cond ((null integers) 1)
-        ((null (cdr integers)) (abs (the integer (car integers))))
-        (t
-         (do ((lcm (the integer (car integers))
-                   (lcm lcm (the integer (car rest))))
-              (rest (cdr integers) (cdr rest)))
-             ((null rest) lcm)
-           (declare (integer lcm) (list rest))))))
+  (case (length integers)
+    (0 1)
+    (1 (abs (the integer (nth 0 integers))))
+    (otherwise
+     (do ((result (nth 0 integers)
+                  (lcm result (the integer (nth i integers))))
+          (i 1 (1+ i)))
+         ((>= i (length integers))
+          result)
+       (declare (integer result))))))
 
 (defun two-arg-lcm (n m)
   (declare (integer n m))
@@ -1384,29 +1406,31 @@ the first."
            ((fixnum bignum)
             (bignum-gcd (make-small-bignum u) v))))))
 
-;;; From discussion on comp.lang.lisp and Akira Kurihara.
+;;;; from Robert Smith; slightly changed not to cons unnecessarily.
 (defun isqrt (n)
   #!+sb-doc
-  "Return the root of the nearest integer less than n which is a perfect
-   square."
-  (declare (type unsigned-byte n) (values unsigned-byte))
-  ;; Theoretically (> n 7), i.e., n-len-quarter > 0.
-  (if (and (fixnump n) (<= n 24))
-      (cond ((> n 15) 4)
-            ((> n  8) 3)
-            ((> n  3) 2)
-            ((> n  0) 1)
-            (t 0))
-      (let* ((n-len-quarter (ash (integer-length n) -2))
-             (n-half (ash n (- (ash n-len-quarter 1))))
-             (n-half-isqrt (isqrt n-half))
-             (init-value (ash (1+ n-half-isqrt) n-len-quarter)))
-        (loop
-          (let ((iterated-value
-                 (ash (+ init-value (truncate n init-value)) -1)))
-            (unless (< iterated-value init-value)
-              (return init-value))
-            (setq init-value iterated-value))))))
+  "Return the greatest integer less than or equal to the square root of N."
+  (declare (type unsigned-byte n))
+  (cond
+    ((> n 24)
+     (let* ((n-fourth-size (ash (1- (integer-length n)) -2))
+            (n-significant-half (ash n (- (ash n-fourth-size 1))))
+            (n-significant-half-isqrt (isqrt n-significant-half))
+            (zeroth-iteration (ash n-significant-half-isqrt n-fourth-size)))
+       (multiple-value-bind (quot rem)
+           (floor n zeroth-iteration)
+         (let ((first-iteration (ash (+ zeroth-iteration quot) -1)))
+           (cond ((oddp quot)
+                  first-iteration)
+                 ((> (expt (- first-iteration zeroth-iteration) 2) rem)
+                  (1- first-iteration))
+                 (t
+                  first-iteration))))))
+    ((> n 15) 4)
+    ((> n  8) 3)
+    ((> n  3) 2)
+    ((> n  0) 1)
+    ((= n  0) 0)))
 
 ;;;; miscellaneous number predicates
 
@@ -1478,14 +1502,9 @@ the first."
     (bignum (ldb (byte 64 0)
                  (ash (logand integer #xffffffffffffffff) amount)))))
 
-#!+x86
-(defun sb!vm::ash-left-smod30 (integer amount)
-  (etypecase integer
-    ((signed-byte 30) (sb!c::mask-signed-field 30 (ash integer amount)))
-    (integer (sb!c::mask-signed-field 30 (ash (sb!c::mask-signed-field 30 integer) amount)))))
-
-#!+x86-64
-(defun sb!vm::ash-left-smod61 (integer amount)
-  (etypecase integer
-    ((signed-byte 61) (sb!c::mask-signed-field 61 (ash integer amount)))
-    (integer (sb!c::mask-signed-field 61 (ash (sb!c::mask-signed-field 61 integer) amount)))))
+#!+(or x86 x86-64)
+(defun sb!vm::ash-left-modfx (integer amount)
+  (let ((fixnum-width (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits)))
+    (etypecase integer
+      (fixnum (sb!c::mask-signed-field fixnum-width (ash integer amount)))
+      (integer (sb!c::mask-signed-field fixnum-width (ash (sb!c::mask-signed-field fixnum-width integer) amount))))))

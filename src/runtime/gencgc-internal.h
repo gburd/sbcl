@@ -25,10 +25,22 @@
 #include "genesis/code.h"
 
 void gc_free_heap(void);
-inline page_index_t find_page_index(void *);
-inline void *page_address(page_index_t);
+extern page_index_t find_page_index(void *);
+extern void *page_address(page_index_t);
 int gencgc_handle_wp_violation(void *);
 
+
+#if GENCGC_CARD_BYTES > USHRT_MAX
+# if GENCGC_CARD_BYTES > UINT_MAX
+#   error "GENCGC_CARD_BYTES unexpectedly large."
+# else
+#   define PAGE_BYTES_FMT "u"
+    typedef unsigned int page_bytes_t;
+# endif
+#else
+# define PAGE_BYTES_FMT "hu"
+  typedef unsigned short page_bytes_t;
+#endif
 
 /* Note that this structure is also used from Lisp-side in
  * src/code/room.lisp, and the Lisp-side structure layout is currently
@@ -42,18 +54,14 @@ struct page {
     /* This is the offset from the start of the page to the start of
      * the alloc_region which contains/contained it.
      */
-    unsigned long region_start_offset;
+    os_vm_size_t region_start_offset;
 
     /* the number of bytes of this page that are used. This may be less
      * than the actual bytes used for pages within the current
      * allocation regions. It should be 0 for all unallocated pages (not
      * hard to achieve).
      */
-#if PAGE_BYTES > USHRT_MAX
-    unsigned int bytes_used;
-#else
-    unsigned short bytes_used;
-#endif
+    page_bytes_t bytes_used;
 
     unsigned
         /* This is set when the page is write-protected. This should
@@ -82,7 +90,7 @@ struct page {
          * set. No other objects should be allocated to these pages.
          * This is only valid when the page is allocated. */
         large_object :1,
-        /* True if the page is known to contain only zeroes. */
+        /* Cleared if the page is known to contain only zeroes. */
         need_to_zero :1;
 
     /* the generation that this page belongs to. This should be valid
@@ -102,10 +110,10 @@ extern struct page *page_table;
 
 /* forward declarations */
 
-void sniff_code_object(struct code *code, unsigned long displacement);
+void sniff_code_object(struct code *code, os_vm_size_t displacement);
 void gencgc_apply_code_fixups(struct code *old_code, struct code *new_code);
 
-long update_dynamic_space_free_pointer(void);
+sword_t update_dynamic_space_free_pointer(void);
 void gc_alloc_update_page_tables(int page_type_flag, struct alloc_region *alloc_region);
 void gc_alloc_update_all_page_tables(void);
 void gc_set_region_empty(struct alloc_region *region);
@@ -119,7 +127,7 @@ space_matches_p(lispobj obj, generation_index_t space)
 {
     if (obj >= DYNAMIC_SPACE_START) {
         page_index_t page_index=((pointer_sized_uint_t)obj
-                                 - DYNAMIC_SPACE_START) / PAGE_BYTES;
+                                 - DYNAMIC_SPACE_START) / GENCGC_CARD_BYTES;
         return ((page_index < page_table_pages) &&
                 (page_table[page_index].gen == space));
     } else {

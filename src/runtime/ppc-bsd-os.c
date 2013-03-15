@@ -8,26 +8,62 @@
 int *
 os_context_register_addr(os_context_t *context, int offset)
 {
+#if defined(LISP_FEATURE_NETBSD)
     return &context->uc_mcontext.__gregs[offset];
+#elif defined(LISP_FEATURE_OPENBSD)
+    return &context->sc_frame.fixreg[offset];
+#endif
 }
 
+#if defined(ARCH_HAS_STACK_POINTER) /* It's not defined on PPC. */
 int *
 os_context_sp_addr(os_context_t *context)
 {
+#if defined(LISP_FEATURE_NETBSD)
     return &(_UC_MACHINE_SP(context));
+#endif
 }
+#endif
 
 
 int *
 os_context_pc_addr(os_context_t *context)
 {
+#if defined(LISP_FEATURE_NETBSD)
     return &(_UC_MACHINE_PC(context));
+#elif defined(LISP_FEATURE_OPENBSD)
+    return &context->sc_frame.srr0;
+#endif
 }
 
 int *
 os_context_lr_addr(os_context_t *context)
 {
+#if defined(LISP_FEATURE_NETBSD)
     return &context->uc_mcontext.__gregs[_REG_LR];
+#elif defined(LISP_FEATURE_OPENBSD)
+    return &context->sc_frame.lr;
+#endif
+}
+
+os_context_register_t *
+os_context_ctr_addr(os_context_t *context)
+{
+#if defined(LISP_FEATURE_NETBSD)
+    return &context->uc_mcontext.__gregs[_REG_CTR];
+#elif defined(LISP_FEATURE_OPENBSD)
+    return &context->sc_frame.ctr;
+#endif
+}
+
+os_context_register_t *
+os_context_cr_addr(os_context_t *context)
+{
+#if defined(LISP_FEATURE_NETBSD)
+    return &context->uc_mcontext.__gregs[_REG_CR];
+#elif defined(LISP_FEATURE_OPENBSD)
+    return &context->sc_frame.cr;
+#endif
 }
 
 /* FIXME: If this can be a no-op on BSD/x86, then it

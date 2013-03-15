@@ -15,8 +15,10 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+(in-package :cl-user)
+
 (when (eq sb-ext:*evaluator-mode* :interpret)
-  (sb-ext:quit :unix-status 104))
+  (sb-ext:exit :code 104))
 
 (load "test-util.lisp")
 (load "compiler-test-util.lisp")
@@ -961,38 +963,27 @@
 (defun foo-inline (x) (quux-marker x))
 (declaim (maybe-inline foo-maybe-inline))
 (defun foo-maybe-inline (x) (quux-marker x))
-;; Pretty horrible, but does the job
-(defun count-full-calls (name function)
-  (let ((code (with-output-to-string (s)
-                (disassemble function :stream s)))
-        (n 0))
-    (with-input-from-string (s code)
-      (loop for line = (read-line s nil nil)
-            while line
-            when (search name line)
-            do (incf n)))
-    n))
 
 (with-test (:name :nested-inline-calls)
   (let ((fun (compile nil `(lambda (x)
                              (foo-inline (foo-inline (foo-inline x)))))))
-    (assert (= 0 (count-full-calls "FOO-INLINE" fun)))
-    (assert (= 3 (count-full-calls "QUUX-MARKER" fun)))))
+    (assert (= 0 (ctu:count-full-calls "FOO-INLINE" fun)))
+    (assert (= 3 (ctu:count-full-calls "QUUX-MARKER" fun)))))
 
 (with-test (:name :nested-maybe-inline-calls)
   (let ((fun (compile nil `(lambda (x)
                              (declare (optimize (space 0)))
                              (foo-maybe-inline (foo-maybe-inline (foo-maybe-inline x)))))))
-    (assert (= 0 (count-full-calls "FOO-MAYBE-INLINE" fun)))
-    (assert (= 1 (count-full-calls "QUUX-MARKER" fun)))))
+    (assert (= 0 (ctu:count-full-calls "FOO-MAYBE-INLINE" fun)))
+    (assert (= 1 (ctu:count-full-calls "QUUX-MARKER" fun)))))
 
 (with-test (:name :inline-calls)
   (let ((fun (compile nil `(lambda (x)
                              (list (foo-inline x)
                                    (foo-inline x)
                                    (foo-inline x))))))
-    (assert (= 0 (count-full-calls "FOO-INLINE" fun)))
-    (assert (= 3 (count-full-calls "QUUX-MARKER" fun)))))
+    (assert (= 0 (ctu:count-full-calls "FOO-INLINE" fun)))
+    (assert (= 3 (ctu:count-full-calls "QUUX-MARKER" fun)))))
 
 (with-test (:name :maybe-inline-calls)
   (let ((fun (compile nil `(lambda (x)
@@ -1000,36 +991,21 @@
                              (list (foo-maybe-inline x)
                                    (foo-maybe-inline x)
                                    (foo-maybe-inline x))))))
-    (assert (= 0 (count-full-calls "FOO-MAYBE-INLINE" fun)))
-    (assert (= 1 (count-full-calls "QUUX-MARKER" fun)))))
-
-(defun file-compile (toplevel-forms &key load)
-  (let* ((lisp "compile-impure-tmp.lisp")
-         (fasl (compile-file-pathname lisp)))
-    (unwind-protect
-         (progn
-           (with-open-file (f lisp :direction :output)
-             (dolist (form toplevel-forms)
-               (prin1 form f)))
-           (multiple-value-bind (fasl warn fail) (compile-file lisp)
-             (when load
-               (load fasl))
-             (values warn fail)))
-      (ignore-errors (delete-file lisp))
-      (ignore-errors (delete-file fasl)))))
+    (assert (= 0 (ctu:count-full-calls "FOO-MAYBE-INLINE" fun)))
+    (assert (= 1 (ctu:count-full-calls "QUUX-MARKER" fun)))))
 
 (with-test (:name :bug-405)
   ;; These used to break with a TYPE-ERROR
   ;;     The value NIL is not of type SB-C::PHYSENV.
   ;; in MERGE-LETS.
-  (file-compile
+  (ctu:file-compile
    '((LET (outer-let-var)
        (lambda ()
          (print outer-let-var)
          (MULTIPLE-VALUE-CALL 'some-function
            (MULTIPLE-VALUE-CALL (LAMBDA (a) 'foo)
              1))))))
-  (file-compile
+  (ctu:file-compile
    '((declaim (optimize (debug 3)))
      (defstruct bug-405-foo bar)
      (let ()
@@ -1166,6 +1142,273 @@
   (let ((x (make-instance 'some-slot-thing :slot "foo")))
     (with-slots (slot) (the some-slot-thing x)
       (assert (equal "foo" slot)))))
+
+;;; Missing &REST type in proclamation causing a miscompile.
+(declaim (ftype
+          (function
+           (sequence unsigned-byte
+                     &key (:initial-element t) (:initial-contents sequence))
+           (values sequence &optional))
+          bug-458354))
+(defun bug-458354
+    (sequence length
+     &rest keys
+     &key (initial-element nil iep) (initial-contents nil icp))
+  (declare (sb-ext:unmuffle-conditions style-warning))
+  (declare (ignorable keys initial-element iep initial-contents icp))
+  (apply #'sb-sequence:make-sequence-like sequence length keys))
+(with-test (:name :bug-458354)
+  (assert (equalp #((a b) (a b)) (bug-458354 #(1 2) 2 :initial-element '(a b)))))
+
+(with-test (:name :bug-542807)
+  (handler-bind ((style-warning #'error))
+    (eval '(defstruct bug-542807 slot)))
+  (let (conds)
+    (handler-bind ((style-warning (lambda (c)
+                                    (push c conds))))
+      (eval '(defstruct bug-542807 slot)))
+    (assert (= 1 (length conds)))
+    (assert (typep (car conds) 'sb-kernel::redefinition-with-defun))))
+
+(with-test (:name :defmacro-not-list-lambda-list)
+  (assert (raises-error? (eval `(defmacro ,(gensym) "foo"))
+                         type-error)))
+
+(with-test (:name :bug-308951)
+  (let ((x 1))
+    (dotimes (y 10)
+      (let ((y y))
+        (when (funcall (eval #'(lambda (x) (eql x 2))) y)
+          (defun bug-308951-foo (z)
+            (incf x (incf y z))))))
+    (defun bug-308951-bar (z)
+      (bug-308951-foo z)
+      (values x)))
+  (assert (= 4 (bug-308951-bar 1))))
+
+(declaim (inline bug-308914-storage))
+(defun bug-308914-storage (x)
+  (the (simple-array flt (*)) (bug-308914-unknown x)))
+
+(with-test (:name :bug-308914-workaround)
+  ;; This used to hang in ORDER-UVL-SETS.
+  (handler-case
+      (with-timeout 10
+        (compile nil
+                 `(lambda (lumps &key cg)
+                    (let ((nodes (map 'list (lambda (lump)
+                                              (bug-308914-storage lump))
+                                      lumps)))
+                      (setf (aref nodes 0) 2)
+                      (assert (every #'~= (apply #'concatenate 'list nodes) '(2 3 6 9)))))))
+    (sb-ext:timeout ()
+      (error "Hang in ORDER-UVL-SETS?"))))
+
+(declaim (inline inlined-function-in-source-path))
+(defun inlined-function-in-source-path (x)
+  (+ x x))
+
+(with-test (:name :inlined-function-in-source-path)
+  (let ((output
+         (with-output-to-string (*error-output*)
+           (compile nil `(lambda (x)
+                           (declare (optimize speed))
+                           (funcall #'inlined-function-in-source-path x))))))
+    ;; We want the name
+    (assert (search "INLINED-FUNCTION-IN-SOURCE-PATH" output))
+    ;; ...not the leaf.
+    (assert (not (search "DEFINED-FUN" output)))))
+
+(defmacro bug-795705 ()
+  t)
+
+(with-test (:name :bug-795705)
+  (assert (macro-function 'bug-795705))
+  (fmakunbound 'bug-795705)
+  (assert (not (macro-function 'bug-795705))))
+
+(with-test (:name (load-time-value :type-derivation))
+  (let ((name 'load-time-value-type-derivation-test))
+    (labels ((funtype (fun)
+               (sb-kernel:type-specifier
+                (sb-kernel:single-value-type
+                 (sb-kernel:fun-type-returns
+                  (sb-kernel:specifier-type
+                   (sb-kernel:%simple-fun-type fun))))))
+             (test (type1 type2 form value-cell-p)
+             (let* ((lambda-form `(lambda ()
+                                    (load-time-value ,form)))
+                    (core-fun (compile nil lambda-form))
+                    (core-type (funtype core-fun))
+                    (core-cell (ctu:find-value-cell-values core-fun))
+                    (defun-form `(defun ,name ()
+                                   (load-time-value ,form)))
+                    (file-fun (progn
+                                (ctu:file-compile (list defun-form) :load t)
+                                (symbol-function name)))
+                    (file-type (funtype file-fun))
+                    (file-cell (ctu:find-value-cell-values file-fun)))
+               (if value-cell-p
+                   (assert (and core-cell file-cell))
+                   (assert (not (or core-cell file-cell))))
+               (unless (subtypep core-type type1)
+                 (error "core: wanted ~S, got ~S" type1 core-type))
+               (unless (subtypep file-type type2)
+                 (error "file: wanted ~S, got ~S" type2 file-type)))))
+      (let ((* 10))
+        (test '(integer 11 11) 'number
+              '(+ * 1) nil))
+      (let ((* "fooo"))
+        (test '(integer 4 4) 'unsigned-byte
+              '(length *) nil))
+      (test '(integer 10 10) '(integer 10 10) 10 nil)
+      (test 'cons 'cons '(cons t t) t))))
+
+(with-test (:name (load-time-value :errors))
+  (multiple-value-bind (warn fail)
+      (ctu:file-compile
+       `((defvar *load-time-value-error-value* 10)
+         (declaim (fixnum *load-time-value-error-value*))
+         (defun load-time-value-error-test-1 ()
+           (the list (load-time-value *load-time-value-error-value*))))
+       :load t)
+    (assert warn)
+    (assert fail))
+  (handler-case (load-time-value-error-test-1)
+    (type-error (e)
+      (and (eql 10 (type-error-datum e))
+           (eql 'list (type-error-expected-type e)))))
+  (multiple-value-bind (warn2 fail2)
+      (ctu:file-compile
+       `((defun load-time-value-error-test-2 ()
+           (the list (load-time-value 10))))
+       :load t)
+    (assert warn2)
+    (assert fail2))
+  (handler-case (load-time-value-error-test-2)
+    (type-error (e)
+      (and (eql 10 (type-error-datum e))
+           (eql 'list (type-error-expected-type e))))))
+
+;;;; tests for compiler output
+(with-test (:name :unexpected-compiler-output)
+  (let* ((*error-output* (make-string-output-stream))
+         (output (with-output-to-string (*standard-output*)
+                   (compile-file "compiler-output-test.lisp"
+                                 :print nil :verbose nil))))
+    (unless (zerop (length output))
+      (error "Unexpected output: ~S" output))))
+
+(with-test (:name :bug-493380)
+  (flet ((test (forms)
+           (catch 'debug
+             (let ((*debugger-hook* (lambda (condition if)
+                                      (throw 'debug
+                                        (if (typep condition 'serious-condition)
+                                            :debug
+                                            :oops)))))
+               (multiple-value-bind (warned failed) (ctu:file-compile forms)
+                 (when (and warned failed)
+                   :failed))))))
+    (assert (eq :failed (test "(defun")))
+    (assert (eq :failed (test "(defun no-pkg::foo ())")))
+    (assert (eq :failed (test "(cl:no-such-sym)")))
+    (assert (eq :failed (test "...")))))
+
+(defun cmacro-signals-error () :fun)
+(define-compiler-macro cmacro-signals-error () (error "oops"))
+
+(with-test (:name :cmacro-signals-error)
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda () (cmacro-signals-error)))
+    (assert (and fun warn fail))
+    (assert (eq :fun (funcall fun)))))
+
+(defun cmacro-with-simple-key (&key a)
+  (format nil "fun=~A" a))
+(define-compiler-macro cmacro-with-simple-key (&whole form &key a)
+  (if (constantp a)
+      (format nil "cmacro=~A" (eval a))
+      form))
+
+(with-test (:name (:cmacro-with-simple-key :no-key))
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda () (cmacro-with-simple-key)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "cmacro=NIL" (funcall fun)))))
+
+(with-test (:name (:cmacro-with-simple-key :constant-key))
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda () (cmacro-with-simple-key :a 42)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "cmacro=42" (funcall fun)))))
+
+(with-test (:name (:cmacro-with-simple-key :variable-key))
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda (x) (cmacro-with-simple-key x 42)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "fun=42" (funcall fun :a)))))
+
+(defun cmacro-with-nasty-key (&key ((nasty-key var)))
+  (format nil "fun=~A" var))
+(define-compiler-macro cmacro-with-nasty-key (&whole form &key ((nasty-key var)))
+  (if (constantp var)
+      (format nil "cmacro=~A" (eval var))
+      form))
+
+(with-test (:name (:cmacro-with-nasty-key :no-key))
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda () (cmacro-with-nasty-key)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "cmacro=NIL" (funcall fun)))))
+
+(with-test (:name (:cmacro-with-nasty-key :constant-key))
+  ;; This bogosity is thanks to cmacro lambda lists being /macro/ lambda
+  ;; lists.
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda () (cmacro-with-nasty-key 'nasty-key 42)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "fun=42" (funcall fun)))))
+
+(with-test (:name (:cmacro-with-nasty-key :variable-key))
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda (nasty-key) (cmacro-with-nasty-key nasty-key 42)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "fun=42" (funcall fun 'nasty-key)))))
+
+(defconstant tricky-key 'tricky-key)
+(defun cmacro-with-tricky-key (&key ((tricky-key var)))
+  (format nil "fun=~A" var))
+(define-compiler-macro cmacro-with-tricky-key (&whole form &key ((tricky-key var)))
+  (if (constantp var)
+      (format nil "cmacro=~A" (eval var))
+      form))
+
+(with-test (:name (:cmacro-with-tricky-key :no-key))
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda () (cmacro-with-tricky-key)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "cmacro=NIL" (funcall fun)))))
+
+(with-test (:name (:cmacro-with-tricky-key :constant-quoted-key))
+  ;; This bogosity is thanks to cmacro lambda lists being /macro/ lambda
+  ;; lists.
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda () (cmacro-with-tricky-key 'tricky-key 42)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "fun=42" (funcall fun)))))
+
+(with-test (:name (:cmacro-with-tricky-key :constant-unquoted-key))
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda () (cmacro-with-tricky-key tricky-key 42)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "cmacro=42" (funcall fun)))))
+
+(with-test (:name (:cmacro-with-tricky-key :variable-key))
+  (multiple-value-bind (fun warn fail)
+      (compile nil `(lambda (x) (cmacro-with-tricky-key x 42)))
+    (assert (and (not warn) (not fail)))
+    (assert (string= "fun=42" (funcall fun 'tricky-key)))))
 
 ;;;; tests not in the problem domain, but of the consistency of the
 ;;;; compiler machinery itself
@@ -1233,14 +1476,6 @@
           (grovel-results name))))))
 (identify-suspect-vops)
 
-;;;; tests for compiler output
-(let* ((*error-output* (make-broadcast-stream))
-       (output (with-output-to-string (*standard-output*)
-                 (compile-file "compiler-output-test.lisp"
-                               :print nil :verbose nil))))
-  (print output)
-  (assert (zerop (length output))))
-
 ;;;; bug 305: INLINE/NOTINLINE causing local ftype to be lost
 
 (define-condition optimization-error (error) ())
@@ -1647,6 +1882,7 @@
                            (list &whole x)))
               (program-error ()
                 :ok))))
+#+sb-eval
 (assert (eq :ok
             (handler-case
                 (let ((*evaluator-mode* :interpret))
@@ -1665,7 +1901,7 @@
                  (defmacro macro-no-env ()
                    :foo))))
 
-(dolist (*evaluator-mode* '(:interpret :compile))
+(dolist (*evaluator-mode* '(#+sb-eval :interpret :compile))
   (disassemble (eval '(defun disassemble-source-form-bug (x y z)
                        (declare (optimize debug))
                        (list x y z)))))
@@ -1916,5 +2152,234 @@
 (defun test-mystery (m) (when (eq :mystery (thing-slot m)) :ok))
 (setf *mystery* :mystery)
 (assert (eq :ok (test-mystery (make-thing :slot :mystery))))
+
+;;; Singleton types can also be constant.
+(test-util:with-test (:name :propagate-singleton-types-to-eql)
+  (macrolet ((test (type value &aux (fun (gensym "FUN")))
+               `(progn
+                  (declaim (ftype (function () (values ,type &optional)) ,fun))
+                  (defun ,fun ()
+                    ',value)
+                  (lambda (x)
+                    (if (eql x (,fun))
+                        nil
+                        (eql x (,fun)))))))
+    (values
+      (test (eql foo) foo)
+      (test (integer 0 0) 0)
+      (test (double-float 0d0 0d0) 0d0)
+      (test (eql #\c) #\c))))
+
+(declaim (ftype (function () (integer 42 42)) bug-655581))
+(defun bug-655581 ()
+  42)
+(declaim (notinline bug-655581))
+(test-util:with-test (:name :bug-655581)
+  (multiple-value-bind (type derived)
+      (funcall (compile nil `(lambda ()
+                               (ctu:compiler-derived-type (bug-655581)))))
+    (assert derived)
+    (assert (equal '(integer 42 42) type))))
+
+(test-util:with-test (:name :clear-derived-types-on-set-fdefn)
+  (let ((*evaluator-mode* :compile)
+        (*derive-function-types* t))
+    (eval `(progn
+             (defun clear-derived-types-on-set-fdefn-1 ()
+               "foo")
+             (setf (symbol-function 'clear-derived-types-on-set-fdefn-1)
+                   (constantly "foobar"))
+             (defun clear-derived-types-on-set-fdefn-2 ()
+               (length (clear-derived-types-on-set-fdefn-1)))))
+    (assert (= 6 (clear-derived-types-on-set-fdefn-2)))))
+
+(test-util:with-test (:name (:bug-655126 :derive-function-types t))
+  (let ((*evaluator-mode* :compile)
+        (*derive-function-types* t))
+    (eval `(defun bug-655126 (x) x))
+    ;; Full warnings are ok due to *derive-function-types* = T.
+    (assert (eq :full-warning
+                (handler-case
+                    (eval `(defun bug-655126-2 ()
+                             (bug-655126)))
+                  ((and warning (not style-warning)) ()
+                    :full-warning))))
+    (assert (eq 'bug-655126
+                (handler-case
+                    (eval `(defun bug-655126 (x y)
+                             (cons x y)))
+                  ((and warning (not sb-kernel:redefinition-warning)) ()
+                    :oops))))
+    (assert (eq :full-warning
+                (handler-case
+                    (eval `(defun bug-655126 (x)
+                             (bug-655126 x y)))
+                  ((and warning
+                    (not style-warning)
+                    (not sb-kernel:redefinition-warning)) ()
+                    :full-warning))))))
+
+(test-util:with-test (:name (:bug-655126 :derive-function-types nil))
+  (let ((*evaluator-mode* :compile))
+    (eval `(defun bug-655126/b (x) x))
+    ;; Just style-warning here.
+    (assert (eq :style-warning
+                (handler-case
+                    (eval `(defun bug-655126-2/b ()
+                             (bug-655126/b)))
+                  (style-warning ()
+                    :style-warning))))
+    (assert (eq 'bug-655126/b
+                (handler-case
+                    (eval `(defun bug-655126/b (x y)
+                             (cons x y)))
+                  ((and warning (not sb-kernel:redefinition-warning)) ()
+                    :oops))))
+    ;; Bogus self-call is always worth a full one.
+    (assert (eq :full-warning
+                (handler-case
+                    (eval `(defun bug-655126/b (x)
+                             (bug-655126/b x y)))
+                  ((and warning
+                    (not style-warning)
+                    (not sb-kernel:redefinition-warning)) ()
+                    :full-warning))))))
+
+(test-util:with-test (:name :bug-657499)
+  ;; Don't trust derived types within the compilation unit.
+  (ctu:file-compile
+   `((declaim (optimize safety))
+     (defun bug-657499-foo ()
+       (cons t t))
+     (defun bug-657499-bar ()
+       (let ((cons (bug-657499-foo)))
+         (setf (car cons) 3)
+         cons)))
+   :load t)
+  (locally (declare (optimize safety))
+    (setf (symbol-function 'bug-657499-foo) (constantly "foobar"))
+    (assert (eq :type-error
+                (handler-case
+                    (funcall 'bug-657499-bar)
+                  (type-error (e)
+                    (assert (eq 'cons (type-error-expected-type e)))
+                    (assert (equal "foobar" (type-error-datum e)))
+                    :type-error))))))
+
+(declaim (unsigned-byte *symbol-value-test-var*))
+(defvar *symbol-value-test-var*)
+
+(declaim (unsigned-byte **global-symbol-value-test-var**))
+(defglobal **global-symbol-value-test-var** 0)
+
+(test-util:with-test (:name :symbol-value-type-derivation)
+  (let ((fun (compile
+              nil
+              `(lambda ()
+                 *symbol-value-test-var*))))
+    (assert (equal '(function () (values unsigned-byte &optional))
+                   (%simple-fun-type fun))))
+  (let ((fun (compile
+              nil
+              `(lambda ()
+                 **global-symbol-value-test-var**))))
+    (assert (equal '(function () (values unsigned-byte &optional))
+                   (%simple-fun-type fun))))
+  (let ((fun (compile
+              nil
+              `(lambda (*symbol-value-test-var*)
+                 (declare (fixnum *symbol-value-test-var*))
+                 (symbol-value '*symbol-value-test-var*))))
+        (ufix (type-specifier (specifier-type `(and unsigned-byte fixnum)))))
+    (assert (equal `(function (,ufix) (values ,ufix &optional))
+                   (%simple-fun-type fun))))
+  (let ((fun (compile
+              nil
+              `(lambda ()
+                 (declare (fixnum **global-symbol-value-test-var**))
+                 (symbol-global-value '**global-symbol-value-test-var**))))
+        (ufix (type-specifier (specifier-type `(and unsigned-byte fixnum)))))
+    (assert (equal `(function () (values ,ufix &optional))
+                   (%simple-fun-type fun)))))
+
+(test-util:with-test (:name :mv-bind-to-let-type-propagation)
+  (let ((f (compile nil `(lambda (x)
+                           (declare (optimize speed)
+                                    (type (integer 20 50) x))
+                           (< (truncate x 10) 1))))
+        (g (compile nil `(lambda (x)
+                           (declare (optimize speed)
+                                    (type (integer 20 50) x))
+                           (< (nth-value 1 (truncate x 10)) 10))))
+        (h (compile nil `(lambda (x)
+                           (declare (optimize speed)
+                                    (type (integer 20 50) x))
+                           (multiple-value-bind (q r)
+                               (truncate x 10)
+                             (declare (ignore r))
+                             (< q 1)))))
+        (type0 '(function ((integer 20 50)) (values null &optional)))
+        (type1 '(function ((integer 20 50)) (values (member t) &optional))))
+    (assert (equal type0 (sb-kernel:%simple-fun-type f)))
+    (assert (equal type1 (sb-kernel:%simple-fun-type g)))
+    (assert (equal type0 (sb-kernel:%simple-fun-type h)))))
+
+(test-util:with-test (:name :bug-308921)
+  (let ((*check-consistency* t))
+    (ctu:file-compile
+     `((let ((exported-symbols-alist
+               (loop for symbol being the external-symbols of :cl
+                     collect (cons symbol
+                                   (concatenate 'string
+                                                "#"
+                                                (string-downcase symbol))))))
+         (defun hyperdoc-lookup (symbol)
+           (cdr (assoc symbol exported-symbols-alist)))))
+     :load nil)))
+
+(test-util:with-test (:name :bug-308941)
+  (multiple-value-bind (warn fail)
+      (let ((*check-consistency* t))
+        (ctu:file-compile
+         "(eval-when (:compile-toplevel :load-toplevel :execute)
+            (defstruct foo3))
+          (defstruct bar
+            (foo #.(make-foo3)))"
+         :load nil))
+    ;; ...but the compiler should not break.
+    (assert (and warn fail))))
+
+(test-util:with-test (:name :bug-903821)
+  (let* ((fun (compile nil '(lambda (x n)
+                             (declare (sb-ext:word x)
+                              (type (integer 0 #.(1- sb-vm:n-word-bits)) n)
+                              (optimize speed))
+                             (logandc2 x (ash -1 n)))))
+         (trace-output
+          (with-output-to-string (*trace-output*)
+            (eval `(trace ,(intern (format nil "ASH-LEFT-MOD~D" sb-vm::n-word-bits) "SB-VM")))
+            (assert (= 7 (funcall fun 15 3))))))
+    (assert (string= "" trace-output))))
+
+(test-util:with-test (:name :bug-997528)
+  (let ((fun (compile nil '(lambda (x)
+                            (declare (optimize (speed 0) (space 0))
+                             (type (integer -228645653448155482 -228645653447928749) x))
+                            (floor 1.0 (the (integer -228645653448151677 -228645653448150900) x))))))
+    (multiple-value-bind (quo rem)
+        (funcall fun -228645653448151381)
+      (assert (= quo -1))
+      (assert (= rem (float -228645653448151381))))))
+
+(defmacro def-many-code-constants ()
+  `(defun many-code-constants ()
+     ,@(loop for i from 0 below 1000
+          collect `(print ,(format nil "hi-~d" i)))))
+
+(test-util:with-test (:name :many-code-constants)
+  (def-many-code-constants)
+  (assert (search "hi-999"
+                  (with-output-to-string (*standard-output*)
+                    (many-code-constants)))))
 
 ;;; success

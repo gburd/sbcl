@@ -14,14 +14,14 @@
 (use-package :sb-alien)
 
 #-(or x86 x86-64)
-(sb-ext:quit :unix-status 104)
+(sb-ext:exit :code 104)
 
 (defun run (program &rest arguments)
   (let* ((proc nil)
          (output
           (with-output-to-string (s)
             (setf proc (run-program program arguments
-                                    :search (not (eql #\. (char program 0)))
+                                    :environment (test-util::test-env)
                                     :output s)))))
     (unless (zerop (process-exit-code proc))
       (error "Bad exit code: ~S~%Output:~% ~S"
@@ -29,24 +29,23 @@
              output))
     output))
 
-(run "cc" "-O3"
-     "-I" "../src/runtime/"
-     "swap-lispobjs.c"
-     #+(and (or linux freebsd) (or x86-64 ppc mips)) "-fPIC"
-     #+(and x86-64 darwin) "-arch" #+(and x86-64 darwin) "x86_64"
-     #+darwin "-bundle" #-darwin "-shared"
-     "-o" "swap-lispobjs.so")
+(with-test (:name :swap-lispobjs/prepare :broken-on :win32)
+  (run "/bin/sh" "run-compiler.sh"
+       "-sbcl-pic" "-sbcl-shared"
+       "-O3" "-I" "../src/runtime/"
+       "swap-lispobjs.c" "-o" "swap-lispobjs.so")
 
-(load-shared-object (truename "swap-lispobjs.so"))
+  (load-shared-object (truename "swap-lispobjs.so"))
 
-(define-alien-routine try-to-zero-with-swap-lispobjs int
-  (lispobj-adress unsigned-long))
+  (define-alien-routine try-to-zero-with-swap-lispobjs int
+    (lispobj-adress unsigned-long)))
 
-(with-test (:name :swap-lispobjs)
+(with-test (:name :swap-lispobjs :fails-on :win32)
   (let ((x (cons 13 27)))
     (try-to-zero-with-swap-lispobjs
      (logandc2 (sb-kernel:get-lisp-obj-address x)
                sb-vm:lowtag-mask))
     (assert (equal x (cons 0 27)))))
 
-(delete-file "swap-lispobjs.so")
+(when (probe-file "swap-lispobjs.so")
+  (delete-file "swap-lispobjs.so"))

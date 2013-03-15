@@ -12,13 +12,17 @@
 
 (in-package "SB!IMPL")
 
+(!begin-collecting-cold-init-forms)
+
 ;;; Current deadline as internal time units or NIL.
-(defvar *deadline* nil)
 (declaim (type (or unsigned-byte null) *deadline*))
+(defvar *deadline*)
+(!cold-init-forms (setq *deadline* nil))
 
 ;;; The relative number of seconds the current deadline corresponds
 ;;; to. Used for continuing from TIMEOUT conditions.
-(defvar *deadline-seconds* nil)
+(defvar *deadline-seconds*)
+(!cold-init-forms (setq *deadline-seconds* nil))
 
 (declaim (inline seconds-to-internal-time))
 (defun seconds-to-internal-time (seconds)
@@ -39,18 +43,22 @@ not extended. Deadlines are per thread: children are unaffected by
 their parent's deadlines.
 
 Experimental."
-  (with-unique-names (deadline-seconds deadline)
+  (with-unique-names (tmp deadline-seconds deadline)
     ;; We're operating on a millisecond precision, so a single-float
     ;; is enough, and is an immediate on 64bit platforms.
-    `(let* ((,deadline-seconds (coerce ,seconds 'single-float))
+    `(let* ((,tmp ,seconds)
+            (,deadline-seconds
+              (when ,tmp
+                (coerce ,tmp 'single-float)))
             (,deadline
-             (+ (seconds-to-internal-time ,deadline-seconds)
-                (get-internal-real-time))))
+              (when ,deadline-seconds
+                (+ (seconds-to-internal-time ,deadline-seconds)
+                   (get-internal-real-time)))))
        (multiple-value-bind (*deadline* *deadline-seconds*)
            (if ,override
                (values ,deadline ,deadline-seconds)
                (let ((old *deadline*))
-                 (if (and old (< old ,deadline))
+                 (if (and old (or (not ,deadline) (< old ,deadline)))
                      (values old *deadline-seconds*)
                      (values ,deadline ,deadline-seconds))))
          ,@body))))
@@ -88,19 +96,45 @@ for calling this when a deadline is reached."
         (error 'deadline-timeout :seconds *deadline-seconds*)
       (defer-deadline (&optional (seconds *deadline-seconds*))
         :report "Defer the deadline for SECONDS more."
+        :interactive (lambda ()
+                       (sb!int:read-evaluated-form
+                        "By how many seconds shall the deadline ~
+                         be deferred?: "))
         (let* ((new-deadline-seconds (coerce seconds 'single-float))
                (new-deadline (+ (seconds-to-internal-time new-deadline-seconds)
                                 (get-internal-real-time))))
           (setf *deadline* new-deadline
-                *deadline-seconds* new-deadline-seconds)))))
+                *deadline-seconds* new-deadline-seconds)))
+      (cancel-deadline ()
+        :report "Cancel the deadline and continue."
+        (setf *deadline* nil *deadline-seconds* nil))))
   nil)
 
 (defun defer-deadline (seconds &optional condition)
   "Find the DEFER-DEADLINE restart associated with CONDITION, and
-calls it with SECONDS as argument (deferring the deadline by that many
-seconds.) Continues from the indicated restart, or returns NIL if the
-restart is not found."
+invoke it with SECONDS as argument (deferring the deadline by that many
+seconds.) Otherwise return NIL if the restart is not found."
   (try-restart 'defer-deadline condition seconds))
+
+(defun cancel-deadline (&optional condition)
+  "Find and invoke the CANCEL-DEADLINE restart associated with
+CONDITION, or return NIL if the restart is not found."
+  (try-restart 'cancel-deadline condition))
+
+(declaim (inline relative-decoded-times))
+(defun relative-decoded-times (abs-sec abs-usec)
+  #!+sb-doc
+  "Returns relative decoded times: difference between SEC and USEC and
+current real time."
+  (multiple-value-bind (now-sec now-usec)
+      (decode-internal-time (get-internal-real-time))
+    (let ((rel-sec (- abs-sec now-sec)))
+      (cond ((> now-usec abs-usec)
+             (values (max 0 (1- rel-sec))
+                     (- (+ abs-usec 1000000) now-usec)))
+            (t
+             (values (max 0 rel-sec)
+                     (- abs-usec now-usec)))))))
 
 ;;; Returns TIMEOUT-SEC, TIMEOUT-USEC, DEADLINE-SEC, DEADLINE-USEC, SIGNALP
 ;;;
@@ -157,6 +191,7 @@ it will signal a timeout condition."
                    (decode-internal-time final-timeout)
                  (multiple-value-bind (stop-sec stop-usec)
                      (decode-internal-time final-deadline)
-                   (values to-sec to-usec stop-sec stop-usec signalp)))
+                   (values (max 0 to-sec) (max 0 to-usec) stop-sec stop-usec signalp)))
                (values nil nil nil nil nil)))))))
 
+(!defun-from-collected-cold-init-forms !deadline-cold-init)

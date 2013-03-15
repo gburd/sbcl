@@ -75,7 +75,7 @@
 ;;; all pathname components
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (def!type pathname-component-tokens ()
-    '(member nil :unspecific :wild)))
+    '(member nil :unspecific :wild :unc)))
 
 (sb!xc:defstruct (pathname (:conc-name %pathname-)
                            (:constructor %make-pathname (host
@@ -126,3 +126,46 @@
                                                   name
                                                   type
                                                   version))))
+
+;;; This is used both for Unix and Windows: while we accept both
+;;; \ and / as directory separators on Windows, we print our
+;;; own always with /, which is much less confusing what with
+;;; being \ needing to be escaped.
+(defun unparse-physical-directory (pathname)
+  (declare (pathname pathname))
+  (unparse-physical-directory-list (%pathname-directory pathname)))
+
+(defun unparse-physical-directory-list (directory)
+  (declare (list directory))
+  (collect ((pieces))
+    (when directory
+      (ecase (pop directory)
+       (:absolute
+        (let ((next (pop directory)))
+          (cond ((eq :home next)
+                 (pieces "~"))
+                ((and (consp next) (eq :home (car next)))
+                 (pieces "~")
+                 (pieces (second next)))
+                ((and (plusp (length next)) (char= #\~ (char next 0)))
+                 ;; The only place we need to escape the tilde.
+                 (pieces "\\")
+                 (pieces next))
+                (next
+                 (push next directory)))
+          (pieces "/")))
+        (:relative))
+      (dolist (dir directory)
+        (typecase dir
+         ((member :up)
+          (pieces "../"))
+         ((member :back)
+          (error ":BACK cannot be represented in namestrings."))
+         ((member :wild-inferiors)
+          (pieces "**/"))
+         ((or simple-string pattern (member :wild))
+          (pieces (unparse-physical-piece dir))
+          (pieces "/"))
+         (t
+          (error "invalid directory component: ~S" dir)))))
+    (apply #'concatenate 'simple-string (pieces))))

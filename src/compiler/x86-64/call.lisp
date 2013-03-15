@@ -119,6 +119,99 @@
   (:generator 1
     nil))
 
+;;; Accessing a slot from an earlier stack frame is definite hackery.
+(define-vop (ancestor-frame-ref)
+  (:args (frame-pointer :scs (descriptor-reg))
+         (variable-home-tn :load-if nil))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:policy :fast-safe)
+  (:generator 4
+    (aver (sc-is variable-home-tn control-stack))
+    (loadw value frame-pointer
+           (frame-word-offset (tn-offset variable-home-tn)))))
+(define-vop (ancestor-frame-set)
+  (:args (frame-pointer :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:results (variable-home-tn :load-if nil))
+  (:policy :fast-safe)
+  (:generator 4
+    (aver (sc-is variable-home-tn control-stack))
+    (storew value frame-pointer
+            (frame-word-offset (tn-offset variable-home-tn)))))
+
+(macrolet ((define-frame-op
+               (suffix sc stack-sc instruction
+                &optional (ea
+                           `(make-ea :qword
+                                     :base frame-pointer
+                                     :disp (frame-byte-offset
+                                            (tn-offset variable-home-tn)))))
+               (let ((reffer (symbolicate 'ancestor-frame-ref '/ suffix))
+                     (setter (symbolicate 'ancestor-frame-set '/ suffix)))
+                 `(progn
+                    (define-vop (,reffer ancestor-frame-ref)
+                      (:results (value :scs (,sc)))
+                      (:generator 4
+                        (aver (sc-is variable-home-tn ,stack-sc))
+                        (inst ,instruction value
+                              ,ea)))
+                    (define-vop (,setter ancestor-frame-set)
+                      (:args (frame-pointer :scs (descriptor-reg))
+                             (value :scs (,sc)))
+                      (:generator 4
+                        (aver (sc-is variable-home-tn ,stack-sc))
+                        (inst ,instruction ,ea value)))))))
+  (define-frame-op double-float double-reg double-stack movsd)
+  (define-frame-op single-float single-reg single-stack movss)
+  (define-frame-op complex-double-float complex-double-reg complex-double-stack
+    movupd (ea-for-cdf-data-stack variable-home-tn frame-pointer))
+  (define-frame-op complex-single-float complex-single-reg complex-single-stack
+    movq   (ea-for-csf-data-stack variable-home-tn frame-pointer))
+  (define-frame-op signed-byte-64 signed-reg signed-stack mov)
+  (define-frame-op unsigned-byte-64 unsigned-reg unsigned-stack mov)
+  (define-frame-op system-area-pointer sap-reg sap-stack mov))
+
+(defun primitive-type-indirect-cell-type (ptype)
+  (declare (type primitive-type ptype))
+  (macrolet ((foo (&body data)
+                 `(case (primitive-type-name ptype)
+                    ,@(loop for (name stack-sc ref set) in data
+                            collect
+                            `(,name
+                               (load-time-value
+                                (list (primitive-type-or-lose ',name)
+                                      (sc-or-lose ',stack-sc)
+                                      (lambda (node block fp value res)
+                                        (sb!c::vop ,ref node block
+                                                   fp value res))
+                                      (lambda (node block fp new-val value)
+                                        (sb!c::vop ,set node block
+                                                   fp new-val value)))))))))
+    (foo (double-float double-stack
+                       ancestor-frame-ref/double-float
+                       ancestor-frame-set/double-float)
+         (single-float single-stack
+                       ancestor-frame-ref/single-float
+                       ancestor-frame-set/single-float)
+         (complex-double-float complex-double-stack
+                               ancestor-frame-ref/complex-double-float
+                               ancestor-frame-set/complex-double-float)
+         (complex-single-float complex-single-stack
+                               ancestor-frame-ref/complex-single-float
+                               ancestor-frame-set/complex-single-float)
+         (signed-byte-64 signed-stack
+                         ancestor-frame-ref/signed-byte-64
+                         ancestor-frame-set/signed-byte-64)
+         (unsigned-byte-64 unsigned-stack
+                           ancestor-frame-ref/unsigned-byte-64
+                           ancestor-frame-set/unsigned-byte-64)
+         (unsigned-byte-63 unsigned-stack
+                           ancestor-frame-ref/unsigned-byte-64
+                           ancestor-frame-set/unsigned-byte-64)
+         (system-area-pointer sap-stack
+                              ancestor-frame-ref/system-area-pointer
+                              ancestor-frame-set/system-area-pointer))))
+
 (define-vop (xep-allocate-frame)
   (:info start-lab copy-more-arg-follows)
   (:vop-var vop)
@@ -350,7 +443,7 @@
                         :disp (frame-byte-offset
                                (+ sp->fp-offset register-arg-count))))
          ;; Do the copy.
-         (inst shr rcx-tn word-shift)   ; make word count
+         (inst shr rcx-tn n-fixnum-tag-bits)   ; make word count
          (inst std)
          (inst rep)
          (inst movs :qword)
@@ -362,7 +455,7 @@
          ;; If none, then just blow out of here.
          (inst jmp :le restore-edi)
          (inst mov rcx-tn rax-tn)
-         (inst shr rcx-tn word-shift)   ; word count
+         (inst shr rcx-tn n-fixnum-tag-bits)   ; word count
          ;; Load RAX with NIL for fast storing.
          (inst mov rax-tn nil-value)
          ;; Do the store.
@@ -417,7 +510,15 @@
               register-arg-count)
       (inst cmp nargs (fixnumize register-arg-count))
       (inst jmp :g stack-values)
+      #!+#.(cl:if (cl:= sb!vm:word-shift sb!vm:n-fixnum-tag-bits) '(and) '(or))
       (inst sub rsp-tn nargs)
+      #!-#.(cl:if (cl:= sb!vm:word-shift sb!vm:n-fixnum-tag-bits) '(and) '(or))
+      (progn
+        ;; FIXME: This can't be efficient, but LEA (my first choice)
+        ;; doesn't do subtraction.
+        (inst shl nargs (- word-shift n-fixnum-tag-bits))
+        (inst sub rsp-tn nargs)
+        (inst shr nargs (- word-shift n-fixnum-tag-bits)))
       (emit-label stack-values))
     ;; dtc: this writes the registers onto the stack even if they are
     ;; not needed, only the number specified in rcx are used and have
@@ -464,16 +565,18 @@
                (= (tn-offset return-pc) return-pc-save-offset))
     (error "return-pc not on stack in standard save location?")))
 
-;;; Instead of JMPing to TARGET, CALL a trampoline that saves the
-;;; return pc and jumps. Although this is an incredibly stupid trick
-;;; the paired CALL/RET instructions are a big win.
-(defun make-local-call (target)
-  (let ((tramp (gen-label)))
-    (inst call tramp)
-    (assemble (*elsewhere*)
-      (emit-label tramp)
-      (popw rbp-tn (frame-word-offset return-pc-save-offset))
-      (inst jmp target))))
+;;; The local call convention doesn't fit that well with x86-style
+;;; calls. Emit a header for local calls to pop the return address
+;;; in the right place.
+(defun emit-block-header (start-label trampoline-label fall-thru-p alignp)
+  (when (and fall-thru-p trampoline-label)
+    (inst jmp start-label))
+  (when trampoline-label
+    (emit-label trampoline-label)
+    (popw rbp-tn (frame-word-offset return-pc-save-offset)))
+  (when alignp
+    (emit-alignment n-lowtag-bits :long-nop))
+  (emit-label start-label))
 
 ;;; Non-TR local call for a fixed number of values passed according to
 ;;; the unknown values convention.
@@ -509,7 +612,7 @@
     (trace-table-entry trace-table-call-site)
     (move rbp-tn fp)
     (note-this-location vop :call-site)
-    (make-local-call target)
+    (inst call target)
     (default-unknown-values vop values nvals node)
     (trace-table-entry trace-table-normal)))
 
@@ -530,7 +633,7 @@
     (trace-table-entry trace-table-call-site)
     (move rbp-tn fp)
     (note-this-location vop :call-site)
-    (make-local-call target)
+    (inst call target)
     (note-this-location vop :unknown-return)
     (receive-unknown-values values-start nvals start count node)
     (trace-table-entry trace-table-normal)))
@@ -557,7 +660,7 @@
     (trace-table-entry trace-table-call-site)
     (move rbp-tn fp)
     (note-this-location vop :call-site)
-    (make-local-call target)
+    (inst call target)
     (note-this-location vop :known-return)
     (trace-table-entry trace-table-normal)))
 
@@ -715,6 +818,9 @@
                               ;; Compute the number of arguments.
                               (noise '(inst mov rcx new-fp))
                               (noise '(inst sub rcx rsp-tn))
+                              #.(unless (= word-shift n-fixnum-tag-bits)
+                                  '(noise '(inst shr rcx
+                                            (- word-shift n-fixnum-tag-bits))))
                               ;; Move the necessary args to registers,
                               ;; this moves them all even if they are
                               ;; not all needed.
@@ -779,11 +885,11 @@
                           ;; there are at least 3 slots. This hack
                           ;; just adds 3 more.
                           ,(if variable
-                               '(inst sub rsp-tn (fixnumize 3)))
+                               '(inst sub rsp-tn (* 3 n-word-bytes)))
 
                           ;; Bias the new-fp for use as an fp
                           ,(if variable
-                               '(inst sub new-fp (fixnumize sp->fp-offset)))
+                               '(inst sub new-fp (* sp->fp-offset n-word-bytes)))
 
                           ;; Save the fp
                           (storew rbp-tn new-fp
@@ -1033,15 +1139,19 @@
            (inst cmp rcx-tn (fixnumize fixed))
            (inst jmp :be JUST-ALLOC-FRAME)))
 
+    ;; Create a negated copy of the number of arguments to allow us to
+    ;; use EA calculations in order to do scaled subtraction.
+    (inst mov temp rcx-tn)
+    (inst neg temp)
+
     ;; Allocate the space on the stack.
     ;; stack = rbp + sp->fp-offset - (max 3 frame-size) - (nargs - fixed)
-    (inst lea rbx-tn
+    (inst lea rsp-tn
           (make-ea :qword :base rbp-tn
+                   :index temp :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                    :disp (* n-word-bytes
                             (- (+ sp->fp-offset fixed)
                                (max 3 (sb-allocated-size 'stack))))))
-    (inst sub rbx-tn rcx-tn)  ; Got the new stack in rbx
-    (inst mov rsp-tn rbx-tn)
 
     ;; Now: nargs>=1 && nargs>fixed
 
@@ -1061,8 +1171,8 @@
 
     ;; Initialize R8 to be the end of args.
     (inst lea source (make-ea :qword :base rbp-tn
+                              :index temp :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                               :disp (* sp->fp-offset n-word-bytes)))
-    (inst sub source rbx-tn)
 
     ;; We need to copy from downwards up to avoid overwriting some of
     ;; the yet uncopied args. So we need to use R9 as the copy index
@@ -1075,7 +1185,7 @@
     (inst mov temp (make-ea :qword :base source :index copy-index))
     (inst mov (make-ea :qword :base rsp-tn :index copy-index) temp)
     (inst add copy-index n-word-bytes)
-    (inst sub rcx-tn n-word-bytes)
+    (inst sub rcx-tn (fixnumize 1))
     (inst jmp :nz COPY-LOOP)
 
     DO-REGS
@@ -1130,8 +1240,10 @@
             (keyword :scs (descriptor-reg any-reg)))
   (:result-types * *)
   (:generator 4
-     (inst mov value (make-ea :qword :base object :index index))
+     (inst mov value (make-ea :qword :base object :index index
+                              :scale (ash 1 (- word-shift n-fixnum-tag-bits))))
      (inst mov keyword (make-ea :qword :base object :index index
+                                :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                                 :disp n-word-bytes))))
 
 (define-vop (more-arg)
@@ -1145,7 +1257,8 @@
   (:generator 4
     (move value index)
     (inst neg value)
-    (inst mov value (make-ea :qword :base object :index value))))
+    (inst mov value (make-ea :qword :base object :index value
+                             :scale (ash 1 (- word-shift n-fixnum-tag-bits))))))
 
 ;;; Turn more arg (context, count) into a list.
 (define-vop (listify-rest-args)
@@ -1170,7 +1283,7 @@
       ;; Check to see whether there are no args, and just return NIL if so.
       (inst mov result nil-value)
       (inst jrcxz done)
-      (inst lea dst (make-ea :qword :base rcx :index rcx))
+      (inst lea dst (make-ea :qword :index rcx :scale (ash 2 (- word-shift n-fixnum-tag-bits))))
       (maybe-pseudo-atomic stack-allocate-p
        (allocation dst dst node stack-allocate-p list-pointer-lowtag)
        ;; Set decrement mode (successive args at lower addresses)
@@ -1187,10 +1300,11 @@
        (storew dst dst -1 list-pointer-lowtag)
        (emit-label enter)
        ;; Grab one value and stash it in the car of this cons.
-       (inst lods rax)
+       (inst mov rax (make-ea :qword :base src))
+       (inst sub src n-word-bytes)
        (storew rax dst 0 list-pointer-lowtag)
        ;; Go back for more.
-       (inst sub rcx n-word-bytes)
+       (inst sub rcx (fixnumize 1))
        (inst jmp :nz loop)
        ;; NIL out the last cons.
        (storew nil-value dst 1 list-pointer-lowtag)
@@ -1222,8 +1336,9 @@
     ;; SP at this point points at the last arg pushed.
     ;; Point to the first more-arg, not above it.
     (inst lea context (make-ea :qword :base rsp-tn
-                               :index count :scale 1
-                               :disp (- (+ (fixnumize fixed) n-word-bytes))))
+                               :index count
+                               :scale (ash 1 (- word-shift n-fixnum-tag-bits))
+                               :disp (- (* (1+ fixed) n-word-bytes))))
     (unless (zerop fixed)
       (inst sub count (fixnumize fixed)))))
 

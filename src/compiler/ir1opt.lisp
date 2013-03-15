@@ -27,8 +27,7 @@
              (and (ref-p use) (constant-p (ref-leaf use))))
            ;; check for EQL types (but not singleton numeric types)
            (let ((type (lvar-type thing)))
-             (and (member-type-p type)
-                  (eql 1 (member-type-size type)))))))
+             (values (type-singleton-p type))))))
 
 ;;; Return the constant value for an LVAR whose only use is a constant
 ;;; node.
@@ -37,14 +36,13 @@
   (let ((use  (principal-lvar-use lvar))
         (type (lvar-type lvar))
         leaf)
-    (cond ((and (ref-p use)
-                (constant-p (setf leaf (ref-leaf use))))
-           (constant-value leaf))
-          ((and (member-type-p type)
-                (eql 1 (member-type-size type)))
-           (first (member-type-members type)))
-          (t
-           (error "~S used on non-constant LVAR ~S" 'lvar-value lvar)))))
+    (if (and (ref-p use)
+             (constant-p (setf leaf (ref-leaf use))))
+        (constant-value leaf)
+        (multiple-value-bind (constantp value) (type-singleton-p type)
+          (unless constantp
+            (error "~S used on non-constant LVAR ~S" 'lvar-value lvar))
+          value))))
 
 ;;;; interface for obtaining results of type inference
 
@@ -168,7 +166,14 @@
               :specialized-element-type (array-type-specialized-element-type type))
              ;; Simple arrays cannot change at all.
              type))
+        ((union-type-p type)
+         ;; Conservative union type is an union of conservative types.
+         (let ((res *empty-type*))
+           (dolist (part (union-type-types type) res)
+             (setf res (type-union res (conservative-type part))))))
         (t
+         ;; Catch-all.
+         ;;
          ;; If the type contains some CONS types, the conservative type contains all
          ;; of them.
          (when (types-equal-or-intersect type (specifier-type 'cons))
@@ -224,7 +229,7 @@
                                 it (coerce-to-values type)))
                               (t (coerce-to-values type)))))
                dest)))))
-  (lvar-%externally-checkable-type lvar))
+  (or (lvar-%externally-checkable-type lvar) *wild-type*))
 #!-sb-fluid(declaim (inline flush-lvar-externally-checkable-type))
 (defun flush-lvar-externally-checkable-type (lvar)
   (declare (type lvar lvar))
@@ -324,8 +329,8 @@
           (dest (lvar-dest lvar)))
       (substitute-lvar internal-lvar lvar)
       (let ((cast (insert-cast-before dest lvar type policy)))
-        (use-lvar cast internal-lvar))))
-  (values))
+        (use-lvar cast internal-lvar)
+        t))))
 
 
 ;;;; IR1-OPTIMIZE
@@ -635,38 +640,57 @@
 
 ;;;; IF optimization
 
-;;; If the test has multiple uses, replicate the node when possible.
-;;; Also check whether the predicate is known to be true or false,
+;;; Utility: return T if both argument cblocks are equivalent.  For now,
+;;; detect only blocks that read the same leaf into the same lvar, and
+;;; continue to the same block.
+(defun cblocks-equivalent-p (x y)
+  (declare (type cblock x y))
+  (and (ref-p (block-start-node x))
+       (eq (block-last x) (block-start-node x))
+
+       (ref-p (block-start-node y))
+       (eq (block-last y) (block-start-node y))
+
+       (equal (block-succ x) (block-succ y))
+       (eql (ref-lvar (block-start-node x)) (ref-lvar (block-start-node y)))
+       (eql (ref-leaf (block-start-node x)) (ref-leaf (block-start-node y)))))
+
+;;; Check whether the predicate is known to be true or false,
 ;;; deleting the IF node in favor of the appropriate branch when this
 ;;; is the case.
+;;; Similarly, when both branches are equivalent, branch directly to either
+;;; of them.
+;;; Also, if the test has multiple uses, replicate the node when possible.
 (defun ir1-optimize-if (node)
   (declare (type cif node))
   (let ((test (if-test node))
         (block (node-block node)))
+    (let* ((type (lvar-type test))
+           (consequent  (if-consequent  node))
+           (alternative (if-alternative node))
+           (victim
+            (cond ((constant-lvar-p test)
+                   (if (lvar-value test) alternative consequent))
+                  ((not (types-equal-or-intersect type (specifier-type 'null)))
+                   alternative)
+                  ((type= type (specifier-type 'null))
+                   consequent)
+                  ((cblocks-equivalent-p alternative consequent)
+                   alternative))))
+      (when victim
+        (flush-dest test)
+        (when (rest (block-succ block))
+          (unlink-blocks block victim))
+        (setf (component-reanalyze (node-component node)) t)
+        (unlink-node node)
+        (return-from ir1-optimize-if (values))))
 
     (when (and (eq (block-start-node block) node)
                (listp (lvar-uses test)))
       (do-uses (use test)
         (when (immediately-used-p test use)
           (convert-if-if use node)
-          (when (not (listp (lvar-uses test))) (return)))))
-
-    (let* ((type (lvar-type test))
-           (victim
-            (cond ((constant-lvar-p test)
-                   (if (lvar-value test)
-                       (if-alternative node)
-                       (if-consequent node)))
-                  ((not (types-equal-or-intersect type (specifier-type 'null)))
-                   (if-alternative node))
-                  ((type= type (specifier-type 'null))
-                   (if-consequent node)))))
-      (when victim
-        (flush-dest test)
-        (when (rest (block-succ block))
-          (unlink-blocks block victim))
-        (setf (component-reanalyze (node-component node)) t)
-        (unlink-node node))))
+          (when (not (listp (lvar-uses test))) (return))))))
   (values))
 
 ;;; Create a new copy of an IF node that tests the value of the node
@@ -784,24 +808,35 @@
        (dolist (arg args)
          (when arg
            (setf (lvar-reoptimize arg) nil)))
-       (when info
-         (check-important-result node info)
-         (let ((fun (fun-info-destroyed-constant-args info)))
-           (when fun
-             (let ((destroyed-constant-args (funcall fun args)))
-               (when destroyed-constant-args
-                 (let ((*compiler-error-context* node))
-                   (warn 'constant-modified
-                         :fun-name (lvar-fun-name
-                                    (basic-combination-fun node)))
-                   (setf (basic-combination-kind node) :error)
-                   (return-from ir1-optimize-combination))))))
-         (let ((fun (fun-info-derive-type info)))
-           (when fun
-             (let ((res (funcall fun node)))
-               (when res
-                 (derive-node-type node (coerce-to-values res))
-                 (maybe-terminate-block node nil)))))))
+       (cond (info
+              (check-important-result node info)
+              (let ((fun (fun-info-destroyed-constant-args info)))
+                (when fun
+                  (let ((destroyed-constant-args (funcall fun args)))
+                    (when destroyed-constant-args
+                      (let ((*compiler-error-context* node))
+                        (warn 'constant-modified
+                              :fun-name (lvar-fun-name
+                                         (basic-combination-fun node)))
+                        (setf (basic-combination-kind node) :error)
+                        (return-from ir1-optimize-combination))))))
+              (let ((fun (fun-info-derive-type info)))
+                (when fun
+                  (let ((res (funcall fun node)))
+                    (when res
+                      (derive-node-type node (coerce-to-values res))
+                      (maybe-terminate-block node nil))))))
+             (t
+              ;; Check against the DEFINED-TYPE unless TYPE is already good.
+              (let* ((fun (basic-combination-fun node))
+                     (uses (lvar-uses fun))
+                     (leaf (when (ref-p uses) (ref-leaf uses))))
+                (multiple-value-bind (type defined-type)
+                    (if (global-var-p leaf)
+                        (values (leaf-type leaf) (leaf-defined-type leaf))
+                        (values nil nil))
+                  (when (and (not (fun-type-p type)) (fun-type-p defined-type))
+                    (validate-call-type node type leaf)))))))
       (:known
        (aver info)
        (dolist (arg args)
@@ -1024,50 +1059,46 @@
 ;;; syntax check, arg/result type processing, but still call
 ;;; RECOGNIZE-KNOWN-CALL, since the call might be to a known lambda,
 ;;; and that checking is done by local call analysis.
-(defun validate-call-type (call type defined-type ir1-converting-not-optimizing-p)
+(defun validate-call-type (call type fun &optional ir1-converting-not-optimizing-p)
   (declare (type combination call) (type ctype type))
-  (cond ((not (fun-type-p type))
-         (aver (multiple-value-bind (val win)
-                   (csubtypep type (specifier-type 'function))
-                 (or val (not win))))
-         ;; In the commonish case where the function has been defined
-         ;; in another file, we only get FUNCTION for the type; but we
-         ;; can check whether the current call is valid for the
-         ;; existing definition, even if only to STYLE-WARN about it.
-         (when defined-type
-           (valid-fun-use call defined-type
+  (let* ((where (when fun (leaf-where-from fun)))
+         (same-file-p (eq :defined-here where)))
+    (cond ((not (fun-type-p type))
+           (aver (multiple-value-bind (val win)
+                     (csubtypep type (specifier-type 'function))
+                   (or val (not win))))
+           ;; Using the defined-type too early is a bit of a waste: during
+           ;; conversion we cannot use the untrusted ASSERT-CALL-TYPE, etc.
+           (when (and fun (not ir1-converting-not-optimizing-p))
+             (let ((defined-type (leaf-defined-type fun)))
+               (when (and (fun-type-p defined-type)
+                          (neq fun (combination-type-validated-for-leaf call)))
+                 ;; Don't validate multiple times against the same leaf --
+                 ;; it doesn't add any information, but may generate the same warning
+                 ;; multiple times.
+                 (setf (combination-type-validated-for-leaf call) fun)
+                 (when (and (valid-fun-use call defined-type
+                                           :argument-test #'always-subtypep
+                                           :result-test nil
+                                           :lossage-fun (if same-file-p
+                                                            #'compiler-warn
+                                                            #'compiler-style-warn)
+                                           :unwinnage-fun #'compiler-notify)
+                            same-file-p)
+                   (assert-call-type call defined-type nil)
+                   (maybe-terminate-block call ir1-converting-not-optimizing-p)))))
+           (recognize-known-call call ir1-converting-not-optimizing-p))
+          ((valid-fun-use call type
                           :argument-test #'always-subtypep
                           :result-test nil
-                          :lossage-fun #'compiler-style-warn
-                          :unwinnage-fun #'compiler-notify))
-         (recognize-known-call call ir1-converting-not-optimizing-p))
-        ((valid-fun-use call type
-                        :argument-test #'always-subtypep
-                        :result-test nil
-                        ;; KLUDGE: Common Lisp is such a dynamic
-                        ;; language that all we can do here in
-                        ;; general is issue a STYLE-WARNING. It
-                        ;; would be nice to issue a full WARNING
-                        ;; in the special case of of type
-                        ;; mismatches within a compilation unit
-                        ;; (as in section 3.2.2.3 of the spec)
-                        ;; but at least as of sbcl-0.6.11, we
-                        ;; don't keep track of whether the
-                        ;; mismatched data came from the same
-                        ;; compilation unit, so we can't do that.
-                        ;; -- WHN 2001-02-11
-                        ;;
-                        ;; FIXME: Actually, I think we could
-                        ;; issue a full WARNING if the call
-                        ;; violates a DECLAIM FTYPE.
-                        :lossage-fun #'compiler-style-warn
-                        :unwinnage-fun #'compiler-notify)
-         (assert-call-type call type)
-         (maybe-terminate-block call ir1-converting-not-optimizing-p)
-         (recognize-known-call call ir1-converting-not-optimizing-p))
-        (t
-         (setf (combination-kind call) :error)
-         (values nil nil))))
+                          :lossage-fun #'compiler-warn
+                          :unwinnage-fun #'compiler-notify)
+           (assert-call-type call type)
+           (maybe-terminate-block call ir1-converting-not-optimizing-p)
+           (recognize-known-call call ir1-converting-not-optimizing-p))
+          (t
+           (setf (combination-kind call) :error)
+           (values nil nil)))))
 
 ;;; This is called by IR1-OPTIMIZE when the function for a call has
 ;;; changed. If the call is local, we try to LET-convert it, and
@@ -1089,7 +1120,9 @@
            (derive-node-type call (tail-set-type (lambda-tail-set fun))))))
       (:full
        (multiple-value-bind (leaf info)
-           (validate-call-type call (lvar-type fun-lvar) nil nil)
+           (let* ((uses (lvar-uses fun-lvar))
+                  (leaf (when (ref-p uses) (ref-leaf uses))))
+             (validate-call-type call (lvar-type fun-lvar) leaf))
          (cond ((functional-p leaf)
                 (convert-call-if-possible
                  (lvar-uses (basic-combination-fun call))
@@ -1278,7 +1311,7 @@
                               '(optimize
                                 (preserve-single-use-debug-variables 0))
                               (lexenv-policy
-                                   (combination-lexenv call)))))
+                               (combination-lexenv call)))))
   (with-ir1-environment-from-node call
     (with-component-last-block (*current-component*
                                 (block-next (node-block call)))
@@ -1689,9 +1722,7 @@
                            leaf var)))
                  t)))))
         ((and (null (rest (leaf-refs var)))
-              ;; Don't substitute single-ref variables on high-debug /
-              ;; low speed, to improve the debugging experience.
-              (policy call (< preserve-single-use-debug-variables 3))
+              (not (preserve-single-use-debug-var-p call var))
               (substitute-single-use-lvar arg var)))
         (t
          (propagate-to-refs var (lvar-type arg))))))
@@ -1706,8 +1737,13 @@
 ;;; variable, we compute the union of the types across all calls and
 ;;; propagate this type information to the var's refs.
 ;;;
-;;; If the function has an XEP, then we don't do anything, since we
-;;; won't discover anything.
+;;; If the function has an entry-fun, then we don't do anything: since
+;;; it has a XEP we would not discover anything.
+;;;
+;;; If the function is an optional-entry-point, we will just make sure
+;;; &REST lists are known to be lists. Doing the regular rigamarole
+;;; can erronously propagate too strict types into refs: see
+;;; BUG-655203-REGRESSION in tests/compiler.pure.lisp.
 ;;;
 ;;; We can clear the LVAR-REOPTIMIZE flags for arguments in all calls
 ;;; corresponding to changed arguments in CALL, since the only use in
@@ -1715,36 +1751,42 @@
 ;;; right here.
 (defun propagate-local-call-args (call fun)
   (declare (type combination call) (type clambda fun))
-  (unless (or (functional-entry-fun fun)
-              (lambda-optional-dispatch fun))
-    (let* ((vars (lambda-vars fun))
-           (union (mapcar (lambda (arg var)
-                            (when (and arg
-                                       (lvar-reoptimize arg)
-                                       (null (basic-var-sets var)))
-                              (lvar-type arg)))
-                          (basic-combination-args call)
-                          vars))
-           (this-ref (lvar-use (basic-combination-fun call))))
+  (unless (functional-entry-fun fun)
+    (if (lambda-optional-dispatch fun)
+        ;; We can still make sure &REST is known to be a list.
+        (loop for var in (lambda-vars fun)
+              do (let ((info (lambda-var-arg-info var)))
+                   (when (and info (eq :rest (arg-info-kind info)))
+                     (propagate-from-sets var (specifier-type 'list)))))
+        ;; The normal case.
+        (let* ((vars (lambda-vars fun))
+               (union (mapcar (lambda (arg var)
+                                (when (and arg
+                                           (lvar-reoptimize arg)
+                                           (null (basic-var-sets var)))
+                                  (lvar-type arg)))
+                              (basic-combination-args call)
+                              vars))
+               (this-ref (lvar-use (basic-combination-fun call))))
 
-      (dolist (arg (basic-combination-args call))
-        (when arg
-          (setf (lvar-reoptimize arg) nil)))
+          (dolist (arg (basic-combination-args call))
+            (when arg
+              (setf (lvar-reoptimize arg) nil)))
 
-      (dolist (ref (leaf-refs fun))
-        (let ((dest (node-dest ref)))
-          (unless (or (eq ref this-ref) (not dest))
-            (setq union
-                  (mapcar (lambda (this-arg old)
-                            (when old
-                              (setf (lvar-reoptimize this-arg) nil)
-                              (type-union (lvar-type this-arg) old)))
-                          (basic-combination-args dest)
-                          union)))))
+          (dolist (ref (leaf-refs fun))
+            (let ((dest (node-dest ref)))
+              (unless (or (eq ref this-ref) (not dest))
+                (setq union
+                      (mapcar (lambda (this-arg old)
+                                (when old
+                                  (setf (lvar-reoptimize this-arg) nil)
+                                  (type-union (lvar-type this-arg) old)))
+                              (basic-combination-args dest)
+                              union)))))
 
-      (loop for var in vars
-            and type in union
-            when type do (propagate-to-refs var type))))
+          (loop for var in vars
+                and type in union
+                when type do (propagate-to-refs var type)))))
 
   (values))
 
@@ -1951,6 +1993,15 @@
         (unlink-node call)
         (when vals
           (reoptimize-lvar (first vals)))
+        ;; Propagate derived types from the VALUES call to its args:
+        ;; transforms can leave the VALUES call with a better type
+        ;; than its args have, so make sure not to throw that away.
+        (let ((types (values-type-types (node-derived-type use))))
+          (dolist (val vals)
+            (when types
+              (let ((type (pop types)))
+                (assert-lvar-type val type '((type-check . 0)))))))
+        ;; Propagate declared types of MV-BIND variables.
         (propagate-to-args use fun)
         (reoptimize-call use))
       t)))
@@ -2061,17 +2112,20 @@
         (unless (eq value-type *empty-type*)
 
           ;; FIXME: Do it in one step.
-          (filter-lvar
-           value
-           (if (cast-single-value-p cast)
-               `(list 'dummy)
-               `(multiple-value-call #'list 'dummy)))
-          (filter-lvar
-           (cast-value cast)
-           ;; FIXME: Derived type.
-           `(%compile-time-type-error 'dummy
-                                      ',(type-specifier atype)
-                                      ',(type-specifier value-type)))
+          (let ((context (cons (node-source-form cast)
+                               (lvar-source (cast-value cast)))))
+            (filter-lvar
+             value
+             (if (cast-single-value-p cast)
+                 `(list 'dummy)
+                 `(multiple-value-call #'list 'dummy)))
+            (filter-lvar
+             (cast-value cast)
+             ;; FIXME: Derived type.
+             `(%compile-time-type-error 'dummy
+                                        ',(type-specifier atype)
+                                        ',(type-specifier value-type)
+                                        ',context)))
           ;; KLUDGE: FILTER-LVAR does not work for non-returning
           ;; functions, so we declare the return type of
           ;; %COMPILE-TIME-TYPE-ERROR to be * and derive the real type

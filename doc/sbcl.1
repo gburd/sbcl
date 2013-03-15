@@ -41,13 +41,13 @@ To run SBCL, type "sbcl". After startup messages a prompt
 execute it, print any values returned, give you another prompt, and
 wait for your next input.
 
-\f(C
+\f(CR
   $ sbcl
   ...[startup messages elided]...
   * (+ 1 2 3)
 
   6
-  * (quit)
+  * (exit)
 \fR
 
 Most people like to run SBCL as a subprocess under Emacs. The Emacs
@@ -77,7 +77,7 @@ The overall command line syntax is:
 
 Both \-\-end\-runtime\-options and \-\-end\-toplevel\-options are
 optional, and may be omitted. They are intended for use in situations
-where any command line options are under user control (eg. in batch
+where any command line options are under user control (e.g. in batch
 files): by using them you can prevent options intended for your
 program being accidentally processed by SBCL.
 
@@ -118,9 +118,25 @@ error SBCL will invoke ldb (if present and enabled) or else exit.
 .TP 3
 .B \-\-script <filename>
 As a runtime option equivalent to \-\-noinform \-\-disable\-ldb
-\-\-lose\-on\-corruption \-\-end\-toplevel\-options \-\-script
+\-\-lose\-on\-corruption \-\-end\-runtime\-options \-\-script
 <filename>. See the description of \-\-script as a toplevel option
 below.
+.TP 3
+.B \-\-merge\-core\-pages
+When platform support is present, provide hints to the operating
+system that identical pages may be shared between processes until they
+are written to. This can be useful to reduce the memory usage on
+systems with multiple SBCL processes started from similar but
+differently\-named core files, or from compressed cores. Without
+platform support, do nothing.
+.TP 3
+.B \-\-no-merge\-core\-pages
+Ensures that no sharing hint is provided to the operating system.
+.TP 3
+.B \-\-default\-merge\-core\-pages
+Reverts the sharing hint policy to the default: only compressed cores
+trigger hinting. Uncompressed cores are mapped directly from the core
+file, which is usually enough to ensure sharing.
 .TP 3
 .B \-\-help
 Print some basic information about SBCL, then exit.
@@ -179,12 +195,23 @@ This option disables the debugger, causing errors to print a backtrace
 and exit with status 1 instead -- which is a mode of operation better suited
 for batch processing. See the User Manual on \f(CRSB\-EXT:DISABLE\-DEBUGGER\fR for details.
 .TP 3
+.B \-\-quit
+At the end of toplevel option processing, exit SBCL with a successful
+code of zero.  Note that the effect of this option is delayed until after
+toplevel options following this one.
+.TP 3
+.B \-\-non-interactive
+This option disables the read-eval-print loop for both exceptional and
+non-exceptional reasons.  It is short for --disable-debugger and --quit in
+combination and is useful for batch uses where the special option processing
+implied by --script is not desired.
+.TP 3
 .B \-\-script <filename>
 Implies \-\-no-sysinit \-\-no-userinit \-\-disable-debugger
 \-\-end\-toplevel\-options.
 
 Causes the system to load the specified file and exit immediately
-afterwards, instead of entering the readl-eval-print loop. If the file
+afterwards, instead of entering the read-eval-print loop. If the file
 begins with a shebang line, it is ignored.
 .PP
 
@@ -432,7 +459,7 @@ been installed, the command
 .B info sbcl
 .PP
 should give you access to the complete manual. Depending on your
-installation it may also be available in HTML and PDF formats in eg.
+installation it may also be available in HTML and PDF formats in e.g.
 .IP
 .B /usr/local/share/doc/sbcl/
 .PP

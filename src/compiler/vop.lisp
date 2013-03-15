@@ -167,6 +167,11 @@
   ;; the assembler label that points to the beginning of the code for
   ;; this block, or NIL when we haven't assigned a label yet
   (%label nil)
+  ;; the assembler label that points to the trampoline for this block,
+  ;; or NIL if unassigned yet. Only meaningful for local call targets.
+  (%trampoline-label nil)
+  ;; T if the preceding block assumes it can drop thru to %label
+  (dropped-thru-to nil)
   ;; list of LOCATION-INFO structures describing all the interesting
   ;; (to the debugger) locations in this block
   (locations nil :type list))
@@ -889,7 +894,7 @@
   ;;   :SAVE-ONCE
   ;;    A TN used for saving a :NORMAL TN across function calls. The
   ;;    lifetime information slots are unitialized: get the original
-  ;;    TN our of the SAVE-TN slot and use it for conflicts. SAVE-ONCE
+  ;;    TN out of the SAVE-TN slot and use it for conflicts. SAVE-ONCE
   ;;    is like :SAVE, except that it is only save once at the single
   ;;    writer of the original TN.
   ;;
@@ -984,7 +989,7 @@
 
 ;;; The GLOBAL-CONFLICTS structure represents the conflicts for global
 ;;; TNs. Each global TN has a list of these structures, one for each
-;;; block that it is live in. In addition to repsenting the result of
+;;; block that it is live in. In addition to representing the result of
 ;;; lifetime analysis, the global conflicts structure is used during
 ;;; lifetime analysis to represent the set of TNs live at the start of
 ;;; the IR2 block.

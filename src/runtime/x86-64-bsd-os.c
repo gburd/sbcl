@@ -8,10 +8,8 @@
 #include <machine/fpu.h>
 #endif
 
-#ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-#include <mach/mach.h>
-
-kern_return_t mach_thread_init(mach_port_t thread_exception_port);
+#if defined(LISP_FEATURE_OPENBSD)
+#include <machine/fpu.h>
 #endif
 
 /* KLUDGE: There is strong family resemblance in the signal context
@@ -151,7 +149,7 @@ int arch_os_thread_init(struct thread *thread) {
 #endif
 
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-    mach_thread_init(THREAD_STRUCT_TO_EXCEPTION_PORT(thread));
+    mach_lisp_thread_init(thread);
 #endif
 
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
@@ -180,5 +178,18 @@ os_restore_fp_control(os_context_t *context)
     asm ("ldmxcsr %0" : : "m" (temp));
     /* same for x87 FPU. */
     asm ("fldcw %0" : : "m" (ex->en_cw));
+}
+#endif
+
+#if defined(LISP_FEATURE_OPENBSD)
+void
+os_restore_fp_control(os_context_t *context)
+{
+    if (context->sc_fpstate != NULL) {
+        u_int32_t mxcsr = context->sc_fpstate->fx_mxcsr & ~0x3F;
+        u_int16_t cw = context->sc_fpstate->fx_fcw;
+        asm ("ldmxcsr %0" : : "m" (mxcsr));
+        asm ("fldcw %0" : : "m" (cw));
+    }
 }
 #endif

@@ -299,6 +299,7 @@
   (defregtn zero any-reg)
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
+  (defregtn lip descriptor-reg)
   (defregtn alloc any-reg)
 
   (defregtn nargs any-reg)
@@ -323,6 +324,11 @@
      (if (static-symbol-p value)
          (sc-number-or-lose 'immediate)
          nil))))
+
+(!def-vm-support-routine boxed-immediate-sc-p (sc)
+  (or (eql sc (sc-number-or-lose 'zero))
+      (eql sc (sc-number-or-lose 'null))
+      (eql sc (sc-number-or-lose 'immediate))))
 
 ;;;; function call parameters
 
@@ -376,3 +382,7 @@
 (!def-vm-support-routine combination-implementation-style (node)
   (declare (type sb!c::combination node) (ignore node))
   (values :default nil))
+
+(defun primitive-type-indirect-cell-type (ptype)
+  (declare (ignore ptype))
+  nil)

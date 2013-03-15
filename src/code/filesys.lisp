@@ -291,11 +291,34 @@
                  (simple-file-perror note-format pathname errno)
                  (return-from query-file-system nil))))
       (let ((filename (native-namestring pathname :as-file t)))
+        #!+win32
+        (case query-for
+          ((:existence :truename)
+           (multiple-value-bind (file kind)
+               (sb!win32::native-probe-file-name filename)
+             (when (and (not file) kind)
+               (setf file filename))
+             ;; The following OR was an AND, but that breaks files like NUL,
+             ;; for which GetLongPathName succeeds yet GetFileAttributesEx
+             ;; fails to return the file kind. --DFL
+             (if (or file kind)
+                 (values
+                  (parse-native-namestring
+                   file
+                   (pathname-host pathname)
+                   (sane-default-pathname-defaults)
+                   :as-directory (eq :directory kind)))
+                 (fail "couldn't resolve ~A" filename
+                       (- (sb!win32:get-last-error))))))
+          (:write-date
+           (or (sb!win32::native-file-write-date filename)
+               (fail "couldn't query write date of ~A" filename
+                     (- (sb!win32:get-last-error))))))
+        #!-win32
         (multiple-value-bind (existsp errno ino mode nlink uid gid rdev size
                                       atime mtime)
             (sb!unix:unix-stat filename)
-          (declare (ignore ino nlink gid rdev size atime
-                           #!+win32 uid))
+          (declare (ignore ino nlink gid rdev size atime))
           (if existsp
               (case query-for
                 (:existence (nth-value
@@ -323,9 +346,7 @@
                              ;; ... but without any trailing slash.
                              :as-directory (eql (logand  mode sb!unix:s-ifmt)
                                                 sb!unix:s-ifdir))))
-                (:author
-                 #!-win32
-                 (sb!unix:uid-username uid))
+                (:author (sb!unix:uid-username uid))
                 (:write-date (+ unix-to-universal-time mtime)))
               (progn
                 ;; SBCL has for many years had a policy that a pathname
@@ -335,7 +356,6 @@
                 ;; we must distinguish cases where the symlink exists
                 ;; from ones where there's a loop in the apparent
                 ;; containing directory.
-                #!-win32
                 (multiple-value-bind (linkp ignore ino mode nlink uid gid rdev
                                             size atime mtime)
                     (sb!unix:unix-lstat filename)
@@ -446,9 +466,11 @@ or if PATHSPEC is a wild pathname."
 (defun rename-file (file new-name)
   #!+sb-doc
   "Rename FILE to have the specified NEW-NAME. If FILE is a stream open to a
-  file, then the associated file is renamed."
-  (let* ((original (truename file))
-         (original-namestring (native-namestring original :as-file t))
+file, then the associated file is renamed."
+  (let* ((original (merge-pathnames file (sane-default-pathname-defaults)))
+         (old-truename (truename original))
+         (original-namestring (native-namestring (physicalize-pathname original)
+                                                 :as-file t))
          (new-name (merge-pathnames new-name original))
          (new-namestring (native-namestring (physicalize-pathname new-name)
                                             :as-file t)))
@@ -467,7 +489,7 @@ or if PATHSPEC is a wild pathname."
                :format-arguments (list original new-name (strerror error))))
       (when (streamp file)
         (file-name file new-name))
-      (values new-name original (truename new-name)))))
+      (values new-name old-truename (truename new-name)))))
 
 (defun delete-file (file)
   #!+sb-doc
@@ -477,16 +499,91 @@ If FILE is a stream, on Windows the stream is closed immediately. On Unix
 plaforms the stream remains open, allowing IO to continue: the OS resources
 associated with the deleted file remain available till the stream is closed as
 per standard Unix unlink() behaviour."
-  (let* ((pathname (translate-logical-pathname file))
+  (let* ((pathname (translate-logical-pathname
+                    (merge-pathnames file (sane-default-pathname-defaults))))
          (namestring (native-namestring pathname :as-file t)))
-    (truename file) ; for error-checking side-effect
     #!+win32
     (when (streamp file)
       (close file))
-    (multiple-value-bind (res err) (sb!unix:unix-unlink namestring)
-      (unless res
-        (simple-file-perror "couldn't delete ~A" namestring err))))
+    (multiple-value-bind (res err)
+        #!-win32 (sb!unix:unix-unlink namestring)
+        #!+win32 (or (sb!win32::native-delete-file namestring)
+                     (values nil (- (sb!win32:get-last-error))))
+        (unless res
+          (simple-file-perror "couldn't delete ~A" namestring err))))
   t)
+
+(defun directorize-pathname (pathname)
+  (if (or (pathname-name pathname)
+          (pathname-type pathname))
+      (make-pathname :directory (append (pathname-directory pathname)
+                                        (list (file-namestring pathname)))
+                     :host (pathname-host pathname)
+                     :device (pathname-device pathname))
+      pathname))
+
+(defun delete-directory (pathspec &key recursive)
+  "Deletes the directory designated by PATHSPEC (a pathname designator).
+Returns the truename of the directory deleted.
+
+If RECURSIVE is false \(the default), signals an error unless the directory is
+empty. If RECURSIVE is true, first deletes all files and subdirectories. If
+RECURSIVE is true and the directory contains symbolic links, the links are
+deleted, not the files and directories they point to.
+
+Signals an error if PATHSPEC designates a file or a symbolic link instead of a
+directory, or if the directory could not be deleted for any reason.
+
+Both
+
+   \(DELETE-DIRECTORY \"/tmp/foo\")
+   \(DELETE-DIRECTORY \"/tmp/foo/\")
+
+delete the \"foo\" subdirectory of \"/tmp\", or signal an error if it does not
+exist or if is a file or a symbolic link."
+  (declare (type pathname-designator pathspec))
+  (let ((physical (directorize-pathname
+                   (physicalize-pathname
+                    (merge-pathnames
+                     pathspec (sane-default-pathname-defaults))))))
+    (labels ((recurse-merged (dir)
+               (lambda (sub)
+                 (recurse (merge-pathnames sub dir))))
+             (delete-merged (dir)
+               (lambda (file)
+                 (delete-file (merge-pathnames file dir))))
+             (recurse (dir)
+               (map-directory (recurse-merged dir) dir
+                              :files nil
+                              :directories t
+                              :classify-symlinks nil)
+               (map-directory (delete-merged dir) dir
+                              :files t
+                              :directories nil
+                              :classify-symlinks nil)
+               (delete-dir dir))
+             (delete-dir (dir)
+               (let ((namestring (native-namestring dir :as-file t)))
+                 (multiple-value-bind (res errno)
+                     #!+win32
+                     (or (sb!win32::native-delete-directory namestring)
+                         (values nil (- (sb!win32:get-last-error))))
+                     #!-win32
+                     (values
+                      (not (minusp (alien-funcall
+                                    (extern-alien "rmdir"
+                                                  (function int c-string))
+                                    namestring)))
+                      (get-errno))
+                     (if res
+                         dir
+                         (simple-file-perror
+                          "Could not delete directory ~A"
+                          namestring errno))))))
+      (if recursive
+          (recurse physical)
+          (delete-dir physical)))))
+
 
 (defun sbcl-homedir-pathname ()
   (let ((sbcl-home (posix-getenv "SBCL_HOME")))
@@ -498,30 +595,32 @@ per standard Unix unlink() behaviour."
                                *default-pathname-defaults*
                                :as-directory t))))
 
+(defun user-homedir-namestring (&optional username)
+  (if username
+      (sb!unix:user-homedir username)
+      (let ((env-home (posix-getenv "HOME")))
+        (if (and env-home (not (string= env-home "")))
+            env-home
+            #!-win32
+            (sb!unix:uid-homedir (sb!unix:unix-getuid))))))
+
 ;;; (This is an ANSI Common Lisp function.)
 (defun user-homedir-pathname (&optional host)
   #!+sb-doc
   "Return the home directory of the user as a pathname. If the HOME
 environment variable has been specified, the directory it designates
 is returned; otherwise obtains the home directory from the operating
-system."
+system. HOST argument is ignored by SBCL."
   (declare (ignore host))
-  (let ((env-home (posix-getenv "HOME")))
-    (values
-     (parse-native-namestring
-      (if (and env-home (not (string= env-home "")))
-          env-home
-          #!-win32
-          (sb!unix:uid-homedir (sb!unix:unix-getuid))
-          #!+win32
-          ;; Needs to bypass PARSE-NATIVE-NAMESTRING & ENSURE-TRAILING-SLASH
-          ;; What?! -- RMK, 2007-12-31
-          (return-from user-homedir-pathname
-            (sb!win32::get-folder-pathname sb!win32::csidl_profile)))
-      #!-win32 sb!impl::*unix-host*
-      #!+win32 sb!impl::*win32-host*
-      *default-pathname-defaults*
-      :as-directory t))))
+  (values
+   (parse-native-namestring
+    (or (user-homedir-namestring)
+        #!+win32
+        (sb!win32::get-folder-namestring sb!win32::csidl_profile))
+    #!-win32 sb!impl::*unix-host*
+    #!+win32 sb!impl::*win32-host*
+    *default-pathname-defaults*
+    :as-directory t)))
 
 
 ;;;; DIRECTORY
@@ -603,7 +702,8 @@ matching filenames."
            (canonicalize-directory (directory)
              (let (pieces)
                (dolist (piece directory)
-                 (if (and pieces (member piece '(:back :up)))
+                 (cond
+                    ((and pieces (member piece '(:back :up)))
                      ;; FIXME: We should really canonicalize when we construct
                      ;; pathnames. This is just wrong.
                      (case (car pieces)
@@ -615,8 +715,17 @@ matching filenames."
                        ((:relative :up :back)
                         (push piece pieces))
                        (t
-                        (pop pieces)))
-                     (push piece pieces)))
+                        (pop pieces))))
+                    ((equal piece ".")
+                     ;; This case only really matters on Windows,
+                     ;; because on POSIX, our call site (TRUENAME via
+                     ;; QUERY-FILE-SYSTEM) only passes in pathnames from
+                     ;; realpath(3), in which /./ has been removed
+                     ;; already.  Windows, however, depends on us to
+                     ;; perform this fixup. -- DFL
+                     )
+                    (t
+                     (push piece pieces))))
                (nreverse pieces))))
     (let ((name (simplify (pathname-name pathname)))
           (type (simplify (pathname-type pathname)))
@@ -645,6 +754,10 @@ matching filenames."
             (macrolet ((,iterator ()
                          `(funcall ,',one-iter)))
               ,@body)))
+       #!+win32
+       (sb!win32::native-call-with-directory-iterator
+        #'iterate ,namestring ,errorp)
+       #!-win32
        (call-with-native-directory-iterator #'iterate ,namestring ,errorp))))
 
 (defun call-with-native-directory-iterator (function namestring errorp)
@@ -676,7 +789,8 @@ matching filenames."
 
 ;;; This is our core directory access interface that we use to implement
 ;;; DIRECTORY.
-(defun map-directory (function directory &key (files t) (directories t) (errorp t))
+(defun map-directory (function directory &key (files t) (directories t)
+                      (classify-symlinks t) (errorp t))
   #!+sb-doc
   "Map over entries in DIRECTORY. Keyword arguments specify which entries to
 map over, and how:
@@ -691,24 +805,24 @@ map over, and how:
    as a file in DIRECTORY. Otherwise the pathname used is a directory
    pathname. Defaults to T.
 
+ :CLASSIFY-SYMLINKS
+   If true, the decision to call FUNCTION with the pathname of a symbolic link
+   depends on the resolution of the link: if it points to a directory, it is
+   considered a directory entry, otherwise a file entry. If false, all
+   symbolic links are considered file entries. In both cases the pathname used
+   for the symbolic link is not fully resolved, but names it as an immediate
+   child of DIRECTORY. Defaults to T.
+
  :ERRORP
    If true, signal an error if DIRECTORY does not exist, cannot be read, etc.
    Defaults to T.
-
-On platforms supporting symbolic links the decision to call FUNCTION with its
-pathname depends on the resolution of the link: if it points to a directory,
-it is considered a directory entry. Whether it is considered a file or a
-directory, the provided pathname is not fully resolved, but rather names the
-symbolic link as an immediate child of DIRECTORY.
 
 Experimental: interface subject to change."
   (declare (pathname-designator directory))
   (let* ((fun (%coerce-callable-to-fun function))
          (as-files (eq :as-files directories))
          (physical (physicalize-pathname directory))
-         ;; Not QUERY-FILE-SYSTEM :EXISTENCE, since it doesn't work on Windows
-         ;; network shares.
-         (realname (sb!unix:unix-realpath (native-namestring physical :as-file t)))
+         (realname (query-file-system physical :existence nil))
          (canonical (if realname
                         (parse-native-namestring realname
                                                  (pathname-host physical)
@@ -723,31 +837,39 @@ Experimental: interface subject to change."
                                         :as-directory (and dirp (not as-files)))
                                        physical))))
       (with-native-directory-iterator (next dirname :errorp errorp)
-       (loop for name = (next)
-             while name
-             do (let* ((full (concatenate 'string dirname name))
-                       (kind (native-file-kind full)))
-                  (when kind
-                    (case kind
-                      (:directory
-                       (when directories
-                         (map-it name t)))
-                      (:symlink
-                       (let* ((tmpname (merge-pathnames
-                                        (parse-native-namestring
-                                         name nil physical :as-directory nil)
-                                        physical))
-                              (truename (query-file-system tmpname :truename nil)))
-                         (if (or (not truename)
-                                 (or (pathname-name truename) (pathname-type truename)))
-                             (when files
-                               (funcall fun tmpname))
-                             (when directories
-                               (map-it name t)))))
-                      (t
-                       ;; Anything else parses as a file.
-                       (when files
-                         (map-it name nil)))))))))))
+        (loop
+          ;; provision for FindFirstFileExW-based iterator that should be used
+          ;; on Windows: file kind is known instantly there, so we'll have it
+          ;; returned by (next) soon.
+          (multiple-value-bind (name kind) (next)
+            (unless (or name kind) (return))
+            (unless kind
+              (setf kind (native-file-kind
+                          (concatenate 'string dirname name))))
+            (when kind
+              (case kind
+                (:directory
+                 (when directories
+                   (map-it name t)))
+                (:symlink
+                 (if classify-symlinks
+                     (let* ((tmpname (merge-pathnames
+                                      (parse-native-namestring
+                                       name nil physical :as-directory nil)
+                                      physical))
+                            (truename (query-file-system tmpname :truename nil)))
+                       (if (or (not truename)
+                               (or (pathname-name truename) (pathname-type truename)))
+                           (when files
+                             (funcall fun tmpname))
+                           (when directories
+                             (map-it name t))))
+                     (when files
+                       (map-it name nil))))
+                (t
+                 ;; Anything else parses as a file.
+                 (when files
+                   (map-it name nil)))))))))))
 
 ;;; Part of DIRECTORY: implements matching the directory spec. Calls FUNCTION
 ;;; with all DIRECTORIES that match the directory portion of PATHSPEC.
@@ -939,7 +1061,7 @@ Experimental: interface subject to change."
            ((or (null one) (eq one :unspecific)) two)
            ((or (null two) (eq two :unspecific)) one)
            ((string= one two) one)
-           (t nil)))
+           (t (return-from pathname-intersections nil))))
        (intersect-directory (one two)
          (aver (typep one '(or null (member :wild :unspecific) list)))
          (aver (typep two '(or null (member :wild :unspecific) list)))
@@ -1029,6 +1151,12 @@ Experimental: interface subject to change."
                                            (car one) (car two)) x))
                         (intersect-directory-helper (cdr one) (cdr two)))))))))
 
+
+(defun directory-pathname-p (pathname)
+  (and (pathnamep pathname)
+       (null (pathname-name pathname))
+       (null (pathname-type pathname))))
+
 (defun ensure-directories-exist (pathspec &key verbose (mode #o777))
   #!+sb-doc
   "Test whether the directories containing the specified file
@@ -1041,37 +1169,48 @@ Experimental: interface subject to change."
       (error 'simple-file-error
              :format-control "bad place for a wild pathname"
              :pathname pathspec))
-    (let ((dir (pathname-directory pathname)))
-      (loop for i from 1 upto (length dir)
-            do (let ((newpath (make-pathname
-                               :host (pathname-host pathname)
-                               :device (pathname-device pathname)
-                               :directory (subseq dir 0 i))))
-                 (unless (probe-file newpath)
-                   (let ((namestring (coerce (native-namestring newpath)
-                                             'string)))
-                     (when verbose
-                       (format *standard-output*
-                               "~&creating directory: ~A~%"
-                               namestring))
-                     (sb!unix:unix-mkdir namestring mode)
-                     (unless (probe-file newpath)
-                       (restart-case (error
-                                      'simple-file-error
-                                      :pathname pathspec
-                                      :format-control
-                                      "can't create directory ~A"
-                                      :format-arguments (list namestring))
-                         (retry ()
-                           :report "Retry directory creation."
-                           (ensure-directories-exist
-                            pathspec
-                            :verbose verbose :mode mode))
-                         (continue ()
-                           :report
-                           "Continue as if directory creation was successful."
-                           nil)))
-                     (setf created-p t)))))
+    (let* ((dir (pathname-directory pathname))
+           (*default-pathname-defaults*
+             (make-pathname :directory dir :device (pathname-device pathname)))
+          (dev (pathname-device pathname)))
+      (loop for i from (case dev (:unc 3) (otherwise 2))
+              upto (length dir)
+            do
+            (let* ((newpath (make-pathname
+                             :host (pathname-host pathname)
+                             :device dev
+                             :directory (subseq dir 0 i)))
+                   (probed (probe-file newpath)))
+              (unless (directory-pathname-p probed)
+                (let ((namestring (coerce (native-namestring newpath)
+                                          'string)))
+                  (when verbose
+                    (format *standard-output*
+                            "~&creating directory: ~A~%"
+                            namestring))
+                  (sb!unix:unix-mkdir namestring mode)
+                  (unless (directory-pathname-p (probe-file newpath))
+                    (restart-case
+                        (error
+                         'simple-file-error
+                         :pathname pathspec
+                         :format-control
+                         (if (and probed
+                                  (not (directory-pathname-p probed)))
+                             "Can't create directory ~A,~
+                                 ~%a file with the same name already exists."
+                             "Can't create directory ~A")
+                         :format-arguments (list namestring))
+                      (retry ()
+                        :report "Retry directory creation."
+                        (ensure-directories-exist
+                         pathspec
+                         :verbose verbose :mode mode))
+                      (continue ()
+                        :report
+                        "Continue as if directory creation was successful."
+                        nil)))
+                  (setf created-p t)))))
       (values pathspec created-p))))
 
 (/show0 "filesys.lisp 1000")

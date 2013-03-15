@@ -25,7 +25,7 @@ INSTALLING SBCL
     $ sh run-sbcl.sh
 
   The following command installs SBCL and related documentation under
-  the "/usr/local" directory:
+  the "/usr/local" directory (typically run as root):
 
     # INSTALL_ROOT=/usr/local sh install.sh
 
@@ -34,7 +34,11 @@ INSTALLING SBCL
     $ INSTALL_ROOT=/home/me sh install.sh
 
   In other words, "install.sh" installs SBCL under the directory named
-  by the environment variable "INSTALL_ROOT".
+  by the environment variable INSTALL_ROOT.
+
+  If INSTALL_ROOT is not specified, SBCL is installed into location
+  configured at build-time: for official binary distributions under
+  "/usr/local" directory.
 
   If you install SBCL from binary distribution in other location than
   "/usr/local", see section 1.2, "Finding ancillary files".
@@ -114,13 +118,32 @@ INSTALLING SBCL
 
     $ sh make.sh
 
+  To configure SBCL to install to a non-standard location, you can use
+  the --prefix option:
+
+    $ sh make.sh --prefix=/opt/mysbcl
+
+  This also sets the default SBCL_HOME to prefix/lib/sbcl/ for the
+  built binaries.
+
+  To configure SBCL with a non-standard default dynamic-space size,
+  use the --dynamic-space-size option:
+
+    $ sh make.sh --dynamic-space-size=4Gb
+    $ sh make.sh --dynamic-space-size=800Mb
+
+  If mega- or gigabytes are not specified, the number is taken to be
+  in megabytes. The standard default is 512Mb for 32-bit systems, and
+  1Gb for 64-bit systems (with the exception of OpenBSD where 444Mb
+  are used to fit under default ulimits.)
+
   If you don't already have an SBCL binary installed as "sbcl" on your
   system, you'll need to tell make.sh what Lisp to use as the
   cross-compilation host. For example, to use CMUCL (assuming has
   been installed under its default name "lisp") as the
   cross-compilation host:
 
-    $ sh make.sh 'lisp -batch -noinit'
+    $ sh make.sh --xc-host='lisp -batch -noinit'
 
   The build may take a long time, especially on older hardware. A
   successful build ends with a message beginning: "The build seems to
@@ -149,25 +172,43 @@ INSTALLING SBCL
   enabling or disabling features like documentation strings, threads,
   or extra debugging code.
 
-  The preferred way to do this is by creating a file
-  "customize-target-features.lisp", containing a lambda expression
-  which is applied to the default *FEATURES* set and which returns the
-  new *FEATURES* set, e.g.
+  The preferred way to do this is using commandline arguments to make.sh:
 
-    (lambda (features)
-      (flet ((enable (x)
-               (pushnew x features))
-             (disable (x)
-               (setf features (remove x features))))
-        ;; Threading support, available only on x86/x86-64 Linux, x86 Solaris
-        ;; and x86 Mac OS X (experimental).
-        (enable :sb-thread)))
+    --fancy                    Enables all supported feature enhancements.
+    --with-<feature>           Enables a specific feature.
+    --without-<feature>        Disables a specific feature.
 
-  This is the preferred way because it lets local changes interact
-  cleanly with CVS changes to the main, global source tree.
+  Some features of interest:
+
+    :SB-THREAD (--with-sb-thread, --without-sb-thread)
+
+      Native threads. Enabled by default on x86[-64] Linux only, also
+      available on x86[-64] Max OS X, x86[-64] FreeBSD, x86 Solaris,
+      and PPC Linux.
+
+      NOTE: --fancy enables threads on all platforms where they can be
+      built, even if they aren't 100% stable on that platform.
+
+    :SB-CORE-COMPRESSION (--with-sb-core-compression)
+
+      Adds zlib as a build-dependency, and makes SBCL able to save
+      compressed cores. Not enabled by default.
+
+    :SB-XREF-FOR-INTERNALS (--with-sb-xref-for-internals)
+
+      XREF data for SBCL internals. Not enabled by default, increases
+      core size by 5-6mb.
+
+    :SB-UNICODE (--without-sb-unicode)
+
+      Unicode support. Enabled by default. Disabling this feature
+      limits characters to the 8-bit ISO-8859-1 set.
 
   A catalog of available features and their meaning can be found in
   "base-target-features.lisp-expr".
+
+  Please do NOT edit base-target-features.lisp-expr in order to enable
+  or disable build features.
 
 2.3. Troubleshooting
 
@@ -243,7 +284,7 @@ INSTALLING SBCL
   Supported operating systems and architectures:
 
                            x86 x86-64 PPC Sparc Alpha MIPS MIPSel
-    Linux 2.2, 2.4, 2.6     X     X    X    X     X     X     X
+    Linux 2.6               X     X    X    X     X     X     X
     Darwin (Mac OS X)       X     X    X
     Solaris                 X               X
     FreeBSD                 X     X

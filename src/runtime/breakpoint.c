@@ -102,21 +102,21 @@ static long compute_offset(os_context_t *context, lispobj code)
     if (code == NIL)
         return 0;
     else {
-        unsigned long code_start;
+        uword_t code_start;
         struct code *codeptr = (struct code *)native_pointer(code);
 #ifdef LISP_FEATURE_HPPA
-        unsigned long pc = *os_context_pc_addr(context) & ~3;
+        uword_t pc = *os_context_pc_addr(context) & ~3;
 #else
-        unsigned long pc = *os_context_pc_addr(context);
+        uword_t pc = *os_context_pc_addr(context);
 #endif
 
-        code_start = (unsigned long)codeptr
+        code_start = (uword_t)codeptr
             + HeaderValue(codeptr->header)*sizeof(lispobj);
         if (pc < code_start)
             return 0;
         else {
-            unsigned long offset = pc - code_start;
-            if (offset >= codeptr->code_size)
+            uword_t offset = pc - code_start;
+            if (offset >= (N_WORD_BYTES * fixnum_value(codeptr->code_size)))
                 return 0;
             else
                 return make_fixnum(offset);
@@ -130,7 +130,9 @@ void handle_breakpoint(os_context_t *context)
 
     fake_foreign_function_call(context);
 
+#ifndef LISP_FEATURE_SB_SAFEPOINT
     unblock_gc_signals(0, 0);
+#endif
     context_sap = alloc_sap(context);
     code = find_code(context);
 
@@ -155,7 +157,9 @@ void *handle_fun_end_breakpoint(os_context_t *context)
 
     fake_foreign_function_call(context);
 
+#ifndef LISP_FEATURE_SB_SAFEPOINT
     unblock_gc_signals(0, 0);
+#endif
     context_sap = alloc_sap(context);
     code = find_code(context);
     codeptr = (struct code *)native_pointer(code);
@@ -173,9 +177,16 @@ void *handle_fun_end_breakpoint(os_context_t *context)
 
     lra = codeptr->constants[REAL_LRA_SLOT];
 
+#ifdef LISP_FEATURE_PPC
+    /* PPC now passes LRA objects in reg_LRA during return.  Other
+     * platforms should as well, but haven't been fixed yet. */
+    if (codeptr->constants[KNOWN_RETURN_P_SLOT] == NIL)
+        *os_context_register_addr(context, reg_LRA) = lra;
+#else
 #ifdef reg_CODE
     if (codeptr->constants[KNOWN_RETURN_P_SLOT] == NIL)
         *os_context_register_addr(context, reg_CODE) = lra;
+#endif
 #endif
 
     undo_fake_foreign_function_call(context);

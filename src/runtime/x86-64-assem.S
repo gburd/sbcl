@@ -25,7 +25,7 @@
 #include "genesis/thread.h"
 	
 /* Minimize conditionalization for different OS naming schemes. */
-#if defined __linux__  || defined __FreeBSD__ || defined __OpenBSD__ || defined __NetBSD__ || defined __sun
+#if defined __linux__  || defined __FreeBSD__ || defined __OpenBSD__ || defined __NetBSD__ || defined __sun || defined _WIN64
 #define GNAME(var) var
 #else
 #define GNAME(var) _##var
@@ -33,15 +33,17 @@
 
 /* Get the right type of alignment. Linux, FreeBSD and OpenBSD
  * want alignment in bytes. */
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined __NetBSD__ || defined(__sun)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined __NetBSD__ || defined(__sun) || defined _WIN64
 #define align_4byte	4
 #define align_8byte	8
 #define align_16byte	16
 #define align_32byte	32
+#define align_page	32768
 #else
 #define	align_4byte	2
 #define	align_8byte	3
 #define	align_16byte	4	
+#define	align_page	15
 #endif			
 
 /*
@@ -67,7 +69,7 @@
  * for this instruction in the SIGILL handler and if we see it, we
  * advance the EIP by two bytes to skip over ud2 instruction and
  * call sigtrap_handler. */
-#if defined(LISP_FEATURE_DARWIN)
+#if defined(LISP_FEATURE_UD2_BREAKPOINTS)
 #define TRAP ud2
 #else
 #define TRAP int3
@@ -154,12 +156,23 @@ GNAME(call_into_lisp_first_time):
  * return values in rax rdx
  * callee saves rbp rbx r12-15 if it uses them
  */
-	
+#ifdef LISP_FEATURE_WIN32
+# define SUPPORT_FOMIT_FRAME_POINTER
+#endif
 	.align	align_16byte,0x90
 GNAME(call_into_lisp):
+#ifdef SUPPORT_FOMIT_FRAME_POINTER
+	mov	%rbp,%rax
+#endif
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
 Lstack:
+#ifdef SUPPORT_FOMIT_FRAME_POINTER
+	/* If called through call_into_lisp_first_time, %r15 becomes invalid
+	 * here, but we will not return in that case. */
+	push	%r15
+	mov	%rax,%r15
+#endif
 	/* FIXME x86 saves FPU state here */
 	push	%rbx  	# these regs are callee-saved according to C
 	push	%r12	# so must be preserved and restored when 
@@ -174,6 +187,13 @@ Lstack:
 	push	%rsi	#
 	push	%rdx	#
 #ifdef LISP_FEATURE_SB_THREAD
+# ifdef SUPPORT_FOMIT_FRAME_POINTER
+	mov	(%rbp),%rcx
+	sub	$32,%rsp
+	call	GNAME(carry_frame_pointer)
+	add	$32,%rsp
+	mov	%rax,(%rbp)
+# endif
 #ifdef LISP_FEATURE_GCC_TLS
 	movq	%fs:0, %rax
 	movq	GNAME(current_thread)@TPOFF(%rax), %r12
@@ -194,7 +214,7 @@ Lstack:
 	xor	%rdx,%rdx	# clear any descriptor registers 
 	xor	%rdi,%rdi	# that we can't be sure we'll 
 	xor	%rsi,%rsi	# initialise properly.  XX do r8-r15 too?
-	shl	$3,%rcx		# (fixnumize num-args)
+	shl	$(N_FIXNUM_TAG_BITS),%rcx	# (fixnumize num-args)
 	cmp	$0,%rcx
 	je	Ldone
 	mov	0(%rbx),%rdx	# arg0
@@ -236,7 +256,13 @@ LsingleValue:
 /* FIXME Restore the NPX state. */
 
 	mov	%rdx,%rax	# c-val
+#ifdef SUPPORT_FOMIT_FRAME_POINTER
+	mov	%r15,%rbp	# orig rbp
+	pop	%r15		# orig r15
+	add	$8,%rsp		# no need for saved (overridden) rbp
+#else
 	leave
+#endif
 	ret
 	SIZE(GNAME(call_into_lisp))
 
@@ -266,6 +292,7 @@ GNAME(fpu_restore):
 	.globl  GNAME(undefined_tramp)
 	TYPE(GNAME(undefined_tramp))
 GNAME(undefined_tramp):
+	pop	8(%rbp)         # Save return PC for backtrace.
 	TRAP
 	.byte	trap_Error
         .byte   2
@@ -274,14 +301,40 @@ GNAME(undefined_tramp):
 	ret
 	SIZE(GNAME(undefined_tramp))
 
+/* KLUDGE: FIND-ESCAPED-FRAME (SYS:SRC;CODE;DEBUG-INT.LISP) needs
+ * to know the name of the function immediately following the
+ * undefined-function trampoline. */
+
+/* Our call-site does not take care of caller-saved xmm registers, so it
+ * falls to us spill them beforing hopping into C.
+ *
+ * We simply save all of them.
+ *
+ * (But for the sake of completeness, here is my understanding of the specs:)
+ *                     System V       Microsoft
+ * argument passing    xmm0-7         xmm0-3
+ * caller-saved        xmm8-15        xmm4-5
+ * callee-saved        -              xmm6-15
+ *
+ *  --DFL */
+
+#define stkxmmsave(n) movaps %xmm##n, n*16(%rsp)
+#define stkxmmload(n) movaps n*16(%rsp), %xmm##n
+#define map_all_xmm(op) \
+	op(0);op(1);op(2);op(3);op(4);op(5);op(6);op(7); \
+    op(8);op(9);op(10);op(11);op(12);op(13);op(14);op(15);
 
 	.text
 	.align	align_16byte,0x90
 	.globl  GNAME(alloc_tramp)
 	TYPE(GNAME(alloc_tramp))
 GNAME(alloc_tramp):
+	cld
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
+	and	$-32,%rsp
+	sub	$16*16,%rsp
+	map_all_xmm(stkxmmsave)
 	push	%rax
 	push	%rcx
 	push	%rdx
@@ -291,9 +344,11 @@ GNAME(alloc_tramp):
 	push	%r9
 	push	%r10
 	push	%r11
-	mov	16(%rbp),%rdi	
+	push	%r11
+	mov	16(%rbp),%rdi
 	call	GNAME(alloc)
 	mov	%rax,16(%rbp)
+	pop	%r11
 	pop	%r11
 	pop	%r10
 	pop	%r9
@@ -303,6 +358,8 @@ GNAME(alloc_tramp):
 	pop	%rdx
 	pop	%rcx
 	pop	%rax
+	map_all_xmm(stkxmmload)
+	mov	%rbp,%rsp
 	pop	%rbp
 	ret
 	SIZE(GNAME(alloc_tramp))
@@ -330,7 +387,7 @@ GNAME(closure_tramp):
 	.align	align_16byte,0x90
 	.globl  GNAME(funcallable_instance_tramp)
 #if !defined(LISP_FEATURE_DARWIN)
-        .type	GNAME(funcallable_instance_tramp),@function
+	TYPE(GNAME(funcallable_instance_tramp))
 #endif
         GNAME(funcallable_instance_tramp):
 	mov	FUNCALLABLE_INSTANCE_FUNCTION_OFFSET(%rax),%rax
@@ -338,11 +395,17 @@ GNAME(closure_tramp):
 	 * now, the first word of it contains the address to jump to. */
 	jmp	*CLOSURE_FUN_OFFSET(%rax)
 #if !defined(LISP_FEATURE_DARWIN)
-	.size	GNAME(funcallable_instance_tramp), .-GNAME(funcallable_instance_tramp)
+	SIZE(GNAME(funcallable_instance_tramp))
 #endif
 /*
  * fun-end breakpoint magic
  */
+
+/*
+ * For an explanation of the magic involved in function-end
+ * breakpoints, see the implementation in ppc-assem.S.
+ */
+
 	.text
 	.globl 	GNAME(fun_end_breakpoint_guts)
 	.align	align_16byte
@@ -415,7 +478,17 @@ GNAME(post_signal_tramp):
 	.align	align_16byte,0x90
 	.globl  GNAME(fast_bzero)
 	TYPE(GNAME(fast_bzero))
-        
+
+	#ifdef LISP_FEATURE_WIN32
+	#define xmmreg xmm7
+	#define redsave(reg,off) movups reg,-off(%rsp)
+	#define redrestore(reg,off) movups -off(%rsp),reg
+	#else
+	#define xmmreg xmm0
+	#define redsave(reg,off)
+	#define redrestore(reg,off)
+	#endif
+
 GNAME(fast_bzero):
         /* A fast routine for zero-filling blocks of memory that are
          * guaranteed to start and end at a 4096-byte aligned address.
@@ -423,10 +496,10 @@ GNAME(fast_bzero):
         shr $6, %rsi              /* Amount of 64-byte blocks to copy */
         jz Lend                   /* If none, stop */
         mov %rsi, %rcx            /* Save start address */
-        movups %xmm7, -16(%rsp)   /* Save XMM register */
-        xorps  %xmm7, %xmm7       /* Zero the XMM register */
+	redsave(%xmmreg,16)
+        xorps  %xmmreg, %xmmreg       /* Zero the XMM register */
         jmp Lloop
-        .align align_16byte                 
+        .align align_16byte
 Lloop:
 
         /* Copy the 16 zeroes from xmm7 to memory, 4 times. MOVNTDQ is the
@@ -434,21 +507,95 @@ Lloop:
          * we're touching are not fetched into the L1 cache, since we're just
          * going to overwrite the memory soon anyway.
          */
-        movntdq %xmm7, 0(%rdi)
-        movntdq %xmm7, 16(%rdi)
-        movntdq %xmm7, 32(%rdi)
-        movntdq %xmm7, 48(%rdi)
+        movntdq %xmmreg, 0(%rdi)
+        movntdq %xmmreg, 16(%rdi)
+        movntdq %xmmreg, 32(%rdi)
+        movntdq %xmmreg, 48(%rdi)
 
         add $64, %rdi  /* Advance pointer */
         dec %rsi       /* Decrement 64-byte block count */
         jnz Lloop
         mfence         /* Ensure that the writes are globally visible, since
                         * MOVNTDQ is weakly ordered */
-        movups -16(%rsp), %xmm7 /* Restore the XMM register */
+	redrestore(%xmmreg,16)
         prefetcht0 0(%rcx)      /* Prefetch the start of the block into cache,
                                  * since it's likely to be used immediately. */
 Lend:        
 	ret
 	SIZE(GNAME(fast_bzero))
 
+
+/* When LISP_FEATURE_C_STACK_IS_CONTROL_STACK, we cannot safely scrub
+ * the control stack from C, largely due to not knowing where the
+ * active stack frame ends.  On such platforms, we reimplement the
+ * core scrubbing logic in assembly, in this case here:
+ */
+	.text
+	.align	align_16byte,0x90
+	.globl GNAME(arch_scrub_control_stack)
+	TYPE(GNAME(arch_scrub_control_stack))
+GNAME(arch_scrub_control_stack):
+	/* We are passed three parameters:
+	 * A (struct thread *) in RDI,
+	 * the address of the guard page in RSI, and
+	 * the address of the hard guard page in RDX.
+	 * We may trash RAX, RCX, and R8-R11 with impunity.
+	 * [RSP] is our return address, [RSP-8] is the first
+	 * stack slot to scrub. */
+
+	/* We start by setting up our scrub pointer in RAX, our
+	 * guard page upper bound in R8, and our hard guard
+	 * page upper bound in R9. */
+	lea	-8(%rsp), %rax
+#ifdef LISP_FEATURE_DARWIN
+	mov	GSYM(GNAME(os_vm_page_size)),%r9
+#else
+	mov	os_vm_page_size,%r9
+#endif
+	lea	(%rsi,%r9), %r8
+	lea	(%rdx,%r9), %r9
+
+	/* Now we begin our main scrub loop. */
+ascs_outer_loop:
+
+	/* If we're about to scrub the hard guard page, exit. */
+	cmp	%r9, %rax
+	jae	ascs_check_guard_page
+	cmp	%rax, %rdx
+	jbe	ascs_finished
+
+ascs_check_guard_page:
+	/* If we're about to scrub the guard page, and the guard
+	 * page is protected, exit. */
+	cmp	%r8, %rax
+	jae	ascs_clear_loop
+	cmp	%rax, %rsi
+	ja	ascs_clear_loop
+	cmpq	$(NIL), THREAD_CONTROL_STACK_GUARD_PAGE_PROTECTED_OFFSET(%rdi)
+	jne	ascs_finished
+
+	/* Clear memory backwards to the start of the (4KiB) page */
+ascs_clear_loop:
+	movq	$0, (%rax)
+	test	$0xfff, %rax
+	lea	-8(%rax), %rax
+	jnz	ascs_clear_loop
+
+	/* If we're about to hit the hard guard page, exit. */
+	cmp	%r9, %rax
+	jae	ascs_finished
+
+	/* If the next (previous?) 4KiB page contains a non-zero
+	 * word, continue scrubbing. */
+ascs_check_loop:
+	testq	$-1, (%rax)
+	jnz	ascs_outer_loop
+	test	$0xfff, %rax
+	lea	-8(%rax), %rax
+	jnz	ascs_check_loop
+
+ascs_finished:
+	ret
+	SIZE(GNAME(arch_scrub_control_stack))
+
         END()

@@ -44,7 +44,7 @@
     (inst jmp :ne done)
 
     ;; Pick off fixnums.
-    (inst and al-tn 3)
+    (inst and al-tn fixnum-tag-mask)
     (inst jmp :e done)
 
     ;; must be an other immediate
@@ -135,17 +135,6 @@
     ;; fixnum.
     (inst and res (lognot lowtag-mask))
     (inst shr res 1)))
-
-(define-vop (make-other-immediate-type)
-  (:args (val :scs (any-reg descriptor-reg) :target res)
-         (type :scs (unsigned-reg immediate)))
-  (:results (res :scs (any-reg descriptor-reg) :from (:argument 0)))
-  (:generator 2
-    (move res val)
-    (inst shl res (- n-widetag-bits 2))
-    (inst or res (sc-case type
-                   (unsigned-reg type)
-                   (immediate (tn-value type))))))
 
 ;;;; allocation
 
@@ -254,6 +243,13 @@
   (:generator 1
     (inst break pending-interrupt-trap)))
 
+#!+sb-safepoint
+(define-vop (insert-safepoint)
+  (:policy :fast-safe)
+  (:translate sb!kernel::gc-safepoint)
+  (:generator 0
+    (emit-safepoint)))
+
 #!+sb-thread
 (defknown current-thread-offset-sap ((unsigned-byte 32))
   system-area-pointer (flushable))
@@ -263,10 +259,19 @@
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:translate current-thread-offset-sap)
-  (:args (n :scs (unsigned-reg) :target sap))
+  (:args (n :scs (unsigned-reg)
+            #!+win32 #!+win32 :to :save
+            #!-win32 #!-win32 :target sap))
   (:arg-types unsigned-num)
   (:policy :fast-safe)
   (:generator 2
+    #!+win32
+    (progn
+      ;; Note that SAP conflicts with N in this case, hence the reader
+      ;; conditionals above.
+      (inst mov sap (make-ea :dword :disp +win32-tib-arbitrary-field-offset+) :fs)
+      (inst mov sap (make-ea :dword :base sap :disp 0 :index n :scale 4)))
+    #!-win32
     (inst mov sap (make-ea :dword :disp 0 :index n :scale 4) :fs)))
 
 (define-vop (halt)
@@ -352,3 +357,42 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (:info index)
   (:generator 0
     (inst inc (make-ea-for-vector-data count-vector :offset index))))
+
+;;;; Memory barrier support
+
+#!+memory-barrier-vops
+(define-vop (%compiler-barrier)
+  (:policy :fast-safe)
+  (:translate %compiler-barrier)
+  (:generator 3))
+
+#!+memory-barrier-vops
+(define-vop (%memory-barrier)
+  (:policy :fast-safe)
+  (:translate %memory-barrier)
+  (:generator 3
+    (inst add (make-ea :dword :base esp-tn) 0 :lock)))
+
+#!+memory-barrier-vops
+(define-vop (%read-barrier)
+  (:policy :fast-safe)
+  (:translate %read-barrier)
+  (:generator 3))
+
+#!+memory-barrier-vops
+(define-vop (%write-barrier)
+  (:policy :fast-safe)
+  (:translate %write-barrier)
+  (:generator 3))
+
+#!+memory-barrier-vops
+(define-vop (%data-dependency-barrier)
+  (:policy :fast-safe)
+  (:translate %data-dependency-barrier)
+  (:generator 3))
+
+(define-vop (pause)
+  (:translate spin-loop-hint)
+  (:policy :fast-safe)
+  (:generator 0
+    (inst pause)))

@@ -284,11 +284,13 @@ return zero values.
 
 @item
 @cindex External formats
-The foreign type specifier @code{(sb-alien:c-string &key external-format
-element-type)} is similar to @code{(* char)}, but is interpreted as a
-null-terminated string, and is automatically converted into a Lisp
-string when accessed; or if the pointer is C @code{NULL} or @code{0},
-then accessing it gives Lisp @code{nil}.
+The foreign type specifier @code{(sb-alien:c-string &key
+external-format element-type not-null)} is similar to
+@code{(* char)}, but is interpreted as a null-terminated string, and
+is automatically converted into a Lisp string when accessed; or if the
+pointer is C @code{NULL} or @code{0}, then accessing it gives Lisp
+@code{nil} unless @code{not-null} is true, in which case a type-error
+is signalled.
 
 External format conversion is automatically done when Lisp strings are
 passed to foreign code, or when foreign strings are passed to Lisp code.
@@ -340,13 +342,17 @@ the variable.
 
 @item
 @code{sb-alien} also exports translations of these C type
-specifiers as foreign type specifiers: @code{sb-alien:char},
-@code{sb-alien:short}, @code{sb-alien:int},
-@code{sb-alien:long}, @code{sb-alien:unsigned-char},
-@code{sb-alien:unsigned-short},
-@code{sb-alien:unsigned-int},
-@code{sb-alien:unsigned-long}, @code{sb-alien:float}, and
-@code{sb-alien:double}.
+specifiers as foreign type specifiers:
+@code{char},
+@code{short},
+@code{int},
+@code{long},
+@code{unsigned-char},
+@code{unsigned-short},
+@code{unsigned-int},
+@code{unsigned-long},
+@code{float}, @code{double},
+@code{size-t}, and @code{off-t}.
 
 @end itemize
 
@@ -369,8 +375,7 @@ to dynamically allocate and free foreign variables.
 @comment  node-name,  next,  previous,  up
 @subsection Accessing Foreign Values
 
-@defun sb-alien:deref @var{pointer-or-array} &rest @var{indices}
-@findex deref
+@defun @sbalien{deref} @var{pointer-or-array} &rest @var{indices}
 
 The @code{sb-alien:deref} function returns the value pointed to by a
 foreign pointer, or the value of a foreign array element. When
@@ -382,8 +387,7 @@ array type. @code{deref} can be set with @code{setf} to assign a new
 value.
 @end defun
 
-@defun sb-alien:slot @var{struct-or-union} @var{slot-name}
-@findex slot
+@defun @sbalien{slot} @var{struct-or-union} @var{slot-name}
 
 The @code{sb-alien:slot} function extracts the value of the slot named
 @var{slot-name} from a foreign @code{struct} or @code{union}. If
@@ -405,23 +409,20 @@ to and from integers - raw machine addresses.  They should thus be
 used with caution; corrupting the Lisp heap or other memory with
 @acronym{SAP}s is trivial.
 
-@defun sb-sys:int-sap @var{machine-address}
-@findex int-sap
+@defun @sbsys{int-sap} @var{machine-address}
 
 Creates a @acronym{SAP} pointing at the virtual address
 @var{machine-address}.
 @end defun
 
-@defun sb-sys:sap-ref-32 @var{sap} @var{offset}
-@findex sap-ref-32
+@defun @sbsys{sap-ref-32} @var{sap} @var{offset}
 
 Access the value of the memory location at @var{offset} bytes from
 @var{sap}.  This form may also be used with @code{setf} to alter the
 memory at that location.
 @end defun
 
-@defun sb-sys:sap= @var{sap1} @var{sap2}
-@findex sap=
+@defun @sbsys{sap=} @var{sap1} @var{sap2}
 
 Compare @var{sap1} and @var{sap2} for equality.
 @end defun
@@ -439,37 +440,33 @@ use @code{apropos} and @code{describe} for more details
 @comment  node-name,  next,  previous,  up
 @subsection Coercing Foreign Values
 
-@defun sb-alien:addr @var{alien-expr}
-@findex addr
+@defmac @sbalien{addr} @var{alien-expr}
 
 The @code{sb-alien:addr} macro returns a pointer to the location
 specified by @var{alien-expr}, which must be either a foreign
 variable, a use of @code{sb-alien:deref}, a use of
 @code{sb-alien:slot}, or a use of @code{sb-alien:extern-alien}.
-@end defun
+@end defmac
 
-@defun sb-alien:cast @var{foreign-value} @var{new-type}
-@findex cast
+@defmac @sbalien{cast} @var{foreign-value} @var{new-type}
 
 The @code{sb-alien:cast} macro converts @var{foreign-value} to a new
 foreign value with the specified @var{new-type}. Both types, old and
 new, must be foreign pointer, array or function types.  Note that the
 resulting Lisp foreign variable object is not @code{eq} to the
 argument, but it does refer to the same foreign data bits.
-@end defun
+@end defmac
 
-@defun sb-alien:sap-alien @var{sap} @var{type}
-@findex sap-alien
+@defmac @sbalien{sap-alien} @var{sap} @var{type}
 
-The @code{sb-alien:sap-alien} function converts @var{sap} (a system
+The @code{sb-alien:sap-alien} macro converts @var{sap} (a system
 area pointer) to a foreign value with the specified
 @var{type}. @var{type} is not evaluated.
 
 The @var{type} must be some foreign pointer, array, or record type.
-@end defun
+@end defmac
 
-@defun sb-alien:alien-sap @var{foreign-value}
-@findex alien-sap
+@defun @sbalien{alien-sap} @var{foreign-value}
 
 The @code{sb-alien:alien-sap} function returns the @acronym{SAP} which
 points to @var{alien-value}'s data.
@@ -484,62 +481,15 @@ record type.
 @subsection Foreign Dynamic Allocation
 
 Lisp code can call the C standard library functions @code{malloc} and
-@code{free} to dynamically allocate and deallocate foreign
-variables. The Lisp code shares the same allocator with foreign C
-code, so it's OK for foreign code to call @code{free} on the result of
-Lisp @code{sb-alien:make-alien}, or for Lisp code to call
-@code{sb-alien:free-alien} on foreign objects allocated by C
-code.
+@code{free} to dynamically allocate and deallocate foreign variables.
+The Lisp code shares the same allocator with foreign C code, so it's
+OK for foreign code to call @code{free} on the result of Lisp
+@code{sb-alien:make-alien}, or for Lisp code to call
+@code{sb-alien:free-alien} on foreign objects allocated by C code.
 
-@defmac sb-alien:make-alien @var{type} @var{size}
-@findex make-alien
-
-The @code{sb-alien:make-alien} macro
-returns a dynamically allocated foreign value of the specified
-@var{type} (which is not evaluated.)  The allocated memory is not
-initialized, and may contain arbitrary junk.  If supplied,
-@var{size} is an expression to evaluate to compute the size of the
-allocated object.  There are two major cases:
-
-@itemize
-@item
-When @var{type} is a foreign array type, an array of that type is
-allocated and a pointer to it is returned.  Note that you must use
-@code{deref} to change the result to an array before you can use
-@code{deref} to read or write elements:
-
-@lisp
-(cl:in-package "CL-USER") ; which USEs package "SB-ALIEN"
-(defvar *foo* (make-alien (array char 10)))
-(type-of *foo*) @result{} (alien (* (array (signed 8) 10)))
-(setf (deref (deref foo) 0) 10) @result{} 10
-@end lisp
-
-If supplied, @var{size} is used as the first dimension for the
-    array.
-
-@item
-When @var{type} is any other foreign type, then an object for that
-type is allocated, and a pointer to it is returned.  So
-@code{(make-alien int)} returns a @code{(* int)}.  If @var{size} is
-specified, then a block of that many objects is allocated, with the
-result pointing to the first one.
-
-@end itemize
-
-@end defmac
-
-@defun sb-alien:free-alien @var{foreign-value}
-@findex free-alien
-
-The @code{sb-alien:free-alien} function
-frees the storage for @var{foreign-value}, 
-which must have been allocated with Lisp @code{make-alien}
-or C @code{malloc}.
-
-See also the @code{sb-alien:with-alien} macro, which allocates foreign
-values on the stack.
-@end defun
+@include macro-sb-alien-make-alien.texinfo
+@include fun-sb-alien-make-alien-string.texinfo
+@include fun-sb-alien-free-alien.texinfo
 
 @node  Foreign Variables
 @comment  node-name,  next,  previous,  up
@@ -558,8 +508,7 @@ are supported.
 @comment  node-name,  next,  previous,  up
 @subsection Local Foreign Variables
 
-@defmac sb-alien:with-alien @var{var-definitions} &body @var{body}
-@findex with-alien
+@defmac @sbalien{with-alien} @var{var-definitions} &body @var{body}
 
 The @code{with-alien} macro establishes local foreign variables with
 the specified alien types and names.  This form is analogous to
@@ -617,8 +566,7 @@ specified by using a list of the form
 
 @end itemize
 
-@defmac sb-alien:define-alien-variable @var{name} @var{type}
-@findex define-alien-variable
+@defmac @sbalien{define-alien-variable} @var{name} @var{type}
 
 The @code{define-alien-variable} macro defines @var{name} as an
 external foreign variable of the specified foreign @code{type}.
@@ -644,8 +592,7 @@ For example, to access a C-level counter @var{foo}, one could write
 @end lisp
 @end defmac
 
-@defun sb-alien:get-errno
-@findex get-errno
+@defun @sbalien{get-errno}
 
 Since in modern C libraries, the @code{errno} ``variable'' is typically
 no longer a variable, but some bizarre artificial construct
@@ -655,8 +602,7 @@ it can no longer reliably be accessed through the ordinary
 the operator @code{sb-alien:get-errno} to allow Lisp code to read it.
 @end defun
 
-@defmac sb-alien:extern-alien @var{name} @var{type}
-@findex extern-alien
+@defmac @sbalien{extern-alien} @var{name} @var{type}
 
 The @code{extern-alien} macro returns an alien with the specified
 @var{type} which points to an externally defined value.  @var{name} is
@@ -747,6 +693,8 @@ calling @code{load-shared-object}.
 
 @include fun-sb-alien-load-shared-object.texinfo
 
+@include fun-sb-alien-unload-shared-object.texinfo
+
 @node  Foreign Function Calls
 @comment  node-name,  next,  previous,  up
 @section Foreign Function Calls
@@ -778,8 +726,7 @@ the only documentation.  Users of a Lisp built with the
 @comment  node-name,  next,  previous,  up
 @subsection The @code{alien-funcall} Primitive
 
-@defun sb-alien:alien-funcall @var{alien-function} &rest @var{arguments}
-@findex alien-funcall
+@defun @sbalien{alien-funcall} @var{alien-function} &rest @var{arguments}
 
 The @code{alien-funcall} function is the foreign function call
 primitive: @var{alien-function} is called with the supplied
@@ -832,8 +779,7 @@ the @code{(* (struct foo))} objects filled in by the foreign call:
 @comment  node-name,  next,  previous,  up
 @subsection The @code{define-alien-routine} Macro
 
-@defmac sb-alien:define-alien-routine @var{name} @var{result-type} &rest @var{arg-specifiers}
-@findex define-alien-routine
+@defmac @sbalien{define-alien-routine} @var{name} @var{result-type} &rest @var{arg-specifiers}
 
 The @code{define-alien-routine} macro is a convenience for
 automatically generating Lisp interfaces to simple foreign functions.

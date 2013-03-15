@@ -496,12 +496,6 @@ ptrans_otherptr(lispobj thing, lispobj header, boolean constant)
 #endif
       case SAP_WIDETAG:
           return ptrans_unboxed(thing, header);
-#ifdef LUTEX_WIDETAG
-      case LUTEX_WIDETAG:
-          gencgc_unregister_lutex((struct lutex *) native_pointer(thing));
-          return ptrans_unboxed(thing, header);
-#endif
-
       case RATIO_WIDETAG:
       case COMPLEX_WIDETAG:
       case SIMPLE_ARRAY_WIDETAG:
@@ -560,10 +554,8 @@ ptrans_otherptr(lispobj thing, lispobj header, boolean constant)
         return ptrans_vector(thing, 16, 0, 0, constant);
 
       case SIMPLE_ARRAY_UNSIGNED_BYTE_32_WIDETAG:
-#ifdef SIMPLE_ARRAY_SIGNED_BYTE_30_WIDETAG
-      case SIMPLE_ARRAY_SIGNED_BYTE_30_WIDETAG:
-      case SIMPLE_ARRAY_UNSIGNED_BYTE_29_WIDETAG:
-#endif
+      case SIMPLE_ARRAY_FIXNUM_WIDETAG:
+      case SIMPLE_ARRAY_UNSIGNED_FIXNUM_WIDETAG:
 #ifdef SIMPLE_ARRAY_SIGNED_BYTE_32_WIDETAG
       case SIMPLE_ARRAY_SIGNED_BYTE_32_WIDETAG:
       case SIMPLE_ARRAY_UNSIGNED_BYTE_31_WIDETAG:
@@ -571,17 +563,11 @@ ptrans_otherptr(lispobj thing, lispobj header, boolean constant)
         return ptrans_vector(thing, 32, 0, 0, constant);
 
 #if N_WORD_BITS == 64
-#ifdef SIMPLE_ARRAY_UNSIGNED_BYTE_60_WIDETAG
-      case SIMPLE_ARRAY_UNSIGNED_BYTE_60_WIDETAG:
-#endif
 #ifdef SIMPLE_ARRAY_UNSIGNED_BYTE_63_WIDETAG
       case SIMPLE_ARRAY_UNSIGNED_BYTE_63_WIDETAG:
 #endif
 #ifdef SIMPLE_ARRAY_UNSIGNED_BYTE_64_WIDETAG
       case SIMPLE_ARRAY_UNSIGNED_BYTE_64_WIDETAG:
-#endif
-#ifdef SIMPLE_ARRAY_SIGNED_BYTE_61_WIDETAG
-      case SIMPLE_ARRAY_SIGNED_BYTE_61_WIDETAG:
 #endif
 #ifdef SIMPLE_ARRAY_SIGNED_BYTE_64_WIDETAG
       case SIMPLE_ARRAY_SIGNED_BYTE_64_WIDETAG:
@@ -774,10 +760,10 @@ pscav(lispobj *addr, long nwords, boolean constant)
                 break;
 
               case SIMPLE_ARRAY_UNSIGNED_BYTE_32_WIDETAG:
-#ifdef SIMPLE_ARRAY_SIGNED_BYTE_30_WIDETAG
-              case SIMPLE_ARRAY_SIGNED_BYTE_30_WIDETAG:
-              case SIMPLE_ARRAY_UNSIGNED_BYTE_29_WIDETAG:
-#endif
+
+              case SIMPLE_ARRAY_FIXNUM_WIDETAG:
+              case SIMPLE_ARRAY_UNSIGNED_FIXNUM_WIDETAG:
+
 #ifdef SIMPLE_ARRAY_SIGNED_BYTE_32_WIDETAG
               case SIMPLE_ARRAY_SIGNED_BYTE_32_WIDETAG:
               case SIMPLE_ARRAY_UNSIGNED_BYTE_31_WIDETAG:
@@ -788,10 +774,6 @@ pscav(lispobj *addr, long nwords, boolean constant)
 
 #if N_WORD_BITS == 64
               case SIMPLE_ARRAY_UNSIGNED_BYTE_64_WIDETAG:
-#ifdef SIMPLE_ARRAY_SIGNED_BYTE_61_WIDETAG
-              case SIMPLE_ARRAY_SIGNED_BYTE_61_WIDETAG:
-              case SIMPLE_ARRAY_UNSIGNED_BYTE_60_WIDETAG:
-#endif
 #ifdef SIMPLE_ARRAY_SIGNED_BYTE_64_WIDETAG
               case SIMPLE_ARRAY_SIGNED_BYTE_64_WIDETAG:
               case SIMPLE_ARRAY_UNSIGNED_BYTE_63_WIDETAG:
@@ -954,7 +936,7 @@ purify(lispobj static_roots, lispobj read_only_roots)
     fflush(stdout);
 #endif
     pscav((lispobj *)all_threads->control_stack_start,
-          current_control_stack_pointer -
+          access_control_stack_pointer(all_threads) -
           all_threads->control_stack_start,
           0);
 
@@ -964,7 +946,7 @@ purify(lispobj static_roots, lispobj read_only_roots)
 #endif
 
     pscav( (lispobj *)all_threads->binding_stack_start,
-          (lispobj *)current_binding_stack_pointer -
+           (lispobj *)get_binding_stack_pointer(all_threads) -
            all_threads->binding_stack_start,
           0);
 
@@ -1026,14 +1008,13 @@ purify(lispobj static_roots, lispobj read_only_roots)
     clear_auto_gc_trigger(); /* restore mmap as it was given by os */
 #endif
 
-    os_zero((os_vm_address_t) current_dynamic_space,
-            (os_vm_size_t) dynamic_space_size);
+    os_zero((os_vm_address_t) current_dynamic_space, dynamic_space_size);
 
     /* Zero the stack. */
-    os_zero((os_vm_address_t) current_control_stack_pointer,
+    os_zero((os_vm_address_t) access_control_stack_pointer(all_threads),
             (os_vm_size_t)
             ((all_threads->control_stack_end -
-              current_control_stack_pointer) * sizeof(lispobj)));
+              access_control_stack_pointer(all_threads)) * sizeof(lispobj)));
 
     /* It helps to update the heap free pointers so that free_heap can
      * verify after it's done. */

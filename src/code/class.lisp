@@ -51,7 +51,7 @@
   ;;   :SEALED    = We can't even add subclasses.
   ;;   NIL        = Anything could happen.
   (state nil :type (member nil :read-only :sealed))
-  ;; direct superclasses of this class
+  ;; direct superclasses of this class. Always NIL for CLOS classes.
   (direct-superclasses () :type list)
   ;; representation of all of the subclasses (direct or indirect) of
   ;; this class. This is NIL if no subclasses or not initalized yet;
@@ -705,7 +705,7 @@
 (defun find-classoid-cell (name &key create errorp)
   (let ((table *classoid-cells*)
         (real-name (uncross name)))
-    (or (with-locked-hash-table (table)
+    (or (with-locked-system-table (table)
           (or (gethash real-name table)
               (when create
                 (setf (gethash real-name table) (make-classoid-cell real-name)))))
@@ -767,7 +767,8 @@
             (:primitive
              (error "Cannot redefine standard type ~S." name))
             (:defined
-             (warn "Redefining DEFTYPE type to be a class: ~S" name)
+             (warn "redefining DEFTYPE type to be a class: ~
+                    ~/sb-impl::print-symbol-with-prefix/" name)
                 (setf (info :type :expander name) nil
                       (info :type :lambda-list name) nil
                       (info :type :source-location name) nil)))
@@ -807,8 +808,12 @@
          ;; getting a different cell for a classoid with the same name
          ;; just would not do.
 
-         ;; Remove the proper name of the classoid.
-         (setf (classoid-name (classoid-cell-classoid cell)) nil)
+         ;; Remove the proper name of the classoid, if this was it.
+         (let* ((classoid (classoid-cell-classoid cell))
+                (proper-name (classoid-name classoid)))
+           (when (eq proper-name name)
+             (setf (classoid-name classoid) nil)))
+
          ;; Clear the cell.
          (setf (classoid-cell-classoid cell) nil
                (classoid-cell-pcl-class cell) nil))
@@ -826,7 +831,7 @@
 (defun insured-find-classoid (name predicate constructor)
   (declare (type function predicate constructor))
   (let ((table *forward-referenced-layouts*))
-    (with-locked-hash-table (table)
+    (with-locked-system-table (table)
       (let* ((old (find-classoid name nil))
              (res (if (and old (funcall predicate old))
                       old
@@ -853,33 +858,43 @@
 ;;; We might be passed classoids with invalid layouts; in any pairwise
 ;;; class comparison, we must ensure that both are valid before
 ;;; proceeding.
-(defun %ensure-classoid-valid (classoid layout)
+(defun %ensure-classoid-valid (classoid layout error-context)
   (aver (eq classoid (layout-classoid layout)))
-  (when (layout-invalid layout)
-    (if (typep classoid 'standard-classoid)
-        (let ((class (classoid-pcl-class classoid)))
-          (cond
-            ((sb!pcl:class-finalized-p class)
-             (sb!pcl::%force-cache-flushes class))
-            ((sb!pcl::class-has-a-forward-referenced-superclass-p class)
-             (error "Invalid, unfinalizeable class ~S (classoid ~S)."
-                    class classoid))
-            (t
-             (sb!pcl:finalize-inheritance class))))
-        (error "Don't know how to ensure validity of ~S (not ~
-                a STANDARD-CLASSOID)." classoid))))
+  (or (not (layout-invalid layout))
+      (if (typep classoid 'standard-classoid)
+          (let ((class (classoid-pcl-class classoid)))
+            (cond
+              ((sb!pcl:class-finalized-p class)
+               (sb!pcl::%force-cache-flushes class)
+               t)
+              ((sb!pcl::class-has-a-forward-referenced-superclass-p class)
+               (when error-context
+                 (bug "~@<Invalid class ~S with forward-referenced superclass ~
+                       ~S in ~A.~%~:@>"
+                      class
+                      (sb!pcl::class-has-a-forward-referenced-superclass-p class)
+                      error-context))
+               nil)
+              (t
+               (sb!pcl:finalize-inheritance class)
+               t)))
+          (bug "~@<Don't know how to ensure validity of ~S (not a STANDARD-CLASSOID) ~
+                for ~A.~%~:@>"
+               classoid (or error-context 'subtypep)))))
 
-(defun %ensure-both-classoids-valid (class1 class2)
+(defun %ensure-both-classoids-valid (class1 class2 &optional errorp)
   (do ((layout1 (classoid-layout class1) (classoid-layout class1))
        (layout2 (classoid-layout class2) (classoid-layout class2))
        (i 0 (+ i 1)))
-      ((and (not (layout-invalid layout1)) (not (layout-invalid layout2))))
+      ((and (not (layout-invalid layout1)) (not (layout-invalid layout2)))
+       t)
     (aver (< i 2))
-    (%ensure-classoid-valid class1 layout1)
-    (%ensure-classoid-valid class2 layout2)))
+    (unless (and (%ensure-classoid-valid class1 layout1 errorp)
+                 (%ensure-classoid-valid class2 layout2 errorp))
+      (return-from %ensure-both-classoids-valid nil))))
 
 (defun update-object-layout-or-invalid (object layout)
-  (if (typep (classoid-of object) 'standard-classoid)
+  (if (layout-for-std-class-p (layout-of object))
       (sb!pcl::check-wrapper-validity object)
       (sb!c::%layout-invalid-error object layout)))
 
@@ -893,11 +908,22 @@
 (!define-type-method (classoid :simple-subtypep) (class1 class2)
   (aver (not (eq class1 class2)))
   (with-world-lock ()
-    (%ensure-both-classoids-valid class1 class2)
-    (let ((subclasses (classoid-subclasses class2)))
-      (if (and subclasses (gethash class1 subclasses))
-          (values t t)
-          (values nil t)))))
+    (if (%ensure-both-classoids-valid class1 class2)
+        (let ((subclasses2 (classoid-subclasses class2)))
+          (if (and subclasses2 (gethash class1 subclasses2))
+              (values t t)
+              (if (and (typep class1 'standard-classoid)
+                       (typep class2 'standard-classoid)
+                       (or (sb!pcl::class-has-a-forward-referenced-superclass-p
+                            (classoid-pcl-class class1))
+                           (sb!pcl::class-has-a-forward-referenced-superclass-p
+                            (classoid-pcl-class class2))))
+                  ;; If there's a forward-referenced class involved we don't know for sure.
+                  ;; (There are cases which we /could/ figure out, but that doesn't seem
+                  ;; to be required or important, really.)
+                  (values nil nil)
+                  (values nil t))))
+        (values nil nil))))
 
 ;;; When finding the intersection of a sealed class and some other
 ;;; class (not hierarchically related) the intersection is the union
@@ -918,7 +944,7 @@
 (!define-type-method (classoid :simple-intersection2) (class1 class2)
   (declare (type classoid class1 class2))
   (with-world-lock ()
-    (%ensure-both-classoids-valid class1 class2)
+    (%ensure-both-classoids-valid class1 class2 "type intersection")
     (cond ((eq class1 class2)
            class1)
           ;; If one is a subclass of the other, then that is the
@@ -1113,7 +1139,7 @@
       :translation (integer #.sb!xc:most-negative-fixnum
                     #.sb!xc:most-positive-fixnum)
       :inherits (integer rational real number)
-      :codes (#.sb!vm:even-fixnum-lowtag #.sb!vm:odd-fixnum-lowtag)
+      :codes #.(mapcar #'symbol-value sb!vm::fixnum-lowtags)
       :prototype-form 42)
      (bignum
       :translation (and integer (not fixnum))
@@ -1187,13 +1213,15 @@
       :direct-superclasses (vector simple-array)
       :inherits (vector simple-array array sequence)
       :prototype-form (make-array 0 :element-type '(unsigned-byte 16)))
-     #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-     (simple-array-unsigned-byte-29
-      :translation (simple-array (unsigned-byte 29) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-29-widetag)
+
+     (simple-array-unsigned-fixnum
+      :translation (simple-array (unsigned-byte #.sb!vm:n-positive-fixnum-bits) (*))
+      :codes (#.sb!vm:simple-array-unsigned-fixnum-widetag)
       :direct-superclasses (vector simple-array)
       :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 29)))
+      :prototype-form (make-array 0
+                       :element-type '(unsigned-byte #.sb!vm:n-positive-fixnum-bits)))
+
      (simple-array-unsigned-byte-31
       :translation (simple-array (unsigned-byte 31) (*))
       :codes (#.sb!vm:simple-array-unsigned-byte-31-widetag)
@@ -1206,13 +1234,6 @@
       :direct-superclasses (vector simple-array)
       :inherits (vector simple-array array sequence)
       :prototype-form (make-array 0 :element-type '(unsigned-byte 32)))
-     #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-     (simple-array-unsigned-byte-60
-      :translation (simple-array (unsigned-byte 60) (*))
-      :codes (#.sb!vm:simple-array-unsigned-byte-60-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(unsigned-byte 60)))
      #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
      (simple-array-unsigned-byte-63
       :translation (simple-array (unsigned-byte 63) (*))
@@ -1239,26 +1260,23 @@
       :direct-superclasses (vector simple-array)
       :inherits (vector simple-array array sequence)
       :prototype-form (make-array 0 :element-type '(signed-byte 16)))
-     #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-     (simple-array-signed-byte-30
-      :translation (simple-array (signed-byte 30) (*))
-      :codes (#.sb!vm:simple-array-signed-byte-30-widetag)
+
+     (simple-array-fixnum
+      :translation (simple-array (signed-byte #.sb!vm:n-fixnum-bits)
+                    (*))
+      :codes (#.sb!vm:simple-array-fixnum-widetag)
       :direct-superclasses (vector simple-array)
       :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(signed-byte 30)))
+      :prototype-form (make-array 0
+                       :element-type
+                       '(signed-byte #.sb!vm:n-fixnum-bits)))
+
      (simple-array-signed-byte-32
       :translation (simple-array (signed-byte 32) (*))
       :codes (#.sb!vm:simple-array-signed-byte-32-widetag)
       :direct-superclasses (vector simple-array)
       :inherits (vector simple-array array sequence)
       :prototype-form (make-array 0 :element-type '(signed-byte 32)))
-     #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-     (simple-array-signed-byte-61
-      :translation (simple-array (signed-byte 61) (*))
-      :codes (#.sb!vm:simple-array-signed-byte-61-widetag)
-      :direct-superclasses (vector simple-array)
-      :inherits (vector simple-array array sequence)
-      :prototype-form (make-array 0 :element-type '(signed-byte 61)))
      #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
      (simple-array-signed-byte-64
       :translation (simple-array (signed-byte 64) (*))

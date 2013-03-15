@@ -79,8 +79,8 @@ case "$HOST_TYPE" in
            INIT="-noinit"
            CORE="-core"
            ;;
-    sbcl)  LISP="sbcl"
-           INIT="--sysinit /dev/null --userinit /dev/null"
+    sbcl)  LISP="${XC_LISP:-sbcl}"
+           INIT="--no-sysinit --no-userinit"
            CORE="--core"
            ;;
     clisp) LISP="clisp"
@@ -97,7 +97,7 @@ case "$HOST_TYPE" in
            exit 1
 esac
 
-SBCL_XC_HOST="$LISP $INIT"
+SBCL_XC_HOST="$LISP ${XC_CORE:+$CORE $XC_CORE} $INIT"
 export SBCL_XC_HOST
 
 # (We don't do make-host-1.sh at all. Hopefully nothing relevant has

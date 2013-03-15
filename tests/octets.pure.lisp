@@ -260,8 +260,7 @@
 (assert (equalp #(251) (string-to-octets (string (code-char 369))
                                          :external-format :latin-2)))
 
-#+sb-unicode
-(with-test (:name (:euc-jp :decoding-errors))
+(with-test (:name (:euc-jp :decoding-errors) :skipped-on '(not :sb-unicode))
   (handler-bind ((sb-int:character-decoding-error
                   (lambda (c) (use-value #\? c))))
     (assert (string= "?{?"
@@ -269,17 +268,131 @@
                       (coerce #(182 123 253 238) '(vector (unsigned-byte 8)))
                       :external-format :euc-jp)))))
 
-#+sb-unicode
-(with-test (:name (:utf-8 :surrogates :encoding-errors))
+(with-test (:name (:utf-8 :surrogates :encoding-errors) :skipped-on '(not :sb-unicode))
   (handler-bind ((sb-int:character-encoding-error
                   (lambda (c) (use-value #\? c))))
     (assert (equalp (string-to-octets (string (code-char #xd800))
                                       :external-format :utf-8)
                     (vector (char-code #\?))))))
-#+sb-unicode
-(with-test (:name (:utf-8 :surrogates :decoding-errors))
+(with-test (:name (:utf-8 :surrogates :decoding-errors) :skipped-on '(not :sb-unicode))
   (handler-bind ((sb-int:character-decoding-error
                   (lambda (c) (use-value #\? c))))
     (assert (find #\? (octets-to-string
                        (coerce #(237 160 128) '(vector (unsigned-byte 8)))
                        :external-format :utf-8)))))
+
+(with-test (:name (:ucs-2 :out-of-range :encoding-errors) :skipped-on '(not :sb-unicode))
+  (handler-bind ((sb-int:character-encoding-error
+                  (lambda (c) (use-value "???" c))))
+    (assert (equalp (string-to-octets (string (code-char #x10001))
+                                      :external-format :ucs-2le)
+                    #(63 0 63 0 63 0))))
+  (handler-bind ((sb-int:character-encoding-error
+                  (lambda (c) (use-value "???" c))))
+    (assert (equalp (string-to-octets (string (code-char #x10001))
+                                      :external-format :ucs-2be)
+                    #(0 63 0 63 0 63)))))
+
+(with-test (:name (:ucs-4 :out-of-range :decoding-errors) :skipped-on '(not :sb-unicode))
+  (handler-bind ((sb-int:character-decoding-error
+                  (lambda (c) (use-value "???" c))))
+    (assert (equalp (octets-to-string (coerce '(1 2 3 4) '(vector (unsigned-byte 8)))
+                                      :external-format :ucs-4le)
+                    "???")))
+  (assert (equalp (octets-to-string (coerce '(#xff #xff #x10 #x00) '(vector (unsigned-byte 8)))
+                                    :external-format :ucs-4le)
+                  (string (code-char #x10ffff))))
+  (handler-bind ((sb-int:character-decoding-error
+                  (lambda (c) (use-value "???" c))))
+    (assert (equalp (octets-to-string (coerce '(1 2 3 4) '(vector (unsigned-byte 8)))
+                                      :external-format :ucs-4be)
+                    "???"))
+    (assert (equalp (octets-to-string (coerce '(#x00 #x10 #xff #xff) '(vector (unsigned-byte 8)))
+                                      :external-format :ucs-4be)
+                    (string (code-char #x10ffff))))))
+
+(with-test (:name (:utf-16le :ensure-roundtrip) :skipped-on '(not :sb-unicode))
+  (flet ((enc (x)
+           (string-to-octets x :external-format :utf-16le))
+         (dec (x)
+           (octets-to-string (coerce x '(vector (unsigned-byte 8)))
+                             :external-format :utf-16le)))
+    (let ((string (map 'string 'code-char
+                       '(#x20 #x200 #x2000 #x10000 #x10401 #x10fffd)))
+          (octets #(#x20 0 0 #x2 0 #x20 0 #xd8 0 #xdc 1 #xd8 1 #xdc #xff #xdb #xfd #xdf)))
+      (assert (equalp (enc string) octets))
+      (assert (equalp (dec octets) string)))))
+
+(with-test (:name (:utf-16le :encoding-error) :skipped-on '(not :sb-unicode))
+  (flet ((enc (x)
+           (string-to-octets x :external-format '(:utf-16le :replacement #\?)))
+         (dec (x)
+           (octets-to-string (coerce x '(vector (unsigned-byte 8)))
+                             :external-format :utf-16le)))
+    (let ((string (map 'string 'code-char '(#xd800 #xdc00 #xfffe #x10ffff))))
+      (assert (equalp (enc string) #(63 0 63 0 63 0 63 0))))))
+
+(with-test (:name (:utf-16be :ensure-roundtrip) :skipped-on '(not :sb-unicode))
+  (flet ((enc (x)
+           (string-to-octets x :external-format :utf-16be))
+         (dec (x)
+           (octets-to-string (coerce x '(vector (unsigned-byte 8)))
+                             :external-format :utf-16be)))
+    (let ((string (map 'string 'code-char
+                       '(#x20 #x200 #x2000 #x10000 #x10401 #x10fffd)))
+          (octets #(0 #x20 #x2 0 #x20 0 #xd8 0 #xdc 0 #xd8 1 #xdc 1 #xdb #xff #xdf #xfd)))
+      (assert (equalp (enc string) octets))
+      (assert (equalp (dec octets) string)))))
+
+(with-test (:name (:utf-16be :encoding-error) :skipped-on '(not :sb-unicode))
+  (flet ((enc (x)
+           (string-to-octets x :external-format '(:utf-16be :replacement #\?)))
+         (dec (x)
+           (octets-to-string (coerce x '(vector (unsigned-byte 8)))
+                             :external-format :utf-16be)))
+    (let ((string (map 'string 'code-char '(#xd800 #xdc00 #xfffe #x10ffff))))
+      (assert (equalp (enc string) #(0 63 0 63 0 63 0 63))))))
+
+
+(with-test (:name (:utf-32le :ensure-roundtrip) :skipped-on '(not :sb-unicode))
+  (flet ((enc (x)
+           (string-to-octets x :external-format :utf-32le))
+         (dec (x)
+           (octets-to-string (coerce x '(vector (unsigned-byte 8)))
+                             :external-format :utf-32le)))
+    (let ((string (map 'string 'code-char
+                       '(#x20 #x200 #x2000 #x10000 #x10401 #x10fffd)))
+          (octets #(#x20 0 0 0 0 #x2 0 0 0 #x20 0 0 0 0 1 0 1 4 1 0 #xfd #xff #x10 0)))
+      (assert (equalp (enc string) octets))
+      (assert (equalp (dec octets) string)))))
+
+(with-test (:name (:utf-32le :encoding-error) :skipped-on '(not :sb-unicode))
+  (flet ((enc (x)
+           (string-to-octets x :external-format '(:utf-32le :replacement #\?)))
+         (dec (x)
+           (octets-to-string (coerce x '(vector (unsigned-byte 8)))
+                             :external-format :utf-32le)))
+    (let ((string (map 'string 'code-char '(#xd800 #xdc00 #xfffe #x10ffff))))
+      (assert (equalp (enc string) #(63 0 0 0 63 0 0 0 63 0 0 0 63 0 0 0))))))
+
+
+(with-test (:name (:utf-32be :ensure-roundtrip) :skipped-on '(not :sb-unicode))
+  (flet ((enc (x)
+           (string-to-octets x :external-format :utf-32be))
+         (dec (x)
+           (octets-to-string (coerce x '(vector (unsigned-byte 8)))
+                             :external-format :utf-32be)))
+    (let ((string (map 'string 'code-char
+                       '(#x20 #x200 #x2000 #x10000 #x10401 #x10fffd)))
+          (octets #(0 0 0 #x20 0 0 #x2 0 0 0 #x20 0 0 1 0 0 0 1 4 1 0 #x10 #xff #xfd)))
+      (assert (equalp (enc string) octets))
+      (assert (equalp (dec octets) string)))))
+
+(with-test (:name (:utf-32be :encoding-error) :skipped-on '(not :sb-unicode))
+  (flet ((enc (x)
+           (string-to-octets x :external-format '(:utf-32be :replacement #\?)))
+         (dec (x)
+           (octets-to-string (coerce x '(vector (unsigned-byte 8)))
+                             :external-format :utf-32be)))
+    (let ((string (map 'string 'code-char '(#xd800 #xdc00 #xfffe #x10ffff))))
+      (assert (equalp (enc string) #(0 0 0 63 0 0 0 63 0 0 0 63 0 0 0 63))))))

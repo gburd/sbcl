@@ -12,22 +12,16 @@
 (in-package "SB!UNIX")
 
 (defmacro with-interrupt-bindings (&body body)
-  (with-unique-names (empty)
-    `(let*
-         ;; KLUDGE: Whatever is on the PCL stacks before the interrupt
-         ;; handler runs doesn't really matter, since we're not on the
-         ;; same call stack, really -- and if we don't bind these (esp.
-         ;; the cache one) we can get a bogus metacircle if an interrupt
-         ;; handler calls a GF that was being computed when the interrupt
-         ;; hit.
-         ((sb!pcl::*cache-miss-values-stack* nil)
-          (sb!pcl::*dfun-miss-gfs-on-stack* nil)
-          ;; Unless we do this, ADJUST-ARRAY and SORT would need to
-          ;; disable interrupts.
-          (,empty (vector))
-          (sb!impl::*zap-array-data-temp* ,empty)
-          (sb!impl::*merge-sort-temp-vector* ,empty))
-       ,@body)))
+  `(let*
+       ;; KLUDGE: Whatever is on the PCL stacks before the interrupt
+       ;; handler runs doesn't really matter, since we're not on the
+       ;; same call stack, really -- and if we don't bind these (esp.
+       ;; the cache one) we can get a bogus metacircle if an interrupt
+       ;; handler calls a GF that was being computed when the interrupt
+       ;; hit.
+       ((sb!pcl::*cache-miss-values-stack* nil)
+        (sb!pcl::*dfun-miss-gfs-on-stack* nil))
+     ,@body))
 
 ;;; Evaluate CLEANUP-FORMS iff PROTECTED-FORM does a non-local exit.
 (defmacro nlx-protect (protected-form &rest cleanup-froms)
@@ -50,10 +44,10 @@
     ;; mechanism there are no extra frames on the stack from a
     ;; previous signal handler when the next signal is delivered
     ;; provided there is no WITH-INTERRUPTS.
-    (let ((*unblock-deferrables-on-enabling-interrupts-p* t))
+    (let ((*unblock-deferrables-on-enabling-interrupts-p* t)
+          (sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint* 'invoke-interruption)))
       (with-interrupt-bindings
-        (let ((sb!debug:*stack-top-hint*
-               (nth-value 1 (sb!kernel:find-interrupted-name-and-frame))))
+        (sb!thread::without-thread-waiting-for (:already-without-interrupts t)
           (allow-with-interrupts
             (nlx-protect (funcall function)
                          ;; We've been running with deferrables
@@ -105,6 +99,7 @@
     sb!alien:void
   (where sb!alien:unsigned-long)
   (old sb!alien:unsigned-long))
+#!-sb-safepoint
 (sb!alien:define-alien-routine ("unblock_gc_signals" %unblock-gc-signals)
     sb!alien:void
   (where sb!alien:unsigned-long)
@@ -113,6 +108,7 @@
 (defun unblock-deferrable-signals ()
   (%unblock-deferrable-signals 0 0))
 
+#!-sb-safepoint
 (defun unblock-gc-signals ()
   (%unblock-gc-signals 0 0))
 
@@ -121,11 +117,25 @@
 (sb!alien:define-alien-routine ("install_handler" install-handler)
                                sb!alien:unsigned-long
   (signal sb!alien:int)
-  (handler sb!alien:unsigned-long))
+  (handler sb!alien:unsigned-long)
+  (synchronous boolean))
 
 ;;;; interface to enabling and disabling signal handlers
 
-(defun enable-interrupt (signal handler)
+;;; Note on the SYNCHRONOUS argument: On builds without pseudo-atomic,
+;;; we have no way of knowing whether interrupted code was in an
+;;; allocation sequence, and cannot delay signals until after
+;;; allocation.  Any signal that can occur asynchronously must be
+;;; considered unsafe for immediate execution, and the invocation of its
+;;; lisp handler will get delayed into a newly spawned signal handler
+;;; thread.  However, there are signals which we must handle
+;;; immediately, because they occur synchonously (hence the boolean flag
+;;; SYNCHRONOUS to this function), luckily implying that the signal
+;;; happens only in specific places (illegal instructions, floating
+;;; point instructions, certain system calls), hopefully ruling out the
+;;; possibility that we would trigger it during allocation.
+
+(defun enable-interrupt (signal handler &key synchronous)
   (declare (type (or function fixnum (member :default :ignore)) handler))
   (/show0 "enable-interrupt")
   (flet ((run-handler (&rest args)
@@ -139,7 +149,8 @@
                                        (:ignore sig-ign)
                                        (t
                                         (sb!kernel:get-lisp-obj-address
-                                         #'run-handler))))))
+                                         #'run-handler)))
+                                     synchronous)))
         (cond ((= result sig-dfl) :default)
               ((= result sig-ign) :ignore)
               (t (the (or function fixnum)
@@ -150,6 +161,26 @@
 
 (defun ignore-interrupt (signal)
   (enable-interrupt signal :ignore))
+
+;;;; Support for signal handlers which aren't.
+;;;;
+;;;; On safepoint builds, user-defined Lisp signal handlers do not run
+;;;; in the handler for their signal, because we have no pseudo atomic
+;;;; mechanism to prevent handlers from hitting during allocation.
+;;;; Rather, the signal spawns off a fresh native thread, which calls
+;;;; into lisp with a fake context through this callback:
+
+#!+(and sb-safepoint-strictly (not win32))
+(defun signal-handler-callback (run-handler signal args)
+  (sb!thread::initial-thread-function-trampoline
+   (sb!thread::make-signal-handling-thread :name "signal handler"
+                                           :signal-number signal)
+   nil (lambda ()
+         (let* ((info (sb!sys:sap-ref-sap args 0))
+                (context (sb!sys:sap-ref-sap args sb!vm:n-word-bytes)))
+           (funcall run-handler signal info context)))
+   nil nil nil nil))
+
 
 ;;;; default LISP signal handlers
 ;;;;
@@ -183,14 +214,44 @@
   (declare (type system-area-pointer context))
   (/show "in Lisp-level SIGINT handler" (sap-int context))
   (flet ((interrupt-it ()
+           ;; This seems wrong to me on multi-threaded builds.  The
+           ;; closed-over signal context belongs to a SIGINT handler.
+           ;; But this function gets run through INTERRUPT-THREAD,
+           ;; i.e. in in a SIGPIPE handler, at a different point in time
+           ;; or even a different thread.  How do we know that the
+           ;; SIGINT's context structure from the other thread is still
+           ;; alive and meaningful?  Why do we care?  If we even need
+           ;; the context and PC, shouldn't they come from the SIGPIPE's
+           ;; context? --DFL
            (with-alien ((context (* os-context-t) context))
              (with-interrupts
-               (%break 'sigint 'interactive-interrupt
-                       :context context
-                       :address (sap-int (sb!vm:context-pc context)))))))
+               (let ((int (make-condition 'interactive-interrupt
+                                          :context context
+                                          :address (sap-int (sb!vm:context-pc context)))))
+                 ;; First SIGNAL, so that handlers can run.
+                 (signal int)
+                 ;; Then enter the debugger like BREAK.
+                 (%break 'sigint int))))))
+    #!+sb-safepoint
+    (let ((target (sb!thread::foreground-thread)))
+      ;; Note that INTERRUPT-THREAD on *CURRENT-THREAD* doesn't actually
+      ;; interrupt right away, because deferrables are blocked.  Rather,
+      ;; the kernel would arrange for the SIGPIPE to hit when the SIGINT
+      ;; handler is done.  However, on safepoint builds, we don't use
+      ;; SIGPIPE and lack an appropriate mechanism to handle pending
+      ;; thruptions upon exit from signal handlers (and this situation is
+      ;; unlike WITHOUT-INTERRUPTS, which handles pending interrupts
+      ;; explicitly at the end).  Only as long as safepoint builds pretend
+      ;; to cooperate with signals -- that is, as long as SIGINT-HANDLER
+      ;; is used at all -- detect this situation and work around it.
+      (if (eq target sb!thread:*current-thread*)
+          (interrupt-it)
+          (sb!thread:interrupt-thread target #'interrupt-it)))
+    #!-sb-safepoint
     (sb!thread:interrupt-thread (sb!thread::foreground-thread)
                                 #'interrupt-it)))
 
+#!-sb-wtimer
 (defun sigalrm-handler (signal info context)
   (declare (ignore signal info context))
   (declare (type system-area-pointer context))
@@ -198,9 +259,9 @@
 
 (defun sigterm-handler (signal code context)
   (declare (ignore signal code context))
-  (sb!thread::terminate-session)
-  (sb!ext:quit))
+  (sb!ext:exit))
 
+#!-sb-thruption
 ;;; SIGPIPE is not used in SBCL for its original purpose, instead it's
 ;;; for signalling a thread that it should look at its interruption
 ;;; queue. The handler (RUN_INTERRUPTION) just returns if there is
@@ -220,18 +281,20 @@
   "Enable all the default signals that Lisp knows how to deal with."
   (enable-interrupt sigint #'sigint-handler)
   (enable-interrupt sigterm #'sigterm-handler)
-  (enable-interrupt sigill #'sigill-handler)
+  (enable-interrupt sigill #'sigill-handler :synchronous t)
   #!-linux
   (enable-interrupt sigemt #'sigemt-handler)
-  (enable-interrupt sigfpe #'sb!vm:sigfpe-handler)
-  (enable-interrupt sigbus #'sigbus-handler)
+  (enable-interrupt sigfpe #'sb!vm:sigfpe-handler :synchronous t)
+  (enable-interrupt sigbus #'sigbus-handler :synchronous t)
   #!-linux
-  (enable-interrupt sigsys #'sigsys-handler)
+  (enable-interrupt sigsys #'sigsys-handler :synchronous t)
+  #!-sb-wtimer
   (enable-interrupt sigalrm #'sigalrm-handler)
+  #!-sb-thruption
   (enable-interrupt sigpipe #'sigpipe-handler)
   (enable-interrupt sigchld #'sigchld-handler)
   #!+hpux (ignore-interrupt sigxcpu)
-  (unblock-gc-signals)
+  #!-sb-safepoint (unblock-gc-signals)
   (unblock-deferrable-signals)
   (values))
 

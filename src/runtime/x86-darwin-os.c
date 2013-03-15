@@ -44,14 +44,23 @@ void set_data_desc_addr(data_desc_t* desc, void* addr)
 
 #endif
 
-#ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-kern_return_t mach_thread_init(mach_port_t thread_exception_port);
+#ifdef LISP_FEATURE_SB_THREAD
+void
+arch_os_load_ldt(struct thread *thread)
+{
+    sel_t sel;
+
+    sel.index = thread->tls_cookie;
+    sel.rpl = USER_PRIV;
+    sel.ti = SEL_LDT;
+
+    __asm__ __volatile__ ("mov %0, %%fs" : : "r"(sel));
+}
 #endif
 
 int arch_os_thread_init(struct thread *thread) {
 #ifdef LISP_FEATURE_SB_THREAD
     int n;
-    sel_t sel;
 
     data_desc_t ldt_entry = { 0, 0, 0, DESC_DATA_WRITE,
                               3, 1, 0, DESC_DATA_32B, DESC_GRAN_BYTE, 0 };
@@ -69,17 +78,13 @@ int arch_os_thread_init(struct thread *thread) {
     thread_mutex_unlock(&modify_ldt_lock);
 
     FSHOW_SIGNAL((stderr, "/ TLS: Allocated LDT %x\n", n));
-    sel.index = n;
-    sel.rpl = USER_PRIV;
-    sel.ti = SEL_LDT;
-
-    __asm__ __volatile__ ("mov %0, %%fs" : : "r"(sel));
-
     thread->tls_cookie=n;
+    arch_os_load_ldt(thread);
+
     pthread_setspecific(specials,thread);
 #endif
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-    mach_thread_init(THREAD_STRUCT_TO_EXCEPTION_PORT(thread));
+    mach_lisp_thread_init(thread);
 #endif
 
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
@@ -119,13 +124,6 @@ void sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context);
 void sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context);
 void memory_fault_handler(int signal, siginfo_t *siginfo,
                           os_context_t *context);
-
-/* exc_server handles mach exception messages from the kernel and
- * calls catch exception raise. We use the system-provided
- * mach_msg_server, which, I assume, calls exc_server in a loop.
- *
- */
-extern boolean_t exc_server();
 
 /* This executes in the faulting thread as part of the signal
  * emulation.  It is passed a context with the uc_mcontext field
@@ -280,8 +278,8 @@ void signal_emulation_wrapper(x86_thread_state32_t *thread_state,
     os_invalidate((os_vm_address_t)regs, sizeof(mcontext_t));
 
     /* Trap to restore the signal context. */
-    asm volatile ("movl %0, %%eax; movl %1, %%ebx; .long 0xffff0b0f"
-                  : : "r" (thread_state), "r" (float_state));
+    asm volatile (".long 0xffff0b0f"
+                  : : "a" (thread_state), "c" (float_state));
 }
 
 /* Convenience wrapper for the above */
@@ -393,7 +391,6 @@ catch_exception_raise(mach_port_t exception_port,
                       exception_data_t code_vector,
                       mach_msg_type_number_t code_count)
 {
-    struct thread *th = (struct thread*) exception_port;
     x86_thread_state32_t thread_state;
     mach_msg_type_number_t state_count;
     vm_address_t region_addr;
@@ -405,8 +402,12 @@ catch_exception_raise(mach_port_t exception_port,
     int signal = 0;
     void (*handler)(int, siginfo_t *, void *) = NULL;
     siginfo_t siginfo;
-    kern_return_t ret;
+    kern_return_t ret, dealloc_ret;
 
+    struct thread *th;
+
+    FSHOW((stderr,"/entering catch_exception_raise with exception: %d\n", exception));
+    th = *(struct thread**)exception_port;
     /* Get state and info */
     state_count = x86_THREAD_STATE32_COUNT;
     if ((ret = thread_get_state(thread,
@@ -485,7 +486,7 @@ catch_exception_raise(mach_port_t exception_port,
                 lose("thread_set_state (x86_THREAD_STATE32) failed %d\n", ret);
             if ((ret = thread_set_state(thread,
                                         x86_FLOAT_STATE32,
-                                        (thread_state_t)thread_state.EBX,
+                                        (thread_state_t)thread_state.ECX,
                                         x86_FLOAT_STATE32_COUNT)) != KERN_SUCCESS)
                 lose("thread_set_state (x86_FLOAT_STATE32) failed %d\n", ret);
             break;
@@ -502,117 +503,30 @@ catch_exception_raise(mach_port_t exception_port,
       siginfo.si_addr = addr;
       call_handler_on_thread(thread, &thread_state, signal, &siginfo, handler);
     }
-    return ret;
-}
 
-void *
-mach_exception_handler(void *port)
-{
-  mach_msg_server(exc_server, 2048, (mach_port_t) port, 0);
-  /* mach_msg_server should never return, but it should dispatch mach
-   * exceptions to our catch_exception_raise function
-   */
-  lose("mach_msg_server returned");
-}
-
-#endif
-
-#ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
-
-/* Sets up the thread that will listen for mach exceptions. note that
-   the exception handlers will be run on this thread. This is
-   different from the BSD-style signal handling situation in which the
-   signal handlers run in the relevant thread directly. */
-
-mach_port_t mach_exception_handler_port_set = MACH_PORT_NULL;
-
-pthread_t
-setup_mach_exception_handling_thread()
-{
-    kern_return_t ret;
-    pthread_t mach_exception_handling_thread = NULL;
-    pthread_attr_t attr;
-
-    /* allocate a mach_port for this process */
-    ret = mach_port_allocate(mach_task_self(),
-                             MACH_PORT_RIGHT_PORT_SET,
-                             &mach_exception_handler_port_set);
-
-    /* create the thread that will receive the mach exceptions */
-
-    FSHOW((stderr, "Creating mach_exception_handler thread!\n"));
-
-    pthread_attr_init(&attr);
-    pthread_create(&mach_exception_handling_thread,
-                   &attr,
-                   mach_exception_handler,
-                   (void*) mach_exception_handler_port_set);
-    pthread_attr_destroy(&attr);
-
-    return mach_exception_handling_thread;
-}
-
-/* tell the kernel that we want EXC_BAD_ACCESS exceptions sent to the
-   exception port (which is being listened to do by the mach
-   exception handling thread). */
-kern_return_t
-mach_thread_init(mach_port_t thread_exception_port)
-{
-    kern_return_t ret;
-    /* allocate a named port for the thread */
-
-    FSHOW((stderr, "Allocating mach port %x\n", thread_exception_port));
-
-    ret = mach_port_allocate_name(mach_task_self(),
-                                  MACH_PORT_RIGHT_RECEIVE,
-                                  thread_exception_port);
-    if (ret) {
-        lose("mach_port_allocate_name failed with return_code %d\n", ret);
+    dealloc_ret = mach_port_deallocate (current_mach_task, thread);
+    if (dealloc_ret) {
+      lose("mach_port_deallocate (thread) failed with return_code %d\n", dealloc_ret);
     }
 
-    /* establish the right for the thread_exception_port to send messages */
-    ret = mach_port_insert_right(mach_task_self(),
-                                 thread_exception_port,
-                                 thread_exception_port,
-                                 MACH_MSG_TYPE_MAKE_SEND);
-    if (ret) {
-        lose("mach_port_insert_right failed with return_code %d\n", ret);
-    }
-
-    ret = thread_set_exception_ports(mach_thread_self(),
-                                     EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION,
-                                     thread_exception_port,
-                                     EXCEPTION_DEFAULT,
-                                     THREAD_STATE_NONE);
-    if (ret) {
-        lose("thread_set_exception_port failed with return_code %d\n", ret);
-    }
-
-    ret = mach_port_move_member(mach_task_self(),
-                                thread_exception_port,
-                                mach_exception_handler_port_set);
-    if (ret) {
-        lose("mach_port_ failed with return_code %d\n", ret);
+    dealloc_ret = mach_port_deallocate (current_mach_task, task);
+    if (dealloc_ret) {
+      lose("mach_port_deallocate (task) failed with return_code %d\n", dealloc_ret);
     }
 
     return ret;
 }
 
 void
-setup_mach_exceptions() {
-    setup_mach_exception_handling_thread();
-    mach_thread_init(THREAD_STRUCT_TO_EXCEPTION_PORT(all_threads));
-}
-
-pid_t
-mach_fork() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        setup_mach_exceptions();
-        return pid;
-    } else {
-        return pid;
-    }
+os_restore_fp_control(os_context_t *context)
+{
+    /* KLUDGE: The x87 FPU control word is some nasty bitfield struct
+     * thing.  Rather than deal with that, just grab it as a 16-bit
+     * integer. */
+    unsigned short fpu_control_word =
+        *((unsigned short *)&context->uc_mcontext->FS.FPU_FCW);
+    /* reset exception flags and restore control flags on x87 FPU */
+    asm ("fldcw %0" : : "m" (fpu_control_word));
 }
 
 #endif

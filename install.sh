@@ -10,12 +10,13 @@ ensure_dirs ()
     done;
 }
 
+. output/prefix.def
+DEFAULT_INSTALL_ROOT=$SBCL_PREFIX
+
 if [ "$OSTYPE" = "cygwin" -o "$OSTYPE" = "msys" ] ; then
-    DEFAULT_INSTALL_ROOT="$PROGRAMFILES/sbcl"
     RUNTIME=sbcl.exe
     OLD_RUNTIME=sbcl.exe.old
 else
-    DEFAULT_INSTALL_ROOT=/usr/local
     RUNTIME=sbcl
     OLD_RUNTIME=sbcl.old
 fi
@@ -111,11 +112,11 @@ cp doc/sbcl.1 "$BUILD_ROOT$MAN_DIR"/man1/ && echo " man $BUILD_ROOT$MAN_DIR/man1
 for info in doc/manual/*.info
 do
   cp $info "$BUILD_ROOT$INFO_DIR"/ \
-      && echo -n " info $BUILD_ROOT$INFO_DIR/`basename $info` $BUILD_ROOT$INFO_DIR/dir" \
-      && ( install-info --info-dir="$BUILD_ROOT$INFO_DIR" \
-        "$BUILD_ROOT$INFO_DIR"/`basename $info` > /dev/null 2>&1 \
-           || echo -n " (could not add to system catalog)" ) \
-      && echo
+      && BN=`basename $info` \
+      && DIRFAIL=`install-info --info-dir="$BUILD_ROOT$INFO_DIR" \
+        "$BUILD_ROOT$INFO_DIR"/$BN > /dev/null 2>&1 \
+           || echo "(could not add to system catalog)"` \
+      && echo " info $BUILD_ROOT$INFO_DIR/`basename $info` [$BUILD_ROOT$INFO_DIR/dir] $DIRFAIL"
 done
 
 for info in doc/manual/*.info-*
@@ -136,6 +137,12 @@ for html in doc/manual/sbcl doc/manual/asdf
 do
   test -d $html && cp -R -L $html "$BUILD_ROOT$DOC_DIR"/html \
       && echo " html $BUILD_ROOT$DOC_DIR/html/`basename $html`/index.html"
+done
+
+for html in doc/manual/sbcl.html doc/manual/asdf.html
+do
+  cp $html "$BUILD_ROOT$DOC_DIR"/ \
+      && echo " html $BUILD_ROOT$DOC_DIR/`basename $html`"
 done
 
 for f in BUGS CREDITS COPYING NEWS

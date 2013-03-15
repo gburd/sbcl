@@ -40,10 +40,12 @@ pa_alloc(int bytes, int page_type_flag)
     lispobj *result;
     struct thread *th = arch_os_get_current_thread();
 
+#ifndef LISP_FEATURE_SB_SAFEPOINT
     /* SIG_STOP_FOR_GC must be unblocked: else two threads racing here
      * may deadlock: one will wait on the GC lock, and the other
      * cannot stop the first one... */
     check_gc_signals_unblocked_or_lose(0);
+#endif
 
     /* FIXME: OOAO violation: see arch_pseudo_* */
     set_pseudo_atomic_atomic(th);
@@ -73,13 +75,13 @@ pa_alloc(int bytes, int page_type_flag)
 #ifdef LISP_FEATURE_STACK_GROWS_DOWNWARD_NOT_UPWARD
 #error "!C_STACK_IS_CONTROL_STACK and STACK_GROWS_DOWNWARD_NOT_UPWARD is not supported"
 #endif
-        *current_control_stack_pointer = (lispobj) result;
-        current_control_stack_pointer += 1;
+        *access_control_stack_pointer(th) = (lispobj) result;
+        access_control_stack_pointer(th) += 1;
 #endif
         do_pending_interrupt();
 #ifndef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
-        current_control_stack_pointer -= 1;
-        result = (lispobj *) *current_control_stack_pointer;
+        access_control_stack_pointer(th) -= 1;
+        result = (lispobj *) *access_control_stack_pointer(th);
 #endif
     }
     return result;
@@ -152,7 +154,7 @@ alloc_cons(lispobj car, lispobj cdr)
 }
 
 lispobj
-alloc_number(long n)
+alloc_number(sword_t n)
 {
     struct bignum *ptr;
 
@@ -197,9 +199,9 @@ alloc_code_object (unsigned boxed, unsigned unboxed) {
     /* Coming in, boxed is the number of boxed words requested.
      * Converting it to a fixnum makes it measured in bytes. It's also
      * rounded up to double word along the way. */
-    boxed = make_fixnum(boxed + 1 +
-                        (offsetof(struct code, trace_table_offset) >>
-                         WORD_SHIFT));
+    boxed = (boxed + 1 +
+             (offsetof(struct code, trace_table_offset) >>
+              WORD_SHIFT)) << WORD_SHIFT;
     boxed &= ~LOWTAG_MASK;
 
     /* Unboxed is in bytes, round it up to double word boundary. Now
@@ -216,7 +218,7 @@ alloc_code_object (unsigned boxed, unsigned unboxed) {
         lose("alloc_code_object called with GC enabled.");
     boxed = boxed << (N_WIDETAG_BITS - WORD_SHIFT);
     code->header = boxed | CODE_HEADER_WIDETAG;
-    code->code_size = unboxed;
+    code->code_size = unboxed >> (WORD_SHIFT - N_FIXNUM_TAG_BITS);
     code->entry_points = NIL;
     code->debug_info = NIL;
     return make_lispobj(code, OTHER_POINTER_LOWTAG);

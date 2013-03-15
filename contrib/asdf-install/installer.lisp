@@ -33,11 +33,13 @@
      ,(merge-pathnames "systems/" *dot-sbcl*)
      "Personal installation")))
 
-(let* ((*package* (find-package :asdf-install-customize))
-       (file (probe-file (merge-pathnames
-                          (make-pathname :name ".asdf-install")
-                          (user-homedir-pathname)))))
-  (when file (load file)))
+(unless (sb-ext:posix-getenv "SBCL_BUILDING_CONTRIB")
+  ;; Not during build, thanks.
+  (let* ((*package* (find-package :asdf-install-customize))
+         (file (probe-file (merge-pathnames
+                            (make-pathname :name ".asdf-install")
+                            (user-homedir-pathname)))))
+    (when file (load file))))
 
 (define-condition download-error (error)
   ((url :initarg :url :reader download-url)
@@ -198,7 +200,7 @@
     (loop for l = (read-line (process-output proc) nil nil)
           while l
           when (> (mismatch l "[GNUPG:]") 6)
-          do (destructuring-bind (_ tag &rest data) (asdf::split l)
+          do (destructuring-bind (_ tag &rest data) (asdf::split-string l)
                (declare (ignore _))
                (pushnew (cons (intern tag :keyword)
                               data) tags)))

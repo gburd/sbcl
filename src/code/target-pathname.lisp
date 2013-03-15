@@ -23,7 +23,7 @@
                        (unparse #'unparse-unix-namestring)
                        (unparse-native #'unparse-native-unix-namestring)
                        (unparse-host #'unparse-unix-host)
-                       (unparse-directory #'unparse-unix-directory)
+                       (unparse-directory #'unparse-physical-directory)
                        (unparse-file #'unparse-unix-file)
                        (unparse-enough #'unparse-unix-enough)
                        (unparse-directory-separator "/")
@@ -42,12 +42,12 @@
                        (unparse #'unparse-win32-namestring)
                        (unparse-native #'unparse-native-win32-namestring)
                        (unparse-host #'unparse-win32-host)
-                       (unparse-directory #'unparse-win32-directory)
+                       (unparse-directory #'unparse-physical-directory)
                        (unparse-file #'unparse-win32-file)
                        (unparse-enough #'unparse-win32-enough)
                        (unparse-directory-separator "\\")
                        (simplify-namestring #'simplify-win32-namestring)
-                       (customary-case :upper))))
+                       (customary-case :lower))))
 (defparameter *win32-host* (make-win32-host))
 (defun make-win32-host-load-form (host)
   (declare (ignore host))
@@ -515,17 +515,27 @@ the operating system native pathname conventions."
     ((member :unspecific) '(:relative))
     (list
      (collect ((results))
-       (results (pop directory))
-       (dolist (piece directory)
-         (cond ((member piece '(:wild :wild-inferiors :up :back))
-                (results piece))
-               ((or (simple-string-p piece) (pattern-p piece))
-                (results (maybe-diddle-case piece diddle-case)))
-               ((stringp piece)
-                (results (maybe-diddle-case (coerce piece 'simple-string)
-                                            diddle-case)))
-               (t
-                (error "~S is not allowed as a directory component." piece))))
+       (let ((root (pop directory)))
+         (if (member root '(:relative :absolute))
+             (results root)
+             (error "List of directory components must start with ~S or ~S."
+                    :absolute :relative)))
+       (when directory
+         (let ((next (pop directory)))
+           (if (or (eq :home next)
+                   (typep next '(cons (eql :home) (cons string null))))
+               (results next)
+               (push next directory)))
+         (dolist (piece directory)
+           (cond ((member piece '(:wild :wild-inferiors :up :back))
+                  (results piece))
+                 ((or (simple-string-p piece) (pattern-p piece))
+                  (results (maybe-diddle-case piece diddle-case)))
+                 ((stringp piece)
+                  (results (maybe-diddle-case (coerce piece 'simple-string)
+                                              diddle-case)))
+                 (t
+                  (error "~S is not allowed as a directory component." piece)))))
        (results)))
     (simple-string
      `(:absolute ,(maybe-diddle-case directory diddle-case)))
@@ -853,7 +863,7 @@ a host-structure or string."
   (cond
     (junk-allowed
      (handler-case
-         (%parse-namestring namestr host defaults start end nil)
+         (%parse-native-namestring namestr host defaults start end nil as-directory)
        (namestring-parse-error (condition)
          (values nil (namestring-parse-error-offset condition)))))
     (t
@@ -1256,7 +1266,7 @@ system's syntax for files."
 (defun translate-pathname (source from-wildname to-wildname &key)
   #!+sb-doc
   "Use the source pathname to translate the from-wildname's wild and
-   unspecified elements into a completed to-pathname based on the to-wildname."
+unspecified elements into a completed to-pathname based on the to-wildname."
   (declare (type pathname-designator source from-wildname to-wildname))
   (with-pathname (source source)
     (with-pathname (from from-wildname)
@@ -1351,7 +1361,7 @@ system's syntax for files."
 ;;; a new one if necessary.
 (defun intern-logical-host (thing)
   (declare (values logical-host))
-  (with-locked-hash-table (*logical-hosts*)
+  (with-locked-system-table (*logical-hosts*)
     (or (find-logical-host thing nil)
         (let* ((name (logical-word-or-lose thing))
                (new (make-logical-host :name name)))
@@ -1708,17 +1718,33 @@ system's syntax for files."
 
 (defun load-logical-pathname-translations (host)
   #!+sb-doc
+  "Reads logical pathname translations from SYS:SITE;HOST.TRANSLATIONS.NEWEST,
+with HOST replaced by the supplied parameter. Returns T on success.
+
+If HOST is already defined as logical pathname host, no file is loaded and NIL
+is returned.
+
+The file should contain a single form, suitable for use with
+\(SETF LOGICAL-PATHNAME-TRANSLATIONS).
+
+Note: behaviour of this function is higly implementation dependent, and
+historically it used to be a no-op in SBcL -- the current approach is somewhat
+experimental and subject to change."
   (declare (type string host)
            (values (member t nil)))
   (if (find-logical-host host nil)
       ;; This host is already defined, all is well and good.
       nil
       ;; ANSI: "The specific nature of the search is
-      ;; implementation-defined." SBCL: doesn't search at all
-      ;;
-      ;; FIXME: now that we have a SYS host that the system uses, it
-      ;; might be cute to search in "SYS:TRANSLATIONS;<name>.LISP"
-      (error "logical host ~S not found" host)))
+      ;; implementation-defined."
+      (prog1 t
+        (setf (logical-pathname-translations host)
+              (with-open-file (lpt (make-pathname :host "SYS"
+                                                  :directory '(:absolute "SITE")
+                                                  :name host
+                                                  :type "TRANSLATIONS"
+                                                  :version :newest))
+                (read lpt))))))
 
 (defun !pathname-cold-init ()
   (let* ((sys *default-pathname-defaults*)
@@ -1741,3 +1767,29 @@ system's syntax for files."
           `(("SYS:SRC;**;*.*.*" ,src)
             ("SYS:CONTRIB;**;*.*.*" ,contrib)
             ("SYS:OUTPUT;**;*.*.*" ,output)))))
+
+(defun set-sbcl-source-location (pathname)
+  "Initialize the SYS logical host based on PATHNAME, which should be
+the top-level directory of the SBCL sources. This will replace any
+existing translations for \"SYS:SRC;\", \"SYS:CONTRIB;\", and
+\"SYS:OUTPUT;\". Other \"SYS:\" translations are preserved."
+  (let ((truename (truename pathname))
+        (current-translations
+         (remove-if (lambda (translation)
+                      (or (pathname-match-p "SYS:SRC;" translation)
+                          (pathname-match-p "SYS:CONTRIB;" translation)
+                          (pathname-match-p "SYS:OUTPUT;" translation)))
+                    (logical-pathname-translations "SYS")
+                    :key #'first)))
+    (flet ((physical-target (component)
+             (merge-pathnames
+              (make-pathname :directory (list :relative component
+                                              :wild-inferiors)
+                             :name :wild
+                             :type :wild)
+              truename)))
+      (setf (logical-pathname-translations "SYS")
+            `(("SYS:SRC;**;*.*.*" ,(physical-target "src"))
+              ("SYS:CONTRIB;**;*.*.*" ,(physical-target "contrib"))
+              ("SYS:OUTPUT;**;*.*.*" ,(physical-target "output"))
+              ,@current-translations)))))

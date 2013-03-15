@@ -29,7 +29,7 @@
     (inst li (logxor other-pointer-lowtag fun-pointer-lowtag) temp2)
     (inst xor temp1 temp2 temp1)
     (inst comb := temp1 zero-tn FUNCTION-PTR)
-    (inst li 3 temp1)  ; pick off fixnums
+    (inst li fixnum-tag-mask temp1)  ; pick off fixnums
     (inst li 1 temp2)
     (inst and temp1 object result)
     (inst comb := result zero-tn DONE)
@@ -129,24 +129,7 @@
   (:results (res :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
   (:generator 1
-    (inst zdep ptr 29 29 res)))
-
-(define-vop (make-other-immediate-type)
-  (:args (val :scs (any-reg descriptor-reg))
-         (type :scs (any-reg descriptor-reg immediate) :target temp))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:temporary (:scs (non-descriptor-reg)) t2)
-  (:generator 2
-    (sc-case type
-      ((immediate)
-        (inst sll val n-widetag-bits temp)
-        (inst li (tn-value type) t2)
-        (inst or temp t2 res))
-      (t
-        (inst sra type 2 temp)
-        (inst sll val (- n-widetag-bits 2) res)
-        (inst or res temp res)))))
+    (inst zdep ptr n-positive-fixnum-bits n-positive-fixnum-bits res)))
 
 ;;;; Allocation
 
@@ -259,3 +242,8 @@
       (inst addi 1 count count)
       (inst stw count offset count-vector))))
 
+;;;; Dummy definition for a spin-loop hint VOP
+(define-vop (spin-loop-hint)
+  (:translate spin-loop-hint)
+  (:policy :fast-safe)
+  (:generator 0))

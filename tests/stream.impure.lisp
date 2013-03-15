@@ -80,7 +80,8 @@
                        type-error))
 (assert (raises-error? (with-open-file (s "/dev/zero")
                          (read-byte s))
-                       type-error))
+                       #-win32 type-error
+                       #+win32 sb-int:simple-file-error))
 ;;; bidirectional streams getting confused about their position
 (let ((p "bidirectional-stream-test"))
   (with-open-file (s p :direction :output :if-exists :supersede)
@@ -131,27 +132,28 @@
 
 ;;; CLOSING a non-new streams should not delete them, and superseded
 ;;; files should be restored.
-(let ((test "test-file-for-close-should-not-delete"))
-  (macrolet ((test-mode (mode)
-               `(progn
-                 (catch :close-test-exit
-                   (with-open-file (f test :direction :output :if-exists ,mode)
-                     (write-line "test" f)
-                     (throw :close-test-exit t)))
-                 (assert (and (probe-file test) ,mode)))))
-    (unwind-protect
-         (progn
-           (with-open-file (f test :direction :output)
-             (write-line "test" f))
-           (test-mode :append)
-           (test-mode :overwrite)
-           ;; FIXME: We really should recover supersede files as well, according to
-           ;; CLOSE in CLHS, but at the moment we don't.
-           ;; (test-mode :supersede)
-           (test-mode :rename)
-           (test-mode :rename-and-delete))
-      (when (probe-file test)
-        (delete-file test)))))
+(with-test (:name test-file-for-close-should-not-delete :fails-on :win32)
+  (let ((test "test-file-for-close-should-not-delete"))
+    (macrolet ((test-mode (mode)
+                          `(progn
+                             (catch :close-test-exit
+                               (with-open-file (f test :direction :output :if-exists ,mode)
+                                               (write-line "test" f)
+                                               (throw :close-test-exit t)))
+                             (assert (and (probe-file test) ,mode)))))
+      (unwind-protect
+          (progn
+            (with-open-file (f test :direction :output)
+                            (write-line "test" f))
+            (test-mode :append)
+            (test-mode :overwrite)
+            ;; FIXME: We really should recover supersede files as well, according to
+            ;; CLOSE in CLHS, but at the moment we don't.
+            ;; (test-mode :supersede)
+            (test-mode :rename)
+            (test-mode :rename-and-delete))
+        (when (probe-file test)
+          (delete-file test))))))
 
 ;;; test for read-write invariance of signed bytes, from Bruno Haible
 ;;; cmucl-imp 2004-09-06
@@ -592,7 +594,7 @@
 ;;; READ-CHAR-NO-HANG on bivalent streams (as returned by RUN-PROGRAM)
 ;;; was wrong.  CSR managed to promote the wrongness to all streams in
 ;;; the 1.0.32.x series, breaking slime instantly.
-(with-test (:name :read-char-no-hang-after-unread-char)
+(with-test (:name :read-char-no-hang-after-unread-char :skipped-on :win32)
   (let* ((process (run-program "/bin/sh" '("-c" "echo a && sleep 10")
                                :output :stream :wait nil))
          (stream (process-output process))
@@ -606,5 +608,129 @@
       ;; immediately
       (read-char-no-hang stream)
       (assert (< (- (get-universal-time) time) 2)))))
+
+(require :sb-posix)
+#-win32
+(with-test (:name :interrupt-open :skipped-on :win32)
+  (let ((fifo nil)
+        (to 0))
+    (unwind-protect
+         (progn
+           ;; Make a FIFO
+           (setf fifo (sb-posix:mktemp "SBCL-fifo.XXXXXXX"))
+           (sb-posix:mkfifo fifo (logior sb-posix:s-iwusr sb-posix:s-irusr))
+           ;; Try to open it (which hangs), and interrupt ourselves with a timer,
+           ;; continue (this used to result in an error due to open(2) returning with
+           ;; EINTR, then interupt again and unwind.
+           (handler-case
+               (with-timeout 2
+                 (handler-bind ((timeout (lambda (c)
+                                           (when (eql 1 (incf to))
+                                             (continue c)))))
+                   (with-timeout 1
+                     (with-open-file (f fifo :direction :input)
+                       :open))))
+             (timeout ()
+               (if (eql 2 to)
+                   :timeout
+                   :wtf))
+             (error (e)
+               e)))
+      (when fifo
+        (ignore-errors (delete-file fifo))))))
+
+#-win32
+(with-test (:name :overeager-character-buffering :skipped-on :win32)
+  (let ((fifo nil)
+        (proc nil))
+    (maphash
+     (lambda (format _)
+       (declare (ignore _))
+       (format t "trying ~A~%" format)
+       (finish-output t)
+       (unwind-protect
+            (progn
+              (setf fifo (sb-posix:mktemp "SBCL-fifo-XXXXXXX"))
+              (sb-posix:mkfifo fifo (logior sb-posix:s-iwusr sb-posix:s-irusr))
+              ;; KLUDGE: because we have both ends in the same process, we would
+              ;; need to use O_NONBLOCK, but this works too.
+              (setf proc
+                    (run-program "/bin/sh"
+                                 (list "-c"
+                                       (format nil "cat > ~A" (native-namestring fifo)))
+                                 :input :stream
+                                 :wait nil
+                                 :external-format format))
+              (write-line "foobar" (process-input proc))
+              (finish-output (process-input proc))
+              (with-open-file (f fifo :direction :input :external-format format)
+                (assert (equal "foobar" (read-line f)))))
+         (when proc
+           (ignore-errors
+             (close (process-input proc) :abort t)
+             (process-wait proc))
+           (ignore-errors (process-close proc))
+           (setf proc nil))
+         (when fifo
+           (ignore-errors (delete-file fifo))
+           (setf fifo nil))))
+     sb-impl::*external-formats*)))
+
+(with-test (:name :bug-657183 :skipped-on '(not :sb-unicode))
+  #+sb-unicode
+  (let ((name (merge-pathnames "stream-impure.temp-test"))
+        (text '(#\GREEK_SMALL_LETTER_LAMDA
+                #\JAPANESE_BANK_SYMBOL
+                #\Space
+                #\HEAVY_BLACK_HEART))
+        (positions '(2 5 6 9))
+        (sb-impl::*default-external-format* :utf-8))
+    (unwind-protect
+         (progn
+           (with-open-file (f name :external-format :default :direction :output
+                              :if-exists :supersede)
+             (assert (eql 0 (file-position f)))
+             (mapc (lambda (char pos)
+                     (write-char char f)
+                     (assert (eql pos (file-position f))))
+                   text
+                   positions))
+           (with-open-file (f name :external-format :default :direction :input)
+             (assert (eql 0 (file-position f)))
+             (assert (eql (pop text) (read-char f)))
+             (assert (eql (file-position f) 2))
+             (assert (eql (pop text) (read-char f)))
+             (assert (eql (file-position f) 5))
+             (assert (eql (pop text) (read-char f)))
+             (assert (eql (file-position f) 6))
+             (assert (eql (pop text) (read-char f)))
+             (assert (eql (file-position f) 9))
+             (assert (eql (file-length f) 9))))
+      (ignore-errors (delete-file name)))))
+
+(with-test (:name :bug-561642)
+  (let ((p "bug-561642-test.tmp"))
+    (unwind-protect
+         (progn
+           (with-open-file (f p
+                              :if-exists :supersede
+                              :if-does-not-exist :create
+                              :direction :output)
+             (write-line "FOOBAR" f))
+           (with-open-file (f p
+                              :if-exists :append
+                              :direction :output)
+             (let ((p0 (file-position f))
+                   (p1 (progn
+                         (write-char #\newline f)
+                         (file-position f)))
+                   (p2 (progn
+                         (write-char #\newline f)
+                         (finish-output f)
+                         (file-position f))))
+               (assert (eql 7 p0))
+               (assert (eql 8 p1))
+               (assert (eql 9 p2)))))
+      (ignore-errors (delete-file p)))))
 
 ;;; success

@@ -41,7 +41,7 @@ distribution for more information.
 * (+ 2 2)
 
 4
-* (quit)
+* (exit)
 $
 @end smallexample
 
@@ -66,8 +66,7 @@ Integration}.
 @node Shebang Scripts
 @comment  node-name,  next,  previous,  up
 @subsection Shebang Scripts
-@vindex sb-ext:*posix-argv*
-@vindex *posix-argv*
+@vindex @sbext{@earmuffs{posix-argv}}
 
 Standard Unix tools that are interpreters follow a common command line
 protocol that is necessary to work with ``shebang scripts''. SBCL supports
@@ -97,22 +96,21 @@ Hello, World!
 @section Stopping SBCL
 
 @menu
-* Quit::                        
+* Exit::
 * End of File::                 
 * Saving a Core Image::         
 * Exit on Errors::              
 @end menu
 
-@node Quit
+@node Exit
 @comment  node-name,  next,  previous,  up
-@subsection Quit
+@subsection Exit
 
-SBCL can be stopped at any time by calling @code{sb-ext:quit},
+SBCL can be stopped at any time by calling @code{sb-ext:exit},
 optionally returning a specified numeric value to the calling process.
-See notes in @ref{Threading} about the interaction between this
-feature and sessions.
+See @ref{Threading} for information about terminating individual threads.
 
-@include fun-sb-ext-quit.texinfo
+@include fun-sb-ext-exit.texinfo
 
 @node End of File
 @comment  node-name,  next,  previous,  up
@@ -132,6 +130,13 @@ process, and is also provided as an extension to the user.
 
 @include fun-sb-ext-save-lisp-and-die.texinfo
 @include var-sb-ext-star-save-hooks-star.texinfo
+
+In cases where the standard initialization files have already been loaded
+into the saved core, and alternative ones should be used (or none at all),
+SBCL allows customizing the initfile pathname computation.
+
+@include var-sb-ext-star-sysinit-pathname-function-star.texinfo
+@include var-sb-ext-star-userinit-pathname-function-star.texinfo
 
 To facilitate distribution of SBCL applications using external
 resources, the filesystem location of the SBCL core file being used is
@@ -215,10 +220,14 @@ cleanly in Unix pipelines. See also the @code{--noprint} and
 @code{--disable-debugger} options.
 
 @item --disable-ldb
+@cindex ldb
+@cindex ldb, disabling
+@cindex disabling ldb
 Disable the low-level debugger. Only effective if SBCL is compiled
 with LDB.
 
 @item --lose-on-corruption
+@cindex ldb
 There are some dangerous low level errors (for instance, control stack
 exhausted, memory fault) that (or whose handlers) can corrupt the
 image. By default SBCL prints a warning, then tries to continue and
@@ -226,11 +235,34 @@ handle the error in Lisp, but this will not always work and SBCL may
 malfunction or even hang. With this option, upon encountering such an
 error SBCL will invoke ldb (if present and enabled) or else exit.
 
+
 @item --script @var{filename}
 As a runtime option this is equivalent to @code{--noinform}
 @code{--disable-ldb} @code{--lose-on-corruption}
 @code{--end-runtime-options} @code{--script} @var{filename}. See the
-description of @code{--script} as a toplevel option below.
+description of @code{--script} as a toplevel option below. If there
+are no other commandline arguments following @code{--script}, the
+filename argument can be omitted.
+
+
+@item --merge-core-pages
+When platform support is present, provide hints to the operating system
+that identical pages may be shared between processes until they are
+written to.  This can be useful to reduce the memory usage on systems
+with multiple SBCL processes started from similar but differently-named
+core files, or from compressed cores.  Without platform support, do
+nothing.
+
+
+@item --no-merge-core-pages
+Ensures that no sharing hint is provided to the operating system.
+
+
+@item --default-merge-core-pages
+Reverts the sharing hint policy to the default: only compressed cores
+trigger hinting.  Uncompressed cores are mapped directly from the core
+file, which is usually enough to ensure sharing.
+
 
 @item --help
 Print some basic information about SBCL, then exit.
@@ -281,9 +313,9 @@ special syntax is intended to reduce quoting headaches when invoking
 SBCL from shell scripts.
 
 @item --noprint
-When ordinarily the toplevel "read-eval-print loop" would be exe-
-cuted, execute a "read-eval loop" instead, i.e. don't print a prompt
-and don't echo results. Combined with the @code{--noinform} runtime
+When ordinarily the toplevel "read-eval-print loop" would be executed,
+execute a "read-eval loop" instead, i.e. don't print a prompt and
+don't echo results. Combined with the @code{--noinform} runtime
 option, this makes it easier to write Lisp "scripts" which work
 cleanly in Unix pipelines.
 
@@ -303,6 +335,16 @@ Implies @code{--no-userinit} @code{--no-sysinit}
 Causes the system to load the specified file instead of entering the
 read-eval-print-loop, and exit afterwards. If the file begins with a
 shebang line, it is ignored.
+
+If there are no other command line arguments following, the filename
+can be omitted: this causes the script to be loaded from standard
+input instead. Shebang lines in standard input script are currently
+@emph{not} ignored.
+
+In either case, if there is an unhandled error (e.g. end of file, or a
+broken pipe) on either standard input, standard output, or standard
+error, the script silently exits with code 0. This allows e.g. safely
+piping output from SBCL to @code{head -n1} or similar.
 
 @end table
 

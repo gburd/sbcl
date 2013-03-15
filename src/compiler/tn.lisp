@@ -199,20 +199,36 @@
 ;;; Create a constant TN. The implementation dependent
 ;;; IMMEDIATE-CONSTANT-SC function is used to determine whether the
 ;;; constant has an immediate representation.
-(defun make-constant-tn (constant)
+(defun make-constant-tn (constant boxedp)
   (declare (type constant constant))
-  (let* ((component (component-info *component-being-compiled*))
-         (immed (immediate-constant-sc (constant-value constant)))
-         (sc (svref *backend-sc-numbers*
-                    (or immed (sc-number-or-lose 'constant))))
-         (res (make-tn 0 :constant (primitive-type (leaf-type constant)) sc)))
-    (unless immed
-      (let ((constants (ir2-component-constants component)))
-        (setf (tn-offset res) (fill-pointer constants))
-        (vector-push-extend constant constants)))
-    (push-in tn-next res (ir2-component-constant-tns component))
-    (setf (tn-leaf res) constant)
-    res))
+  (let* ((immed (immediate-constant-sc (constant-value constant)))
+         (use-immed-p (and immed
+                           (or (not boxedp)
+                               (boxed-immediate-sc-p immed)))))
+    (cond
+      ;; CONSTANT-TN uses two caches, one for boxed and one for unboxed uses.
+      ;;
+      ;; However, in the case of USE-IMMED-P we can have the same TN for both
+      ;; uses. The first two legs here take care of that by cross-pollinating the
+      ;; cached values.
+      ;;
+      ;; Similarly, when there is no immediate SC.
+      ((and (or use-immed-p (not immed)) boxedp (leaf-info constant)))
+      ((and (or use-immed-p (not immed)) (not boxedp) (constant-boxed-tn constant)))
+      (t
+       (let* ((component (component-info *component-being-compiled*))
+              (sc (svref *backend-sc-numbers*
+                         (if use-immed-p
+                             immed
+                             (sc-number-or-lose 'constant))))
+              (res (make-tn 0 :constant (primitive-type (leaf-type constant)) sc)))
+         (unless use-immed-p
+           (let ((constants (ir2-component-constants component)))
+             (setf (tn-offset res) (fill-pointer constants))
+             (vector-push-extend constant constants)))
+         (push-in tn-next res (ir2-component-constant-tns component))
+         (setf (tn-leaf res) constant)
+         res)))))
 
 (defun make-load-time-value-tn (handle type)
   (let* ((component (component-info *component-being-compiled*))
@@ -376,6 +392,11 @@
   (let ((2block (block-info block)))
     (or (ir2-block-%label 2block)
         (setf (ir2-block-%label 2block) (gen-label)))))
+(defun block-trampoline (block)
+  (declare (type cblock block))
+  (let ((2block (block-info block)))
+    (or (ir2-block-%trampoline-label 2block)
+        (setf (ir2-block-%trampoline-label 2block) (gen-label)))))
 
 ;;; Return true if Block is emitted immediately after the block ended by Node.
 (defun drop-thru-p (node block)
@@ -383,6 +404,11 @@
   (let ((next-block (ir2-block-next (block-info (node-block node)))))
     (aver (eq node (block-last (node-block node))))
     (eq next-block (block-info block))))
+(defun register-drop-thru (block)
+  (declare (type cblock block))
+  (let ((2block (block-info block)))
+    (setf (ir2-block-dropped-thru-to 2block) t))
+  nil)
 
 ;;; Link a list of VOPs from First to Last into Block, Before the specified
 ;;; VOP. If Before is NIL, insert at the end.

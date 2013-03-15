@@ -11,7 +11,7 @@
 
 .PHONY: all clean TAGS tags targets
 
-all: targets
+all: targets tags
 TARGET=sbcl
 
 # Defaults which might be overridden or modified by values in the
@@ -23,9 +23,11 @@ NM = nm -gp
 DEPEND_FLAGS = -MM
 GREP = grep
 
+include ../../output/prefix.def
+
 CFLAGS = -g -Wall -Wsign-compare -O3
 ASFLAGS = $(CFLAGS)
-CPPFLAGS = -I.
+CPPFLAGS = -I. -DSBCL_PREFIX=\"$(SBCL_PREFIX)\"
 
 # Give make access to the target Lisp features.
 include genesis/Makefile.features
@@ -41,9 +43,9 @@ include Config
 COMMON_SRC = alloc.c backtrace.c breakpoint.c coreparse.c \
 	dynbind.c funcall.c gc-common.c globals.c interr.c interrupt.c \
 	largefile.c monitor.c os-common.c parse.c print.c purify.c \
-	pthread-futex.c pthread-lutex.c \
-	regnames.c run-program.c runtime.c save.c search.c \
-	thread.c time.c util.c validate.c vars.c wrap.c	
+	pthread-futex.c \
+	regnames.c run-program.c runtime.c safepoint.c save.c search.c \
+	thread.c time.c util.c validate.c vars.c wrap.c
 
 C_SRC = $(COMMON_SRC) ${ARCH_SRC} ${OS_SRC} ${GC_SRC}
 
@@ -66,8 +68,10 @@ sbcl.h: $(wildcard genesis/*.h)
 	echo '#include "genesis/config.h"' >sbcl.h
 	echo '#include "genesis/constants.h"' >>sbcl.h
 
+# || true because we don't want the build to break if etags isn't there.
+# ...but it's still nice to have it done by default.
 TAGS tags: $(SRCS)
-	etags $(SRCS)
+	etags $(SRCS) || true
 
 clean:
 	-rm -f *.[do] $(TARGET) sbcl.nm sbcl.h core *.tmp $(OS_CLEAN_FILES)

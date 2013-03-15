@@ -14,6 +14,7 @@
 (in-package :cl-user)
 
 (load "assertoid.lisp")
+(load "compiler-test-util.lisp")
 (use-package "ASSERTOID")
 
 ;;;; Our little labrats and a few utilities
@@ -190,10 +191,10 @@
     (unintern (or (find-symbol *interned* :test) (error "bugo")) :test)
     (delete-package :test-delete)
 
-    ;; defining or undefining as a function
-    (defun test:unused () 'foo)
-    (setf (fdefinition 'test:unused) (lambda () 'bar))
-    (setf (symbol-function 'test:unused) (lambda () 'quux))
+    ;; redefining or undefining as a function
+    (defun test:function () 'foo)
+    (setf (fdefinition 'test:function) (lambda () 'bar))
+    (setf (symbol-function 'test:function) (lambda () 'quux))
     (tmp-fmakunbound 'test:function)
 
     ;; defining or undefining as a macro or compiler macro
@@ -332,29 +333,33 @@
 ;;; Unlocked. No errors nowhere.
 (reset-test nil)
 
-(dolist (form (append *legal-forms* *illegal-forms*))
-  (with-error-info ("~Unlocked form: ~S~%" form)
-    (eval form)))
+(with-test (:name :unlocked-package)
+  (dolist (form (append *legal-forms* *illegal-forms*))
+    (with-error-info ("~Unlocked form: ~S~%" form)
+      (eval form))))
 
 ;;; Locked. Errors for all illegal forms, none for legal.
 (reset-test t)
 
-(dolist (form *legal-forms*)
-  (with-error-info ("locked legal form: ~S~%" form)
-    (eval form)))
+(with-test (:name :locked-package/legal-forms)
+  (dolist (form *legal-forms*)
+    (with-error-info ("locked legal form: ~S~%" form)
+      (eval form))))
 
-(dolist (form (append *illegal-runtime-forms* *illegal-double-forms*))
-  (with-error-info ("locked illegal runtime form: ~S~%" form)
-    (let ((fun (compile nil `(lambda () ,form))))
-      (assert (raises-error? (funcall fun) sb-ext:package-lock-violation)))
-    (assert (raises-error? (eval form) sb-ext:package-lock-violation))))
-
-(dolist (pair *illegal-lexical-forms-alist*)
-  (let ((form (cdr pair)))
-    (with-error-info ("compile locked illegal lexical form: ~S~%" form)
+(with-test (:name :locked-package/illegal-runtime-forms)
+  (dolist (form (append *illegal-runtime-forms* *illegal-double-forms*))
+    (with-error-info ("locked illegal runtime form: ~S~%" form)
       (let ((fun (compile nil `(lambda () ,form))))
-        (assert (raises-error? (funcall fun) program-error)))
-      (assert (raises-error? (eval form) program-error)))))
+        (assert (raises-error? (funcall fun) sb-ext:package-lock-violation)))
+      (assert (raises-error? (eval form) sb-ext:package-lock-violation)))))
+
+(with-test (:name :locked-package/illegal-lexical-forms)
+  (dolist (pair *illegal-lexical-forms-alist*)
+    (let ((form (cdr pair)))
+      (with-error-info ("compile locked illegal lexical form: ~S~%" form)
+        (let ((fun (compile nil `(lambda () ,form))))
+          (assert (raises-error? (funcall fun) program-error)))
+        (assert (raises-error? (eval form) program-error))))))
 
 ;;; Locked, WITHOUT-PACKAGE-LOCKS
 (reset-test t)
@@ -451,6 +456,7 @@
 ;;;; See that trace on functions in locked packages doesn't break
 ;;;; anything.
 (assert (trace test:function :break t))
+(untrace test:function)
 
 ;;;; No bogus violations from defclass with accessors in a locked
 ;;;; package. Reported by by Francois-Rene Rideau.
@@ -488,5 +494,77 @@
 
 (assert (equal (loop :for *print-base* :from 2 :to 3 :collect *print-base*)
                '(2 3)))
+
+;;; Package lock for DEFMACRO -> DEFUN and vice-versa.
+(reset-test t)
+(with-test (:name :bug-576637)
+  (assert (raises-error? (eval `(defun test:macro (x) x))
+                         sb-ext:package-lock-violation))
+  (assert (eq 'test:macro (eval `(test:macro))))
+  (assert (raises-error? (eval `(defmacro test:function (x) x))
+                         sb-ext:package-lock-violation))
+  (assert (eq 'test:function (eval `(test:function)))))
+
+(defpackage :macro-killing-macro-1
+  (:use :cl)
+  (:lock t)
+  (:export #:to-die-for))
+
+(defpackage :macro-killing-macro-2
+  (:use :cl :macro-killing-macro-1))
+
+(ctu:file-compile
+ `((in-package :macro-killing-macro-1)
+   (defmacro to-die-for ()
+     :original))
+ :load t)
+
+(with-test (:name :defmacro-killing-macro)
+  (ignore-errors
+    (ctu:file-compile
+     `((in-package :macro-killing-macro-2)
+       (defmacro to-die-for ()
+         :replacement))))
+  (assert (eq :original (macroexpand '(macro-killing-macro-1:to-die-for)))))
+
+(with-test (:name :setf-macro-function-killing-macro)
+  (ignore-errors
+    (ctu:file-compile
+     `((in-package :macro-killing-macro-2)
+       (eval-when (:compile-toplevel)
+         (setf (macro-function 'to-die-for) (constantly :replacement2))))))
+  (assert (eq :original (macroexpand '(macro-killing-macro-1:to-die-for)))))
+
+(with-test (:name :compile-time-defun-package-locked)
+  ;; Make sure compile-time side-effects of DEFUN are protected against.
+  (let ((inline-lambda (function-lambda-expression #'fill-pointer)))
+    ;; Make sure it's actually inlined...
+    (assert inline-lambda)
+    (assert (eq :ok
+                (handler-case
+                    (ctu:file-compile `((defun fill-pointer (x) x)))
+                  (sb-ext:symbol-package-locked-error (e)
+                    (when (eq 'fill-pointer
+                              (sb-ext:package-locked-error-symbol e))
+                      :ok)))))
+    (assert (equal inline-lambda
+                   (function-lambda-expression #'fill-pointer)))))
+
+(with-test (:name :compile-time-defclass-package-locked)
+  ;; Compiling (DEFCLASS FTYPE ...) used to break SBCL, but the package
+  ;; locks didn't kick in till later.
+  (assert (eq :ok
+              (handler-case
+                  (ctu:file-compile `((defclass ftype () ())))
+                (sb-ext:symbol-package-locked-error (e)
+                  (when (eq 'ftype (sb-ext:package-locked-error-symbol e))
+                    :ok)))))
+  ;; Check for accessor violations as well.
+  (assert (eq :ok
+              (handler-case
+                  (ctu:file-compile `((defclass foo () ((ftype :reader ftype)))))
+                (sb-ext:symbol-package-locked-error (e)
+                  (when (eq 'ftype (sb-ext:package-locked-error-symbol e))
+                    :ok))))))
 
 ;;; WOOT! Done.

@@ -126,14 +126,15 @@
 ;;; MAP-INTO. RESULT and BODY are forms, which can use variables
 ;;; FUNCALL-RESULT, containing the result of application of FUN, and
 ;;; INDEX, containing the current position in sequences.
-(defun build-sequence-iterator (seqs seq-names &key result into body)
+(defun build-sequence-iterator (seqs seq-names &key result into body fast)
   (declare (type list seqs seq-names)
            (type symbol into))
   (collect ((bindings)
             (declarations)
             (vector-lengths)
             (tests)
-            (places))
+            (places)
+            (around))
     (let ((found-vector-p nil))
       (flet ((process-vector (length)
                (unless found-vector-p
@@ -150,10 +151,22 @@
                        (declarations `(type list ,index))
                        (places `(car ,index))
                        (tests `(endp ,index))))
-                    ((csubtypep type (specifier-type 'vector))
+                    ((or (csubtypep type (specifier-type '(simple-array * 1)))
+                         (and (not fast)
+                              (csubtypep type (specifier-type 'vector))))
                      (process-vector `(length ,seq-name))
                      (places `(locally (declare (optimize (insert-array-bounds-checks 0)))
                                 (aref ,seq-name index))))
+                    ((csubtypep type (specifier-type 'vector))
+                     (let ((data  (gensym "DATA"))
+                           (start (gensym "START"))
+                           (end   (gensym "END")))
+                       (around `(with-array-data ((,data ,seq-name)
+                                                  (,start)
+                                                  (,end (length ,seq-name)))))
+                       (process-vector `(- ,end ,start))
+                       (places `(locally (declare (optimize (insert-array-bounds-checks 0)))
+                                  (aref ,data (truly-the index (+ index ,start)))))))
                     (t
                      (give-up-ir1-transform
                       "can't determine sequence argument type"))))
@@ -162,12 +175,18 @@
       (when found-vector-p
         (bindings `(length (min ,@(vector-lengths))))
         (tests `(>= index length)))
-      `(do (,@(bindings))
-           ((or ,@(tests)) ,result)
-         (declare ,@(declarations))
-         (let ((funcall-result (funcall fun ,@(places))))
-           (declare (ignorable funcall-result))
-           ,body)))))
+      (let ((body `(do (,@(bindings))
+                       ((or ,@(tests)) ,result)
+                     (declare ,@(declarations))
+                     (let ((funcall-result (funcall fun ,@(places))))
+                       (declare (ignorable funcall-result))
+                       ,body))))
+        (if (around)
+            (reduce (lambda (wrap body) (append wrap (list body)))
+                    (around)
+                    :from-end t
+                    :initial-value body)
+            body)))))
 
 ;;; Try to compile %MAP efficiently when we can determine sequence
 ;;; argument types at compile time.
@@ -182,7 +201,7 @@
 ;;; the reader, because the code is complicated enough already and I
 ;;; don't happen to need that functionality right now. -- WHN 20000410
 (deftransform %map ((result-type fun seq &rest seqs) * *
-                    :policy (>= speed space))
+                    :node node :policy (>= speed space))
   "open code"
   (unless (constant-lvar-p result-type)
     (give-up-ir1-transform "RESULT-TYPE argument not constant"))
@@ -244,25 +263,45 @@
                       ,(build-sequence-iterator
                         seqs seq-args
                         :result result
-                        :body push-dacc))))))))))
+                        :body push-dacc
+                        :fast (policy node (> speed space))))))))))))
 
 ;;; MAP-INTO
 (deftransform map-into ((result fun &rest seqs)
                         (vector * &rest *)
-                        *)
+                        * :node node)
   "open code"
   (let ((seqs-names (mapcar (lambda (x)
                               (declare (ignore x))
                               (gensym))
                             seqs)))
     `(lambda (result fun ,@seqs-names)
-       ,(build-sequence-iterator
-         seqs seqs-names
-         :result '(when (array-has-fill-pointer-p result)
-                   (setf (fill-pointer result) index))
-         :into 'result
-         :body '(locally (declare (optimize (insert-array-bounds-checks 0)))
-                 (setf (aref result index) funcall-result)))
+       ,(if (and (policy node (> speed space))
+                 (not (csubtypep (lvar-type result)
+                                 (specifier-type '(simple-array * 1)))))
+            (let ((data  (gensym "DATA"))
+                  (start (gensym "START"))
+                  (end   (gensym "END")))
+              `(with-array-data ((,data result)
+                                 (,start)
+                                 (,end))
+                 (declare (ignore ,end))
+                 ,(build-sequence-iterator
+                   seqs seqs-names
+                   :result '(when (array-has-fill-pointer-p result)
+                             (setf (fill-pointer result) index))
+                   :into 'result
+                   :body `(locally (declare (optimize (insert-array-bounds-checks 0)))
+                           (setf (aref ,data (truly-the index (+ index ,start)))
+                                 funcall-result))
+                   :fast t)))
+            (build-sequence-iterator
+             seqs seqs-names
+             :result '(when (array-has-fill-pointer-p result)
+                       (setf (fill-pointer result) index))
+             :into 'result
+             :body '(locally (declare (optimize (insert-array-bounds-checks 0)))
+                     (setf (aref result index) funcall-result))))
        result)))
 
 
@@ -315,6 +354,8 @@
                    (load-time-value (find-package "SB!KERNEL")))
       (bug "Unknown list item seek transform: name=~S, key-functions=~S variant=~S"
            function-name key-functions variant)))
+
+(defparameter *list-open-code-limit* 128)
 
 (defun transform-list-item-seek (name item list key test test-not node)
   (when (and test test-not)
@@ -376,7 +417,8 @@
         (let* ((cp (constant-lvar-p list))
                (c-list (when cp (lvar-value list))))
           (cond ((and cp c-list (member name '(assoc rassoc member))
-                      (policy node (>= speed space)))
+                      (policy node (>= speed space))
+                      (not (nthcdr *list-open-code-limit* c-list)))
                  `(let ,(mapcar (lambda (fun) `(,(second fun) ,(ensure-fun fun))) funs)
                     ,(open-code c-list)))
                 ((and cp (not c-list))
@@ -431,7 +473,8 @@
                         ,(open-code (cdr tail))))))
         (let* ((cp (constant-lvar-p list))
                (c-list (when cp (lvar-value list))))
-          (cond ((and cp c-list (policy node (>= speed space)))
+          (cond ((and cp c-list (policy node (>= speed space))
+                      (not (nthcdr *list-open-code-limit* c-list)))
                  `(let ((pred ,pred-expr)
                         ,@(when key `((key ,key-form))))
                     ,(open-code c-list)))
@@ -482,21 +525,11 @@
 ;;; almost as fast as MEMQ.
 (deftransform delete ((item list &key test) (t list &rest t) *)
   "convert to EQ test"
-  ;; FIXME: The scope of this transformation could be
-  ;; widened somewhat, letting it work whenever the test is
-  ;; 'EQL and we know from the type of ITEM that it #'EQ
-  ;; works like #'EQL on it. (E.g. types FIXNUM, CHARACTER,
-  ;; and SYMBOL.)
-  ;;   If TEST is EQ, apply transform, else
-  ;;   if test is not EQL, then give up on transform, else
-  ;;   if ITEM is not a NUMBER or is a FIXNUM, apply
-  ;;   transform, else give up on transform.
-  (cond (test
-         (unless (lvar-fun-is test '(eq))
-           (give-up-ir1-transform)))
-        ((types-equal-or-intersect (lvar-type item)
-                                   (specifier-type 'number))
-         (give-up-ir1-transform "Item might be a number.")))
+  (let ((type (lvar-type item)))
+    (unless (or (and test (lvar-fun-is test '(eq)))
+                (and (eq-comparable-type-p type)
+                     (or (not test) (lvar-fun-is test '(eql)))))
+      (give-up-ir1-transform)))
   `(delq item list))
 
 (deftransform delete-if ((pred list) (t list))
@@ -518,9 +551,9 @@
                     (vector t &key (:start t) (:end t))
                     *
                     :node node)
-  (let* ((element-ctype (extract-upgraded-element-type seq))
+  (let* ((type (lvar-type seq))
+         (element-ctype (array-type-upgraded-element-type type))
          (element-type (type-specifier element-ctype))
-         (type (lvar-type seq))
          (saetp (unless (eq *wild-type* element-ctype)
                   (find-saetp-by-ctype element-ctype))))
     (cond ((eq *wild-type* element-ctype)
@@ -610,16 +643,28 @@
                                                            (logior res (ash bits (truly-the (integer 0 ,(- sb!vm:n-word-bits n-bits)) i))))))))
                            res)))))
              (values
-              `(with-array-data ((data seq)
-                                 (start start)
-                                 (end end)
-                                 :check-fill-pointer t)
-                 (declare (type (simple-array ,element-type 1) data))
-                 (declare (type index start end))
-                 (declare (optimize (safety 0) (speed 3))
-                          (muffle-conditions compiler-note))
-                 (,basher ,bash-value data start (- end start))
-                 seq)
+              ;; KLUDGE: WITH-ARRAY data in its full glory is going to mess up
+              ;; dynamic-extent for MAKE-ARRAY :INITIAL-ELEMENT initialization.
+              (if (csubtypep (lvar-type seq) (specifier-type '(simple-array * (*))))
+                  `(let* ((len (length seq))
+                          (end (or end len))
+                          (bound (1+ end)))
+                     ;; Minor abuse %CHECK-BOUND for bounds checking.
+                     ;; (- END START) may still end up negative, but
+                     ;; the basher handle that.
+                     (,basher ,bash-value seq
+                              (%check-bound seq bound start)
+                              (- (if end (%check-bound seq bound end) len)
+                                 start)))
+               `(with-array-data ((data seq)
+                                  (start start)
+                                  (end end)
+                                  :check-fill-pointer t)
+                  (declare (type (simple-array ,element-type 1) data))
+                  (declare (type index start end))
+                  (declare (optimize (safety 0) (speed 3)))
+                  (,basher ,bash-value data start (- end start))
+                  seq))
               `((declare (type ,element-type item))))))
           ((policy node (> speed space))
            (values
@@ -776,7 +821,7 @@
                (end1 (or end1 len1))
                (end2 (or end2 len2))
                (replace-len (min (- end1 start1) (- end2 start2))))
-          ,(unless (policy node (= safety 0))
+          ,(unless (policy node (= insert-array-bounds-checks 0))
              `(progn
                 (unless (<= 0 start1 end1 len1)
                   (sequence-bounding-indices-bad-error seq1 start1 end1))
@@ -962,7 +1007,8 @@
   (let ((type (lvar-type seq)))
     (cond
       ((and (array-type-p type)
-            (csubtypep type (specifier-type '(or (simple-unboxed-array (*)) simple-vector))))
+            (csubtypep type (specifier-type '(or (simple-unboxed-array (*)) simple-vector)))
+            (policy node (> speed space)))
        (let ((element-type (type-specifier (array-type-specialized-element-type type))))
          `(let* ((length (length seq))
                  (end (or end length)))
@@ -977,8 +1023,6 @@
                                                        'start)
                                               'result 0 'size element-type)
               result))))
-      ((csubtypep type (specifier-type 'string))
-       '(string-subseq* seq start end))
       (t
        '(vector-subseq* seq start end)))))
 
@@ -999,8 +1043,6 @@
                      (result (make-array length :element-type ',element-type)))
                 ,(maybe-expand-copy-loop-inline 'seq 0 'result 0 'length element-type)
                 result)))
-          ((csubtypep type (specifier-type 'string))
-           '(string-subseq* seq 0 nil))
           (t
            '(vector-subseq* seq 0 nil)))))
 
@@ -1022,60 +1064,80 @@
                       :node node
                       :policy (> speed (max space safety)))
   "open code"
-  (let ((from-end (when (lvar-p from-end)
-                    (unless (constant-lvar-p from-end)
-                      (give-up-ir1-transform ":FROM-END is not constant."))
-                    (lvar-value from-end)))
-        (keyp (lvar-p key))
-        (testp (lvar-p test))
-        (check-bounds-p (policy node (plusp insert-array-bounds-checks))))
-    `(block search
-       (flet ((oops (vector start end)
-                (sequence-bounding-indices-bad-error vector start end)))
-         (let* ((len1 (length pattern))
-                (len2 (length text))
-                (end1 (or end1 len1))
-                (end2 (or end2 len2))
-               ,@(when keyp
-                       '((key (coerce key 'function))))
-               ,@(when testp
-                       '((test (coerce test 'function)))))
-          (declare (type index start1 start2 end1 end2))
-          ,@(when check-bounds-p
-             `((unless (<= start1 end1 len1)
-                 (oops pattern start1 end1))
-               (unless (<= start2 end2 len2)
-                 (oops pattern start2 end2))))
-          (do (,(if from-end
-                    '(index2 (- end2 (- end1 start1)) (1- index2))
-                    '(index2 start2 (1+ index2))))
-              (,(if from-end
-                    '(< index2 start2)
-                    '(>= index2 end2))
-               nil)
-            ;; INDEX2 is FIXNUM, not an INDEX, as right before the loop
-            ;; terminates is hits -1 when :FROM-END is true and :START2
-            ;; is 0.
-            (declare (type fixnum index2))
-            (when (do ((index1 start1 (1+ index1))
-                       (index2 index2 (1+ index2)))
-                      ((>= index1 end1) t)
-                    (declare (type index index1 index2)
-                             (optimize (insert-array-bounds-checks 0)))
-                    ,@(unless from-end
-                              '((when (= index2 end2)
-                                  (return-from search nil))))
-                    (unless (,@(if testp
-                                   '(funcall test)
-                                   '(eql))
-                               ,(if keyp
-                                    '(funcall key (aref pattern index1))
-                                    '(aref pattern index1))
-                               ,(if keyp
-                                    '(funcall key (aref text index2))
-                                    '(aref text index2)))
-                      (return nil)))
-              (return index2))))))))
+  (flet ((maybe (x)
+           (when (lvar-p x)
+             (if (constant-lvar-p x)
+                 (when (lvar-value x)
+                   :yes)
+                 :maybe))))
+    (let ((from-end (when (lvar-p from-end)
+                     (unless (constant-lvar-p from-end)
+                       (give-up-ir1-transform ":FROM-END is not constant."))
+                     (lvar-value from-end)))
+         (key? (maybe key))
+         (test? (maybe test))
+         (check-bounds-p (policy node (plusp insert-array-bounds-checks))))
+     `(block search
+        (flet ((oops (vector start end)
+                 (sequence-bounding-indices-bad-error vector start end)))
+          (let* ((len1 (length pattern))
+                 (len2 (length text))
+                 (end1 (or end1 len1))
+                 (end2 (or end2 len2))
+                 ,@(case key?
+                     (:yes `((key (%coerce-callable-to-fun key))))
+                     (:maybe `((key (when key
+                                      (%coerce-callable-to-fun key))))))
+                 ,@(when test?
+                     `((test (%coerce-callable-to-fun test)))))
+            (declare (type index start1 start2 end1 end2))
+            ,@(when check-bounds-p
+                `((unless (<= start1 end1 len1)
+                    (oops pattern start1 end1))
+                  (unless (<= start2 end2 len2)
+                    (oops pattern start2 end2))))
+            (when (= end1 start1)
+              (return-from search (if from-end
+                                      end2
+                                      start2)))
+            (do (,(if from-end
+                      '(index2 (- end2 (- end1 start1)) (1- index2))
+                      '(index2 start2 (1+ index2))))
+                (,(if from-end
+                      '(< index2 start2)
+                      '(>= index2 end2))
+                 nil)
+              ;; INDEX2 is FIXNUM, not an INDEX, as right before the loop
+              ;; terminates is hits -1 when :FROM-END is true and :START2
+              ;; is 0.
+              (declare (type fixnum index2))
+              (when (do ((index1 start1 (1+ index1))
+                         (index2 index2 (1+ index2)))
+                        ((>= index1 end1) t)
+                      (declare (type index index1 index2)
+                               (optimize (insert-array-bounds-checks 0)))
+                      ,@(unless from-end
+                          '((when (= index2 end2)
+                              (return-from search nil))))
+                      (unless (,@(if test?
+                                     `(funcall test)
+                                     `(eql))
+                               ,(case key?
+                                  (:yes `(funcall key (aref pattern index1)))
+                                  (:maybe `(let ((elt (aref pattern index1)))
+                                             (if key
+                                                 (funcall key elt)
+                                                 elt)))
+                                  (otherwise `(aref pattern index1)))
+                               ,(case key?
+                                  (:yes `(funcall key (aref text index2)))
+                                  (:maybe `(let ((elt (aref text index2)))
+                                             (if key
+                                                 (funcall key elt)
+                                                 elt)))
+                                  (otherwise `(aref text index2))))
+                        (return nil)))
+                (return index2)))))))))
 
 
 ;;; Open-code CONCATENATE for strings. It would be possible to extend
@@ -1086,6 +1148,13 @@
 ;;; Only handle the simple result type cases. If somebody does (CONCATENATE
 ;;; '(STRING 6) ...) their code won't be optimized, but nobody does that in
 ;;; practice.
+;;;
+;;; Limit full open coding based on length of constant sequences. Default
+;;; value is chosen so that other parts of to compiler (constraint propagation
+;;; mainly) won't go nonlinear too badly. It's not an exact number -- but
+;;; in the right ballpark.
+(defvar *concatenate-open-code-limit* 129)
+
 (deftransform concatenate ((result-type &rest lvars)
                            ((constant-arg
                              (member string simple-string base-string simple-base-string))
@@ -1122,6 +1191,7 @@
           `(apply
             (lambda ,vars
               (declare (ignorable ,@vars))
+              (declare (optimize (insert-array-bounds-checks 0)))
               (let* ((.length. (+ ,@lengths))
                      (.pos. 0)
                      (.string. (make-string .length. :element-type ',element-type)))
@@ -1129,13 +1199,19 @@
                          (muffle-conditions compiler-note))
                 ,@(loop for value in lvar-values
                         for var in vars
-                        collect (if (stringp value)
+                        collect (if (and (stringp value)
+                                         (< (length value) *concatenate-open-code-limit*))
                                     ;; Fold the array reads for constant arguments
                                     `(progn
                                        ,@(loop for c across value
-                                               collect `(setf (aref .string.
-                                                                    .pos.) ,c)
-                                               collect `(incf .pos.)))
+                                               for i from 0
+                                               collect
+                                               ;; Without truly-the we get massive numbers
+                                               ;; of pointless error traps.
+                                                  `(setf (aref .string.
+                                                               (truly-the index (+ .pos. ,i)))
+                                                         ,c))
+                                       (incf .pos. ,(length value)))
                                     `(sb!impl::string-dispatch
                                          (#!+sb-unicode
                                           (simple-array character (*))
@@ -1195,41 +1271,49 @@
                                    *
                                    :policy (> speed space))
                 "expand inline"
-                `(let ((index 0)
-                       (find nil)
+                `(let ((find nil)
                        (position nil))
-                   (declare (type index index))
-                   (dolist (i sequence
-                            (if (and end (> end index))
-                                (sequence-bounding-indices-bad-error
-                                 sequence start end)
-                                (values find position)))
-                     (when (and end (>= index end))
-                       (return (values find position)))
-                     (when (>= index start)
-                       (let ((key-i (funcall key i)))
-                         (,',condition (funcall predicate key-i)
-                                       ;; This hack of dealing with non-NIL
-                                       ;; FROM-END for list data by iterating
-                                       ;; forward through the list and keeping
-                                       ;; track of the last time we found a
-                                       ;; match might be more screwy than what
-                                       ;; the user expects, but it seems to be
-                                       ;; allowed by the ANSI standard. (And
-                                       ;; if the user is screwy enough to ask
-                                       ;; for FROM-END behavior on list data,
-                                       ;; turnabout is fair play.)
-                                       ;;
-                                       ;; It's also not enormously efficient,
-                                       ;; calling PREDICATE and KEY more often
-                                       ;; than necessary; but all the
-                                       ;; alternatives seem to have their own
-                                       ;; efficiency problems.
-                                       (if from-end
-                                           (setf find i
-                                                 position index)
-                                           (return (values i index))))))
-                     (incf index))))))
+                   (flet ((bounds-error ()
+                            (sequence-bounding-indices-bad-error sequence start end)))
+                     (if (and end (> start end))
+                         (bounds-error)
+                         (do ((slow sequence (cdr slow))
+                              (fast (cdr sequence) (cddr fast))
+                              (index 0 (+ index 1)))
+                             ((cond ((null slow)
+                                     (if (and end (> end index))
+                                         (bounds-error)
+                                         (return (values find position))))
+                                    ((and end (>= index end))
+                                     (return (values find position)))
+                                    ((eq slow fast)
+                                     (circular-list-error sequence)))
+                              (bug "never"))
+                           (declare (list slow fast))
+                           (when (>= index start)
+                             (let* ((element (car slow))
+                                    (key-i (funcall key element)))
+                               (,',condition (funcall predicate key-i)
+                                             ;; This hack of dealing with non-NIL
+                                             ;; FROM-END for list data by iterating
+                                             ;; forward through the list and keeping
+                                             ;; track of the last time we found a
+                                             ;; match might be more screwy than what
+                                             ;; the user expects, but it seems to be
+                                             ;; allowed by the ANSI standard. (And
+                                             ;; if the user is screwy enough to ask
+                                             ;; for FROM-END behavior on list data,
+                                             ;; turnabout is fair play.)
+                                             ;;
+                                             ;; It's also not enormously efficient,
+                                             ;; calling PREDICATE and KEY more often
+                                             ;; than necessary; but all the
+                                             ;; alternatives seem to have their own
+                                             ;; efficiency problems.
+                                             (if from-end
+                                                 (setf find element
+                                                       position index)
+                                                 (return (values element index)))))))))))))
   (def %find-position-if when)
   (def %find-position-if-not unless))
 
@@ -1358,6 +1442,31 @@
   (check-inlineability-of-find-position-if sequence from-end)
   '(%find-position-vector-macro item sequence
     from-end start end key test))
+
+(deftransform %find-position ((item sequence from-end start end key test)
+                              (t bit-vector t t t t t)
+                              * :node node)
+  (when (and test (lvar-fun-is test '(eq eql equal)))
+    (setf test nil))
+  (when (and key (lvar-fun-is key '(identity)))
+    (setf key nil))
+  (when (or test key)
+    (delay-ir1-transform node :optimize)
+    (give-up-ir1-transform "non-trivial :KEY or :TEST"))
+  (catch 'not-a-bit
+    `(with-array-data ((bits sequence :offset-var offset)
+                       (start start)
+                       (end end)
+                       :check-fill-pointer t)
+       (let ((p ,(if (constant-lvar-p item)
+                     (case (lvar-value item)
+                       (0 `(%bit-position/0 bits from-end start end))
+                       (1 `(%bit-position/1 bits from-end start end))
+                       (otherwise (throw 'not-a-bit `(values nil nil))))
+                     `(%bit-position item bits from-end start end))))
+         (if p
+             (values item (the index (- (truly-the index p) offset)))
+             (values nil nil))))))
 
 (deftransform %find-position ((item sequence from-end start end key test)
                               (character string t t t function function)

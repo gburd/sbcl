@@ -1,0 +1,95 @@
+@node sb-concurrency
+@section sb-concurrency
+@cindex Concurrency
+@cindex Sb-concurrency
+
+Additional data structures, synchronization primitives and tools for
+concurrent programming. Similiar to Java's @code{java.util.concurrent}
+package.
+
+@page
+@anchor{Section sb-concurrency:queue}
+@subsection Queue
+@cindex Queue, lock-free
+
+@code{sb-concurrency:queue} is a lock-free, thread-safe FIFO queue
+datatype.
+@*@*
+The implementation is based on @cite{An Optimistic Approach to
+Lock-Free FIFO Queues} by Edya Ladan-Mozes and Nir Shavit.
+@*@*
+Before SBCL 1.0.38, this implementation resided in its own contrib
+(@pxref{sb-queue}) which is still provided for backwards-compatibility
+but which has since been deprecated.
+
+@include struct-sb-concurrency-queue.texinfo
+
+@include fun-sb-concurrency-dequeue.texinfo
+@include fun-sb-concurrency-enqueue.texinfo
+@include fun-sb-concurrency-list-queue-contents.texinfo
+@include fun-sb-concurrency-make-queue.texinfo
+@include fun-sb-concurrency-queue-count.texinfo
+@include fun-sb-concurrency-queue-empty-p.texinfo
+@include fun-sb-concurrency-queue-name.texinfo
+@include fun-sb-concurrency-queuep.texinfo
+
+@page
+@subsection Mailbox (lock-free)
+@cindex Mailbox, lock-free
+
+@code{sb-concurrency:mailbox} is a lock-free message queue where one
+or multiple ends can send messages to one or multiple receivers. The
+difference to @ref{Section sb-concurrency:queue, queues} is that the receiving
+end may block until a message arrives.
+@*@*
+Built on top of the @ref{Structure sb-concurrency:queue, queue} implementation.
+
+@include struct-sb-concurrency-mailbox.texinfo
+
+@include fun-sb-concurrency-list-mailbox-messages.texinfo
+@include fun-sb-concurrency-mailbox-count.texinfo
+@include fun-sb-concurrency-mailbox-empty-p.texinfo
+@include fun-sb-concurrency-mailbox-name.texinfo
+@include fun-sb-concurrency-mailboxp.texinfo
+@include fun-sb-concurrency-make-mailbox.texinfo
+@include fun-sb-concurrency-receive-message.texinfo
+@include fun-sb-concurrency-receive-message-no-hang.texinfo
+@include fun-sb-concurrency-receive-pending-messages.texinfo
+@include fun-sb-concurrency-send-message.texinfo
+
+@page
+@anchor{Section sb-concurrency:gate}
+@subsection Gates
+@cindex Gate
+
+@code{sb-concurrency:gate} is a synchronization object suitable for when
+multiple threads must wait for a single event before proceeding.
+
+@include struct-sb-concurrency-gate.texinfo
+
+@include fun-sb-concurrency-close-gate.texinfo
+@include fun-sb-concurrency-gate-name.texinfo
+@include fun-sb-concurrency-gate-open-p.texinfo
+@include fun-sb-concurrency-gatep.texinfo
+@include fun-sb-concurrency-make-gate.texinfo
+@include fun-sb-concurrency-open-gate.texinfo
+@include fun-sb-concurrency-wait-on-gate.texinfo
+
+@page
+@anchor{Section sb-concurrency:frlock}
+@subsection Frlocks, aka Fast Read Locks
+@cindex Frlock
+@cindex Fast Read Lock
+
+@include struct-sb-concurrency-frlock.texinfo
+
+@include macro-sb-concurrency-frlock-read.texinfo
+@include macro-sb-concurrency-frlock-write.texinfo
+
+@include fun-sb-concurrency-make-frlock.texinfo
+@include fun-sb-concurrency-frlock-name.texinfo
+
+@include fun-sb-concurrency-frlock-read-begin.texinfo
+@include fun-sb-concurrency-frlock-read-end.texinfo
+@include fun-sb-concurrency-grab-frlock-write-lock.texinfo
+@include fun-sb-concurrency-release-frlock-write-lock.texinfo

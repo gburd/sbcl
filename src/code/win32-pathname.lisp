@@ -11,6 +11,9 @@
 
 (in-package "SB!IMPL")
 
+(define-symbol-macro +long-file-name-prefix+ (quote "\\\\?\\"))
+(define-symbol-macro +unc-file-name-prefix+ (quote "\\\\?\\UNC"))
+
 (defun extract-device (namestr start end)
   (declare (type simple-string namestr)
            (type index start end))
@@ -21,17 +24,9 @@
                ;; "X:" style, saved as X
                (values (string (char namestr start)) (+ start 2)))
               ((and (member c0 '(#\/ #\\)) (eql c0 c1) (>= end (+ start 3)))
-               ;; "//UNC" style, saved as UNC
-               ;; FIXME: at unparsing time we tell these apart by length,
-               ;; which seems a bit lossy -- presumably one-letter UNC
-               ;; hosts can exist as well. That seems a less troublesome
-               ;; restriction than disallowing UNC hosts whose names match
-               ;; logical pathname hosts... Time will tell -- both LispWorks
-               ;; and ACL use the host component for UNC hosts, so maybe
-               ;; we will end up there as well.
-               (let ((p (or (position c0 namestr :start (+ start 3) :end end)
-                            end)))
-                 (values (subseq namestr (+ start 2) p) p)))
+               ;; "//UNC" style, saved as :UNC device, with host and share
+               ;; becoming directory components.
+               (values :unc (+ start 1)))
               (t
                (values nil start))))
       (values nil start)))
@@ -39,6 +34,11 @@
 (defun split-at-slashes-and-backslashes (namestr start end)
   (declare (type simple-string namestr)
            (type index start end))
+  ;; FIXME: There is a fundamental brokenness in using the same
+  ;; character as escape character and directory separator in
+  ;; non-native pathnames. (PATHNAME-DIRECTORY #P"\\*/") should
+  ;; probably be (:RELATIVE "*") everywhere, but on Windows it's
+  ;; (:ABSOLUTE :WILD)! See lp#673625.
   (let ((absolute (and (/= start end)
                        (or (char= (schar namestr start) #\/)
                            (char= (schar namestr start) #\\)))))
@@ -80,45 +80,73 @@
                                        name)))
             (when position
               (error 'namestring-parse-error
-                     :complaint "can't embed #\\Nul or #\\/ in Unix namestring"
+                     :complaint "can't embed #\\Nul or #\\/ in Windows namestring"
                      :namestring namestring
                      :offset position))))
-        ;; Now we have everything we want. So return it.
-        (values nil ; no host for Win32 namestrings
-                device
-                (collect ((dirs))
-                  (dolist (piece pieces)
-                    (let ((piece-start (car piece))
-                          (piece-end (cdr piece)))
-                      (unless (= piece-start piece-end)
-                        (cond ((string= namestring ".."
-                                        :start1 piece-start
-                                        :end1 piece-end)
-                               (dirs :up))
-                              ((string= namestring "**"
-                                        :start1 piece-start
-                                        :end1 piece-end)
-                               (dirs :wild-inferiors))
-                              (t
-                               (dirs (maybe-make-pattern namestring
-                                                         piece-start
-                                                         piece-end)))))))
-                  (cond (absolute
-                         (cons :absolute (dirs)))
-                        ((dirs)
-                         (cons :relative (dirs)))
-                        (t
-                         nil)))
-                name
-                type
-                version)))))
+
+        (let (home)
+          ;; Deal with ~ and ~user.
+          (when (car pieces)
+            (destructuring-bind (start . end) (car pieces)
+              (when (and (not absolute)
+                         (not (eql start end))
+                         (string= namestring "~"
+                                  :start1 start
+                                  :end1 (1+ start)))
+                (setf absolute t)
+                (if (> end (1+ start))
+                    (setf home (list :home (subseq namestring (1+ start) end)))
+                    (setf home :home))
+                (pop pieces))))
+
+          ;; Now we have everything we want. So return it.
+          (values nil                 ; no host for Win32 namestrings
+                  device
+                  (collect ((dirs))
+                    (dolist (piece pieces)
+                      (let ((piece-start (car piece))
+                            (piece-end (cdr piece)))
+                        (unless (= piece-start piece-end)
+                          (cond ((string= namestring ".."
+                                          :start1 piece-start
+                                          :end1 piece-end)
+                                 (dirs :up))
+                                ((string= namestring "**"
+                                          :start1 piece-start
+                                          :end1 piece-end)
+                                 (dirs :wild-inferiors))
+                                (t
+                                 (dirs (maybe-make-pattern namestring
+                                                           piece-start
+                                                           piece-end)))))))
+                    (cond (absolute
+                           (if home
+                               (list* :absolute home (dirs))
+                               (cons :absolute (dirs))))
+                          ((dirs)
+                           (cons :relative (dirs)))
+                          (t
+                           nil)))
+                  name
+                  type
+                  version))))))
 
 (defun parse-native-win32-namestring (namestring start end as-directory)
   (declare (type simple-string namestring)
            (type index start end))
   (setf namestring (coerce namestring 'simple-string))
   (multiple-value-bind (device new-start)
-      (extract-device namestring start end)
+      (cond ((= (length +unc-file-name-prefix+)
+                (mismatch +unc-file-name-prefix+ namestring
+                          :start2 start))
+             (values :unc (+ start (length +unc-file-name-prefix+))))
+            ((= (length +long-file-name-prefix+)
+                (mismatch +long-file-name-prefix+ namestring
+                          :start2 start))
+             (extract-device namestring
+                             (+ start (length +long-file-name-prefix+))
+                             end))
+            (t (extract-device namestring start end)))
     (multiple-value-bind (absolute ranges)
         (split-at-slashes-and-backslashes namestring new-start end)
       (let* ((components (loop for ((start . end) . rest) on ranges
@@ -159,47 +187,22 @@
   ;; FIXME: same as UNPARSE-UNIX-HOST.  That's probably not good.
   "")
 
-(defun unparse-win32-device (pathname)
+(defun unparse-win32-device (pathname &optional native)
   (declare (type pathname pathname))
   (let ((device (pathname-device pathname))
         (directory (pathname-directory pathname)))
     (cond ((or (null device) (eq device :unspecific))
            "")
+          ((eq device :unc)
+           (if native "\\" "/"))
           ((and (= 1 (length device)) (alpha-char-p (char device 0)))
            (concatenate 'simple-string device ":"))
           ((and (consp directory) (eq :relative (car directory)))
            (error "No printed representation for a relative UNC pathname."))
           (t
-           (concatenate 'simple-string "\\\\" device)))))
-
-(defun unparse-win32-directory-list (directory)
-  (declare (type list directory))
-  (collect ((pieces))
-    (when directory
-      (ecase (pop directory)
-        (:absolute
-         (pieces "\\"))
-        (:relative
-         ;; nothing special
-         ))
-      (dolist (dir directory)
-        (typecase dir
-          ((member :up)
-           (pieces "..\\"))
-          ((member :back)
-           (error ":BACK cannot be represented in namestrings."))
-          ((member :wild-inferiors)
-           (pieces "**\\"))
-          ((or simple-string pattern (member :wild))
-           (pieces (unparse-physical-piece dir))
-           (pieces "\\"))
-          (t
-           (error "invalid directory component: ~S" dir)))))
-    (apply #'concatenate 'simple-string (pieces))))
-
-(defun unparse-win32-directory (pathname)
-  (declare (type pathname pathname))
-  (unparse-win32-directory-list (%pathname-directory pathname)))
+           (if native
+               (concatenate 'simple-string "\\\\" device)
+               (concatenate 'simple-string "//" device))))))
 
 (defun unparse-win32-file (pathname)
   (declare (type pathname pathname))
@@ -234,7 +237,7 @@
   (declare (type pathname pathname))
   (concatenate 'simple-string
                (unparse-win32-device pathname)
-               (unparse-win32-directory pathname)
+               (unparse-physical-directory pathname)
                (unparse-win32-file pathname)))
 
 (defun unparse-native-win32-namestring (pathname as-file)
@@ -246,28 +249,53 @@
          (name-string (if name-present-p name ""))
          (type (pathname-type pathname))
          (type-present-p (typep type '(not (member nil :unspecific))))
-         (type-string (if type-present-p type "")))
+         (type-string (if type-present-p type ""))
+         (absolutep (and device (eql :absolute (car directory)))))
     (when name-present-p
       (setf as-file nil))
+    (when (and absolutep (member :up directory))
+      ;; employ merge-pathnames to parse :BACKs into which we turn :UPs
+      (setf directory
+            (pathname-directory
+             (merge-pathnames
+              (make-pathname :defaults pathname :directory '(:relative))
+              (make-pathname :defaults pathname
+                             :directory (substitute :back :up directory))))))
     (coerce
      (with-output-to-string (s)
-       (when device
-         (write-string (unparse-win32-device pathname) s))
+       (when absolutep
+         (write-string (case device
+                         (:unc +unc-file-name-prefix+)
+                         (otherwise +long-file-name-prefix+)) s))
+       (when (or (not absolutep) (not (member device '(:unc nil))))
+         (write-string (unparse-win32-device pathname t) s))
        (when directory
-         (ecase (car directory)
-           (:absolute (write-char #\\ s))
+         (ecase (pop directory)
+           (:absolute
+            (let ((next (pop directory)))
+              (cond ((eq :home next)
+                     (write-string (user-homedir-namestring) s))
+                    ((and (consp next) (eq :home (car next)))
+                     (let ((where (user-homedir-namestring (second next))))
+                       (if where
+                           (write-string where s)
+                           (error "User homedir unknown for: ~S"
+                                  (second next)))))
+                    (next
+                     (push next directory)))
+              (write-char #\\ s)))
            (:relative)))
-       (loop for (piece . subdirs) on (cdr directory)
-          do (typecase piece
-               ((member :up) (write-string ".." s))
-               (string (write-string piece s))
-               (t (error "ungood directory segment in NATIVE-NAMESTRING: ~S"
-                         piece)))
-          if (or subdirs (stringp name))
-          do (write-char #\\ s)
-          else
-          do (unless as-file
-               (write-char #\\ s)))
+       (loop for (piece . subdirs) on directory
+             do (typecase piece
+                  ((member :up) (write-string ".." s))
+                  (string (write-string piece s))
+                  (t (error "ungood directory segment in NATIVE-NAMESTRING: ~S"
+                            piece)))
+             if (or subdirs (stringp name))
+             do (write-char #\\ s)
+             else
+             do (unless as-file
+                  (write-char #\\ s)))
        (if name-present-p
            (progn
              (unless (stringp name-string) ;some kind of wild field
@@ -281,7 +309,19 @@
            (when type-present-p ;
              (error
               "type component without a name component in NATIVE-NAMESTRING: ~S"
-              type))))
+              type)))
+       (when absolutep
+         (let ((string (get-output-stream-string s)))
+           (return-from unparse-native-win32-namestring
+             (cond ((< (- 260 12) (length string))
+                    ;; KLUDGE: account for additional length of 8.3 name to make
+                    ;; directories always accessible
+                    (coerce string 'simple-string))
+                   ((eq :unc device)
+                    (replace
+                     (subseq string (1- (length +unc-file-name-prefix+)))
+                     "\\"))
+                   (t (subseq string (length +long-file-name-prefix+))))))))
      'simple-string)))
 
 ;;; FIXME.
@@ -311,7 +351,7 @@
                      pathname-directory)
                     (t
                      (bug "Bad fallthrough in ~S" 'unparse-unix-enough)))))
-        (strings (unparse-unix-directory-list result-directory)))
+        (strings (unparse-physical-directory-list result-directory)))
       (let* ((pathname-type (%pathname-type pathname))
              (type-needed (and pathname-type
                                (not (eq pathname-type :unspecific))))

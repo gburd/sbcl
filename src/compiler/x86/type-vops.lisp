@@ -41,10 +41,9 @@
            (inst cmp al-tn immediate))))
   (inst jmp (if not-p :ne :e) target))
 
-(defun %test-lowtag (value target not-p lowtag &optional al-loaded)
-  (unless al-loaded
-    (move eax-tn value)
-    (inst and al-tn lowtag-mask))
+(defun %test-lowtag (value target not-p lowtag)
+  (inst lea eax-tn (make-ea :dword :base value :disp (- lowtag)))
+  (inst test al-tn lowtag-mask)
   ;; FIXME: another 'optimization' which doesn't appear to work:
   ;; prefetching the hypothetically pointed-to version should help,
   ;; but this is in fact non-ideal in plenty of ways: we emit way too
@@ -53,11 +52,10 @@
   ;; not too bad.  -- CSR, 2004-07-27
   (when (member :prefetch *backend-subfeatures*)
     (inst prefetchnta (make-ea :byte :base value :disp (- lowtag))))
-  (inst cmp al-tn lowtag)
   (inst jmp (if not-p :ne :e) target))
 
 (defun %test-headers (value target not-p function-p headers
-                            &optional (drop-through (gen-label)) al-loaded)
+                            &optional (drop-through (gen-label)))
   (let ((lowtag (if function-p fun-pointer-lowtag other-pointer-lowtag)))
     (multiple-value-bind (equal less-or-equal greater-or-equal when-true when-false)
         ;; EQUAL, LESS-OR-EQUAL and GREATER-OR-EQUAL are the conditions for
@@ -67,7 +65,7 @@
         (if not-p
             (values :ne :a :b drop-through target)
             (values :e :na :nb target drop-through))
-      (%test-lowtag value when-false t lowtag al-loaded)
+      (%test-lowtag value when-false t lowtag)
       (cond
         ((and (null (cdr headers))
               (numberp (car headers)))
@@ -127,18 +125,28 @@
                      ;; was true.
                      (return))
                     (t
-                     (unless (= start bignum-widetag)
-                       (inst cmp al-tn start)
-                       (if (= end complex-array-widetag)
-                           (progn
-                             (aver last)
-                             (inst jmp greater-or-equal target))
-                           (inst jmp :b when-false))) ; was :l
-                     (unless (= end complex-array-widetag)
-                       (inst cmp al-tn end)
-                       (if last
-                           (inst jmp less-or-equal target)
-                           (inst jmp :be when-true)))))))))))) ; was :le
+                     (cond
+                       ((= start bignum-widetag)
+                        (inst cmp al-tn end)
+                        (if last
+                            (inst jmp less-or-equal target)
+                            (inst jmp :be when-true)))
+                       ((= end complex-array-widetag)
+                        (inst cmp al-tn start)
+                        (if last
+                            (inst jmp greater-or-equal target)
+                            (inst jmp :b when-false)))
+                       ((not last)
+                        (inst cmp al-tn start)
+                        (inst jmp :b when-false)
+                        (inst cmp al-tn end)
+                        (if last
+                            (inst jmp less-or-equal target)
+                            (inst jmp :be when-true)))
+                       (t
+                        (inst sub al-tn start)
+                        (inst cmp al-tn (- end start))
+                        (inst jmp less-or-equal target))))))))))))
       (emit-label drop-through))))
 
 ;;;; type checking and testing
@@ -245,12 +253,12 @@
             (values target not-target))
       (generate-fixnum-test value)
       (inst jmp :e yep)
-      (move eax-tn value)
-      (inst and al-tn lowtag-mask)
-      (inst cmp al-tn other-pointer-lowtag)
+      (inst lea eax-tn (make-ea :dword :base value
+                                :disp (- other-pointer-lowtag)))
+      (inst test al-tn lowtag-mask)
       (inst jmp :ne nope)
-      (loadw eax-tn value 0 other-pointer-lowtag)
-      (inst cmp eax-tn (+ (ash 1 n-widetag-bits) bignum-widetag))
+      (inst cmp (make-ea-for-object-slot value 0 other-pointer-lowtag)
+            (+ (ash 1 n-widetag-bits) bignum-widetag))
       (inst jmp (if not-p :ne :e) target))
     NOT-TARGET))
 
@@ -261,12 +269,12 @@
                                      value)))
       (generate-fixnum-test value)
       (inst jmp :e yep)
-      (move eax-tn value)
-      (inst and al-tn lowtag-mask)
-      (inst cmp al-tn other-pointer-lowtag)
+      (inst lea eax-tn (make-ea :dword :base value
+                                :disp (- other-pointer-lowtag)))
+      (inst test al-tn lowtag-mask)
       (inst jmp :ne nope)
-      (loadw eax-tn value 0 other-pointer-lowtag)
-      (inst cmp eax-tn (+ (ash 1 n-widetag-bits) bignum-widetag))
+      (inst cmp (make-ea-for-object-slot value 0 other-pointer-lowtag)
+            (+ (ash 1 n-widetag-bits) bignum-widetag))
       (inst jmp :ne nope))
     YEP
     (move result value)))
@@ -304,7 +312,7 @@
         ;; Get the second digit.
         (loadw eax-tn value (1+ bignum-digits-offset) other-pointer-lowtag)
         ;; All zeros, its an (unsigned-byte 32).
-        (inst or eax-tn eax-tn)
+        (inst test eax-tn eax-tn)
         (inst jmp :z yep)
         (inst jmp nope)
 
@@ -314,7 +322,7 @@
 
         ;; positive implies (unsigned-byte 32).
         (emit-label fixnum)
-        (inst or eax-tn eax-tn)
+        (inst test eax-tn eax-tn)
         (inst jmp (if not-p :s :ns) target)
 
         (emit-label not-target)))))
@@ -347,7 +355,7 @@
       ;; Get the second digit.
       (loadw eax-tn value (1+ bignum-digits-offset) other-pointer-lowtag)
       ;; All zeros, its an (unsigned-byte 32).
-      (inst or eax-tn eax-tn)
+      (inst test eax-tn eax-tn)
       (inst jmp :z yep)
       (inst jmp nope)
 
@@ -357,7 +365,7 @@
 
       ;; positive implies (unsigned-byte 32).
       (emit-label fixnum)
-      (inst or eax-tn eax-tn)
+      (inst test eax-tn eax-tn)
       (inst jmp :s nope)
 
       (emit-label yep)

@@ -61,7 +61,7 @@
 ;;; PATHNAME pieces, as returned by the PATHNAME-xxx functions
 (sb!xc:deftype pathname-host () '(or sb!impl::host null))
 (sb!xc:deftype pathname-device ()
-  '(or simple-string (member nil :unspecific)))
+  '(or simple-string (member nil :unspecific :unc)))
 (sb!xc:deftype pathname-directory () 'list)
 (sb!xc:deftype pathname-name ()
   '(or simple-string sb!impl::pattern (member nil :unspecific :wild)))
@@ -95,6 +95,9 @@
       (when (subtypep type '(or integer character float (complex float)))
         (types `(simple-array ,type ,dims))))
     (types)))
+
+(sb!xc:deftype complex-vector (&optional element-type length)
+  `(and (vector ,element-type ,length) (not simple-array)))
 
 ;;; Return the symbol that describes the format of FLOAT.
 (declaim (ftype (function (float) symbol) float-format-name))

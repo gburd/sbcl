@@ -116,7 +116,7 @@
     (inst and t1 widetag-mask t1)
     (sc-case data
       (any-reg
-       (inst sll data (- n-widetag-bits 2) t2)
+       (inst sll data (- n-widetag-bits n-fixnum-tag-bits) t2)
        (inst bis t1 t2 t1))
       (immediate
        (let ((c (ash (tn-value data) n-widetag-bits)))
@@ -139,22 +139,6 @@
     ;; and shift the result into a positive fixnum like on x86.
     (inst sll ptr 35 res)
     (inst srl res 33 res)))
-
-(define-vop (make-other-immediate-type)
-  (:args (val :scs (any-reg descriptor-reg))
-         (type :scs (any-reg descriptor-reg immediate)
-               :target temp))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:generator 2
-    (sc-case type
-      ((immediate)
-       (inst sll val n-widetag-bits temp)
-       (inst bis temp (tn-value type) res))
-      (t
-       (inst sra type n-fixnum-tag-bits temp)
-       (inst sll val (- n-widetag-bits n-fixnum-tag-bits) res)
-       (inst bis res temp res)))))
 
 
 ;;;; allocation
@@ -245,3 +229,9 @@
       (inst ldl count offset count-vector)
       (inst addq count 1 count)
       (inst stl count offset count-vector))))
+
+;;;; Dummy definition for a spin-loop hint VOP
+(define-vop (spin-loop-hint)
+  (:translate spin-loop-hint)
+  (:policy :fast-safe)
+  (:generator 0))

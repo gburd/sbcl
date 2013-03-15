@@ -118,7 +118,8 @@ in effect."
             (or (cdr (assoc precision *precision-mode-alist*))
                 (error "unknown precision mode: ~S" precision))))
     ;; FIXME: This apparently doesn't work on Darwin
-    #!-darwin (setf (floating-point-modes) modes))
+    #!-(and darwin ppc)
+    (setf (floating-point-modes) modes))
   (values))
 
 (defun get-floating-point-modes ()
@@ -158,7 +159,7 @@ sets the floating point modes to their current values (and thus is a no-op)."
 ;;; disabled by default. Joe User can explicitly enable them if
 ;;; desired.
 (defvar *saved-floating-point-modes*
-  '(:traps (:overflow #!-netbsd :invalid :divide-by-zero)
+  '(:traps (:overflow #!-(or netbsd ppc) :invalid :divide-by-zero)
     :rounding-mode :nearest :current-exceptions nil
     :accrued-exceptions nil :fast-mode nil
     #!+x86 :precision #!+x86 :53-bit))

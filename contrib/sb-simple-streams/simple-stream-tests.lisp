@@ -60,6 +60,22 @@
               (progn ,@body))
          ,(when delete-afterwards `(ignore-errors (delete-file ,file))))))
 
+(deftest non-existent-class
+  (handler-case
+      (with-test-file (s *test-file* :class 'non-existent-stream)
+        nil)
+    ;; find-class will raise a simple-error
+    (simple-error (c) (search "There is no class" (simple-condition-format-control c))))
+  0)
+
+(deftest non-stream-class
+  (handler-case
+      (with-test-file (s *test-file* :class 'standard-class)
+        nil)
+    ;; Will fall through sb-simple-streams:open as it is no stream class.
+    (simple-error (c) (search "Don't know how to handle" (simple-condition-format-control c))))
+  0)
+
 (deftest create-file-1
     ;; Create a file-simple-stream, write data.
     (prog1
@@ -930,3 +946,24 @@ Nothing to see here, move along.")
                        :external-format :utf-8)
         (char-code (read-char s))))
   196)
+
+;; launchpad bug #491087
+
+(deftest lp491087
+    (labels ((read-big-int (stream)
+               (let ((b (make-array 1 :element-type '(signed-byte 32)
+                                    :initial-element 0)))
+                 (declare (dynamic-extent b))
+                 (sb-simple-streams::read-vector b stream
+                                                 :endian-swap :network-order)
+                 (aref b 0))))
+      (with-open-file (stream
+                       (merge-pathnames #P"lp491087.txt" *test-path*)
+                       :class 'file-simple-stream)
+        (let* ((start (file-position stream))
+               (integer (read-big-int stream))
+               (end (file-position stream)))
+          (and (= start 0)
+               (= integer #x30313233)
+               (= end 4)))))
+  T)

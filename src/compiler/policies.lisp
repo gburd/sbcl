@@ -45,32 +45,25 @@ Enabling this option can increase heap consing of closures.")
   ("off" "maybe" "on" "on")
   "Control inline-substitution of used-once local functions.")
 
+(define-optimization-quality alien-funcall-saves-fp-and-pc
+    (if (<= speed debug) 3 0)
+  ("no" "maybe" "yes" "yes")
+  "Control ALIEN-FUNCALL saving frame-pointer and program counter for
+more reliable bactracing across foreign calls.")
+
 (define-optimization-quality verify-arg-count
     (if (zerop safety) 0 3)
   ("no" "maybe" "yes" "yes"))
-
-(define-optimization-quality merge-tail-calls
-    (if (or (> space debug)
-            (> speed debug))
-        3
-        0)
-  ("no" "maybe" "yes" "yes")
-  "Control whether tail-calls should reuse caller stack frame.
-Enabling this option make functions use less stack space, and make
-tail-recursive functions execute in constant stack, but debugging
-become harder, because backtraces show only part of function call
-sequence.
-
-This options has no effect when INSERT-DEBUG-CATCH is set.")
 
 (define-optimization-quality insert-debug-catch
     (if (> debug (max speed space))
         3
         0)
   ("no" "maybe" "yes" "yes")
-  "Enable possibility of returning from stack frames with the debugger.
-
-Enabling this option effectively disables MERGE-TAIL-CALLS.")
+  "Enables possibility of returning from stack frames with the debugger.
+Enabling this option causes apparent tail calls to no longer be in a tail
+position -- effectively disabling tail-merging, hence causing apparently tail
+recursive functions to no longer execute in constant stack space")
 
 (define-optimization-quality recognize-self-calls
     (if (> (max speed space) debug)
@@ -136,3 +129,16 @@ debugger.")
 (define-optimization-quality store-coverage-data
     0
   ("no" "no" "yes" "yes"))
+
+#!+sb-safepoint
+(define-optimization-quality inhibit-safepoints
+    0
+  ("no" "no" "yes" "yes")
+  "When disabled, the compiler will insert safepoints at strategic
+points (loop edges, function prologues) to ensure that potentially
+long-running code can be interrupted.
+
+When enabled, no safepoints will be inserted explicitly.  Note that
+this declaration does not prevent out-of-line function calls, which
+will encounter safepoints unless the target function has also been
+compiled with this declaration in effect.")

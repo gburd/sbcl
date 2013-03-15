@@ -100,4 +100,18 @@
     (assert (equal `(funcall #'(setf foo) ,@stores 1 2 3) set))
     (assert (equal '(foo 1 2 3) get))))
 
+(with-test (:name :update-fn-should-be-a-symbol-in-defsetf)
+  (assert (eq :error
+            (handler-case
+                (eval '(defsetf access-fn 5))
+              (error ()
+                :error)))))
+
+(with-test (:name :getf-unused-default-variable)
+  (handler-bind ((style-warning #'error))
+    (compile nil `(lambda (x y)
+                    (setf (gethash :x x 0) 4)
+                    (setf (getf y :y 0) 4)
+                    (setf (get 'z :z 0) 4)))))
+
 ;;; success

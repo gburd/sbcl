@@ -12,6 +12,12 @@
 
 (in-package :sb-introspect-test)
 
+(defmacro deftest* ((name &key fails-on) form &rest results)
+  `(progn
+     (when (sb-impl::featurep ',fails-on)
+       (pushnew ',name sb-rt::*expected-failures*))
+     (deftest ,name ,form ,@results)))
+
 (deftest function-lambda-list.1
     (function-lambda-list 'cl-user::one)
   (cl-user::a cl-user::b cl-user::c))
@@ -151,11 +157,9 @@
     (matchp-name :function  '(setf cl-user::o) 23)
   t)
 
-
 (deftest find-source-stuff.24
     (matchp-name :method  '(setf cl-user::p) 24)
   t)
-
 
 (deftest find-source-stuff.25
     (matchp-name :macro  'cl-user::q 25)
@@ -188,6 +192,14 @@
 (deftest find-source-stuff.30
     ;; Test finding a type that isn't one
     (not (find-definition-sources-by-name 'fboundp :type))
+  t)
+
+(deftest find-source-stuff.31
+    (matchp-name :function 'cl-user::compile-time-too-fun 28)
+  t)
+
+(deftest find-source-stuff.32
+    (matchp-name :function 'cl-user::loaded-as-source-fun 3)
   t)
 
 ;;; Check wrt. interplay of generic functions and their methods.
@@ -286,13 +298,28 @@
     (tai 42 :immediate nil)
   t)
 
-(deftest allocation-information.4
+;;; Skip the whole damn test on GENCGC PPC -- the combination is just
+;;; to flaky for this to make too much sense.  GENCGC SPARC almost
+;;; certainly exhibits the same behavior patterns (or antipatterns) as
+;;; GENCGC PPC.
+;;;
+;;; -- It appears that this test can also fail due to systematic issues
+;;; (possibly with the C compiler used) which we cannot detect based on
+;;; *features*.  Until this issue has been fixed, I am marking this test
+;;; as failing on Windows to allow installation of the contrib on
+;;; affected builds, even if the underlying issue is (possibly?) not even
+;;; strictly related to windows.  C.f. lp1057631.  --DFL
+;;;
+(deftest* (allocation-information.4
+           ;; Ignored as per the comment above, even though it seems
+           ;; unlikely that this is the right condition.
+           :fails-on (or :win32 (and (or :ppc :sparc) :gencgc)))
     #+gencgc
     (tai #'cons :heap
          ;; FIXME: This is the canonical GENCGC result. On PPC we sometimes get
          ;; :LARGE T, which doesn't seem right -- but ignore that for now.
          '(:space :dynamic :generation 6 :write-protected t :boxed t :pinned nil :large nil)
-         :ignore #+ppc '(:large) #-ppc nil)
+         :ignore (list :page #+ppc :large))
     #-gencgc
     (tai :cons :heap
          ;; FIXME: Figure out what's the right cheney-result. SPARC at least
@@ -344,3 +371,212 @@
    (deftest allocation-information.thread.3
        (thread-tai2)
      t))
+
+;;;; Test FUNCTION-TYPE
+
+(defun type-equal (typespec1 typespec2)
+  (or (equal typespec1 typespec2)   ; TYPE= punts on &keywords in FTYPEs.
+      (sb-kernel:type= (sb-kernel:values-specifier-type typespec1)
+                       (sb-kernel:values-specifier-type typespec2))))
+
+(defmacro interpret (form)
+  `(let ((sb-ext:*evaluator-mode* :interpret))
+     (eval ',form)))
+
+;; Functions
+
+(declaim (ftype (function (integer &optional string) string) moon))
+(defun moon (int &optional suffix)
+  (concatenate 'string (princ-to-string int) suffix))
+
+(deftest function-type.1
+    (values (type-equal (function-type 'moon) (function-type #'moon))
+            (type-equal (function-type #'moon)
+                        '(function (integer &optional string)
+                          (values string &rest t))))
+  t t)
+
+(defun sun (x y &key k1)
+  (declare (fixnum x y))
+  (declare (boolean k1))
+  (declare (ignore x y k1))
+  t)
+
+(deftest function-type.2
+    (values (type-equal (function-type 'sun) (function-type #'sun))
+            (type-equal (function-type #'sun)
+                        '(function (fixnum fixnum &key (:k1 (member nil t)))
+                          (values (member t) &optional))))
+  t t)
+
+;; Local functions
+
+(deftest function-type.5
+    (flet ((f (s)
+             (declare (symbol s))
+             (values (symbol-name s))))
+      (type-equal (function-type #'f)
+                  '(function (symbol) (values simple-string &optional))))
+  t)
+
+;; Closures
+
+(deftest function-type.6
+    (let ((x 10))
+      (declare (fixnum x))
+      (flet ((closure (y)
+               (declare (fixnum y))
+               (setq x (+ x y))))
+        (type-equal (function-type #'closure)
+                    '(function (fixnum) (values fixnum &optional)))))
+  t)
+
+;; Anonymous functions
+
+(deftest function-type.7
+    (type-equal (function-type #'(lambda (x) (declare (fixnum x)) x))
+                '(function (fixnum) (values fixnum &optional)))
+  t)
+
+;; Interpreted functions
+
+#+sb-eval
+(deftest function-type.8
+    (type-equal (function-type (interpret (lambda (x) (declare (fixnum x)) x)))
+                '(function (&rest t) *))
+  t)
+
+;; Generic functions
+
+(defgeneric earth (x y))
+
+(deftest function-type+gfs.1
+    (values (type-equal (function-type 'earth) (function-type #'earth))
+            (type-equal (function-type 'earth) '(function (t t) *)))
+  t t)
+
+;; Implicitly created generic functions.
+
+;; (FUNCTION-TYPE 'MARS) => FUNCTION at the moment. (1.0.31.26)
+
+;; See LP #520695.
+
+(defmethod mars (x y) (+ x y))
+
+#+ nil
+(deftest function-type+gfs.2
+    (values (type-equal (function-type 'mars) (function-type #'mars))
+            (type-equal (function-type 'mars) '(function (t t) *)))
+  t t)
+
+;; DEFSTRUCT created functions
+
+;; These do not yet work because SB-KERNEL:%FUN-NAME does not work on
+;; functions defined by DEFSTRUCT. (1.0.35.x)
+
+;; See LP #520692.
+
+#+nil
+(progn
+
+  (defstruct (struct (:predicate our-struct-p)
+                     (:copier copy-our-struct))
+    (a 42 :type fixnum))
+
+  (deftest function-type+defstruct.1
+      (values (type-equal (function-type 'struct-a)
+                          (function-type #'struct-a))
+              (type-equal (function-type 'struct-a)
+                          '(function (struct) (values fixnum &optional))))
+    t t)
+
+  (deftest function-type+defstruct.2
+      (values (type-equal (function-type 'our-struct-p)
+                          (function-type #'our-struct-p))
+              (type-equal (function-type 'our-struct-p)
+                          '(function (t) (values (member t nil) &optional))))
+    t t)
+
+  (deftest function-type+defstruct.3
+      (values (type-equal (function-type 'copy-our-struct)
+                          (function-type #'copy-our-struct))
+              (type-equal (function-type 'copy-our-struct)
+                          '(function (struct) (values struct &optional))))
+    t t)
+
+  (defstruct (typed-struct :named (:type list)
+                           (:predicate typed-struct-p))
+    (a 42 :type fixnum))
+
+  (deftest function-type+defstruct.4
+      (values (type-equal (function-type 'typed-struct-a)
+                          (function-type #'typed-struct-a))
+              (type-equal (function-type 'typed-struct-a)
+                          '(function (list) (values fixnum &optional))))
+    t t)
+
+  (deftest function-type+defstruct.5
+      (values (type-equal (function-type 'typed-struct-p)
+                          (function-type #'typed-struct-p))
+              (type-equal (function-type 'typed-struct-p)
+                          '(function (t) (values (member t nil) &optional))))
+    t t)
+
+  ) ; #+nil (progn ...
+
+;; SETF functions
+
+(defun (setf sun) (value x y &key k1)
+  (declare (boolean value))
+  (declare (fixnum x y))
+  (declare (boolean k1))
+  (declare (ignore x y k1))
+  value)
+
+(deftest function-type+setf.1
+    (values (type-equal (function-type '(setf sun))
+                        (function-type #'(setf sun)))
+            (type-equal (function-type '(setf sun))
+                        '(function ((member nil t)
+                                    fixnum fixnum
+                                    &key (:k1 (member nil t)))
+                          (values (member nil t) &optional))))
+  t t)
+
+;; Misc
+
+(deftest function-type+misc.1
+    (flet ((nullary ()))
+      (type-equal (function-type #'nullary)
+                  '(function () (values null &optional))))
+  t)
+
+;;; Defstruct accessor, copier, and predicate
+
+(deftest defstruct-fun-sources
+    (let ((copier (find-definition-source #'cl-user::copy-three))
+          (accessor (find-definition-source #'cl-user::three-four))
+          (predicate (find-definition-source #'cl-user::three-p)))
+      (values (and (equalp copier accessor)
+                   (equalp copier predicate))
+              (equal "test.lisp"
+                     (file-namestring (definition-source-pathname copier)))
+              (equal '(5)
+                     (definition-source-form-path copier))))
+ t
+ t
+ t)
+
+(deftest defstruct-fun-sources-by-name
+    (let ((copier (car (find-definition-sources-by-name 'cl-user::copy-three :function)))
+          (accessor (car (find-definition-sources-by-name 'cl-user::three-four :function)))
+          (predicate (car (find-definition-sources-by-name 'cl-user::three-p :function))))
+      (values (and (equalp copier accessor)
+                   (equalp copier predicate))
+              (equal "test.lisp"
+                     (file-namestring (definition-source-pathname copier)))
+              (equal '(5)
+                     (definition-source-form-path copier))))
+ t
+ t
+ t)

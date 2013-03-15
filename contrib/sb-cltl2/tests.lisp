@@ -65,6 +65,8 @@
     (macroexpand-all '(symbol-macrolet ((srlt '(nil zool))) (testr)))
   (symbol-macrolet ((srlt '(nil zool))) 'zool))
 
+;;;; DECLARATION-INFORMATION
+
 (defmacro dinfo (thing &environment env)
   `',(declaration-information thing env))
 
@@ -89,6 +91,27 @@
   (def debug)
   (def compilation-speed)
   (def space))
+
+
+(deftest declaration-information.restrict-compiler-policy.1
+    (with-compilation-unit (:policy '(optimize) :override t)
+      (restrict-compiler-policy 'speed 3)
+      (eval '(cadr (assoc 'speed (dinfo optimize)))))
+  3)
+
+(deftest declaration-information.restrict-compiler-policy.2
+    (with-compilation-unit (:policy '(optimize) :override t)
+      (restrict-compiler-policy 'speed 3)
+      (locally (declare (optimize (speed 2)))
+        (cadr (assoc 'speed (dinfo optimize)))))
+  2)
+
+(deftest declaration-information.restrict-compiler-policy.3
+    (locally (declare (optimize (speed 2)))
+      (with-compilation-unit (:policy '(optimize) :override t)
+        (restrict-compiler-policy 'speed 3)
+        (cadr (assoc 'speed (dinfo optimize)))))
+  2)
 
 (deftest declaration-information.muffle-conditions.default
   (dinfo sb-ext:muffle-conditions)
@@ -671,3 +694,25 @@
                                   'robot
                                   lexenv))))))))
   (emotional-state . happy))
+
+(deftest macroexpand-all.special-binding
+    (let ((form '(macrolet ((v (x &environment env)
+                             (sb-cltl2:variable-information x env)))
+                  (let* ((x :foo)
+                         (y (v x)))
+                    (declare (special x))
+                    (list y (v x))))))
+      (list (eval form)
+            (eval (sb-cltl2:macroexpand-all form))))
+  ((:special :special) (:special :special)))
+
+(deftest macroexpand-all.symbol-macro-shadowed
+    (let ((form '(macrolet ((v (x &environment env)
+                             (macroexpand x env)))
+                  (symbol-macrolet ((x :bad))
+                    (let* ((x :good)
+                           (y (v x)))
+                      y)))))
+      (list (eval form)
+            (eval (sb-cltl2:macroexpand-all form))))
+  (:good :good))

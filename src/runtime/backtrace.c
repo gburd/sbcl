@@ -13,6 +13,9 @@
  * files for more information.
  */
 
+/* needed if we want dladdr() and Dl_Info from glibc's dlfcn.h */
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <signal.h>
 #include "sbcl.h"
@@ -34,11 +37,7 @@
 #include "thread.h"
 
 #ifdef LISP_FEATURE_OS_PROVIDES_DLADDR
-# ifndef __USE_GNU
-/* __USE_GNU needed if we want dladdr() and Dl_Info from glibc. */
-# define __USE_GNU
-# endif
-# include "dlfcn.h"
+# include <dlfcn.h>
 #endif
 
 #if !(defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))
@@ -110,13 +109,13 @@ cs_valid_pointer_p(struct call_frame *pointer)
 {
     struct thread *thread=arch_os_get_current_thread();
     return (((char *) thread->control_stack_start <= (char *) pointer) &&
-            ((char *) pointer < (char *) current_control_stack_pointer));
+            ((char *) pointer < (char *) access_control_stack_pointer(thread)));
 }
 
 static void
 call_info_from_lisp_state(struct call_info *info)
 {
-    info->frame = (struct call_frame *)current_control_frame_pointer;
+    info->frame = (struct call_frame *)access_control_frame_pointer(arch_os_get_current_thread());
     info->interrupted = 0;
     info->code = NULL;
     info->lra = 0;
@@ -128,7 +127,7 @@ call_info_from_lisp_state(struct call_info *info)
 static void
 call_info_from_context(struct call_info *info, os_context_t *context)
 {
-    unsigned long pc;
+    uword_t pc;
 
     info->interrupted = 1;
     if (lowtag_of(*os_context_register_addr(context, reg_CODE))
@@ -136,15 +135,15 @@ call_info_from_context(struct call_info *info, os_context_t *context)
         /* We tried to call a function, but crapped out before $CODE could
          * be fixed up. Probably an undefined function. */
         info->frame =
-            (struct call_frame *)(unsigned long)
+            (struct call_frame *)(uword_t)
                 (*os_context_register_addr(context, reg_OCFP));
         info->lra = (lispobj)(*os_context_register_addr(context, reg_LRA));
         info->code = code_pointer(info->lra);
-        pc = (unsigned long)native_pointer(info->lra);
+        pc = (uword_t)native_pointer(info->lra);
     }
     else {
         info->frame =
-            (struct call_frame *)(unsigned long)
+            (struct call_frame *)(uword_t)
                 (*os_context_register_addr(context, reg_CFP));
         info->code =
             code_pointer(*os_context_register_addr(context, reg_CODE));
@@ -152,7 +151,7 @@ call_info_from_context(struct call_info *info, os_context_t *context)
         pc = *os_context_pc_addr(context);
     }
     if (info->code != NULL)
-        info->pc = pc - (unsigned long) info->code -
+        info->pc = pc - (uword_t) info->code -
 #ifndef LISP_FEATURE_ALPHA
             (HEADER_LENGTH(info->code->header) * sizeof(lispobj));
 #else
@@ -170,7 +169,7 @@ previous_info(struct call_info *info)
     int free_ici;
 
     if (!cs_valid_pointer_p(info->frame)) {
-        printf("Bogus callee value (0x%08lx).\n", (unsigned long)info->frame);
+        printf("Bogus callee value (0x%08lx).\n", (uword_t)info->frame);
         return 0;
     }
 
@@ -188,7 +187,7 @@ previous_info(struct call_info *info)
         while (free_ici-- > 0) {
             os_context_t *context =
                 thread->interrupt_contexts[free_ici];
-            if ((struct call_frame *)(unsigned long)
+            if ((struct call_frame *)(uword_t)
                     (*os_context_register_addr(context, reg_CFP))
                 == info->frame) {
                 call_info_from_context(info, context);
@@ -199,8 +198,8 @@ previous_info(struct call_info *info)
     else {
         info->code = code_pointer(info->lra);
         if (info->code != NULL)
-            info->pc = (unsigned long)native_pointer(info->lra) -
-                (unsigned long)info->code -
+            info->pc = (uword_t)native_pointer(info->lra) -
+                (uword_t)info->code -
 #ifndef LISP_FEATURE_ALPHA
                 (HEADER_LENGTH(info->code->header) * sizeof(lispobj));
 #else
@@ -214,20 +213,20 @@ previous_info(struct call_info *info)
 }
 
 void
-backtrace(int nframes)
+lisp_backtrace(int nframes)
 {
     struct call_info info;
 
     call_info_from_lisp_state(&info);
 
     do {
-        printf("<Frame 0x%08lx%s, ", (unsigned long) info.frame,
+        printf("<Frame 0x%08lx%s, ", (uword_t) info.frame,
                 info.interrupted ? " [interrupted]" : "");
 
         if (info.code != (struct code *) 0) {
             lispobj function;
 
-            printf("CODE: 0x%08lX, ", (unsigned long) info.code | OTHER_POINTER_LOWTAG);
+            printf("CODE: 0x%08lX, ", (uword_t) info.code | OTHER_POINTER_LOWTAG);
 
 #ifndef LISP_FEATURE_ALPHA
             function = info.code->entry_points;
@@ -271,7 +270,7 @@ backtrace(int nframes)
             printf("CODE: ???, ");
 
         if (info.lra != NIL)
-            printf("LRA: 0x%08lx, ", (unsigned long)info.lra);
+            printf("LRA: 0x%08lx, ", (uword_t)info.lra);
         else
             printf("<no LRA>, ");
 
@@ -288,7 +287,7 @@ backtrace(int nframes)
 static int
 altstack_pointer_p (void *p) {
 #ifndef LISP_FEATURE_WIN32
-    void* stack_start = arch_os_get_current_thread() + dynamic_values_bytes;
+    void* stack_start = ((void *)arch_os_get_current_thread()) + dynamic_values_bytes;
     void* stack_end = stack_start + 32*SIGSTKSZ;
 
     return (p > stack_start && p <= stack_end);
@@ -304,12 +303,12 @@ stack_pointer_p (void *p)
   /* we are using sizeof(long) here, because that is the right value on both
    * x86 and x86-64.  (But note that false positives would not cause much harm
    * given the heuristical nature of x86_call_context.) */
-  unsigned long stack_alignment = sizeof(long);
+  uword_t stack_alignment = sizeof(void*);
 
   return (altstack_pointer_p(p)
           || (p < (void *) arch_os_get_current_thread()->control_stack_end
               && (p > (void *) &p || altstack_pointer_p(&p))
-              && (((unsigned long) p) & (stack_alignment-1)) == 0));
+              && (((uword_t) p) & (stack_alignment-1)) == 0));
 }
 
 static int
@@ -318,7 +317,7 @@ ra_pointer_p (void *ra)
   /* the check against 4096 is still a mystery to everyone interviewed about
    * it, but recent changes to sb-sprof seem to suggest that such values
    * do occur sometimes. */
-  return ((unsigned long) ra) > 4096 && !stack_pointer_p (ra);
+  return ((uword_t) ra) > 4096 && !stack_pointer_p (ra);
 }
 
 static int
@@ -349,9 +348,9 @@ x86_call_context (void *fp, void **ra, void **ocfp)
 struct compiled_debug_fun *
 debug_function_from_pc (struct code* code, void *pc)
 {
-  unsigned long code_header_len = sizeof(lispobj) * HeaderValue(code->header);
-  unsigned long offset
-    = (unsigned long) pc - (unsigned long) code - code_header_len;
+  uword_t code_header_len = sizeof(lispobj) * HeaderValue(code->header);
+  uword_t offset
+    = (uword_t) pc - (uword_t) code - code_header_len;
   struct compiled_debug_fun *df;
   struct compiled_debug_info *di;
   struct vector *v;
@@ -374,7 +373,7 @@ debug_function_from_pc (struct code* code, void *pc)
     if (i == len)
       return ((struct compiled_debug_fun *) native_pointer(v->data[i - 1]));
 
-    if (offset >= (unsigned long)fixnum_value(df->elsewhere_pc)) {
+    if (offset >= (uword_t)fixnum_value(df->elsewhere_pc)) {
       struct compiled_debug_fun *p
         = ((struct compiled_debug_fun *) native_pointer(v->data[i + 1]));
       next_pc = fixnum_value(p->elsewhere_pc);
@@ -523,7 +522,7 @@ describe_thread_state(void)
     printf("Pending handler = %p\n", data->pending_handler);
 }
 
-/* This function has been split from backtrace() to enable Lisp
+/* This function has been split from lisp_backtrace() to enable Lisp
  * backtraces from gdb with call backtrace_from_fp(...). Useful for
  * example when debugging threading deadlocks.
  */
@@ -556,13 +555,13 @@ backtrace_from_fp(void *fp, int nframes)
         if (dladdr(ra, &info)) {
             printf("Foreign function %s, fp = 0x%lx, ra = 0x%lx",
                    info.dli_sname,
-                   (unsigned long) next_fp,
-                   (unsigned long) ra);
+                   (uword_t) next_fp,
+                   (uword_t) ra);
         } else
 #endif
-        printf("Foreign fp = 0x%lx, ra = 0x%lx",
-               (unsigned long) next_fp,
-               (unsigned long) ra);
+        printf("Foreign fp = 0x%p, ra = 0x%p",
+               (void*) next_fp,
+               (void*) ra);
     }
 
     putchar('\n');
@@ -571,7 +570,7 @@ backtrace_from_fp(void *fp, int nframes)
 }
 
 void
-backtrace(int nframes)
+lisp_backtrace(int nframes)
 {
   void *fp;
 

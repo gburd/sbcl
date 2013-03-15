@@ -231,17 +231,8 @@
             ((null head))
           (unless (cdr (second head))
             (setf (second head) (car (second head)))))
-        (let* ((type-check-function
-                (if (eq type t)
-                    nil
-                    `('type-check-function (lambda (value)
-                                             (declare (type ,type value)
-                                                      (optimize (sb-c:store-coverage-data 0)))
-                                             value))))
-               (canon `(:name ',name :readers ',readers :writers ',writers
-                              :initargs ',initargs
-                              ,@type-check-function
-                              ',others)))
+        (let ((canon `(:name ',name :readers ',readers :writers ',writers
+                             :initargs ',initargs ',others)))
           (push (if (eq initform unsupplied)
                     `(list* ,@canon)
                     `(list* :initfunction ,(make-initfunction initform)
@@ -307,6 +298,7 @@
   ;; actual type as a compile-time side-effect would probably be a bad
   ;; idea and (2) anyway we don't need to modify it in order to make
   ;; NAME be recognized as a valid type name)
+  (with-single-package-locked-error (:symbol name "proclaiming ~S as a class"))
   (unless (info :type :kind name)
     ;; Tell the compiler to expect a class with the given NAME, by
     ;; writing a kind of minimal placeholder type information. This
@@ -469,6 +461,9 @@
 
 (defun early-slot-definition-location (slotd)
   (!bootstrap-get-slot 'standard-effective-slot-definition slotd 'location))
+
+(defun early-slot-definition-info (slotd)
+  (!bootstrap-get-slot 'standard-effective-slot-definition slotd 'info))
 
 (defun early-accessor-method-slot-name (method)
   (!bootstrap-get-slot 'standard-accessor-method method 'slot-name))

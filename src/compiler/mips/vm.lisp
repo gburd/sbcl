@@ -313,6 +313,10 @@
     (character
      (sc-number-or-lose 'immediate))))
 
+(!def-vm-support-routine boxed-immediate-sc-p (sc)
+  (or (eql sc (sc-number-or-lose 'zero))
+      (eql sc (sc-number-or-lose 'null))
+      (eql sc (sc-number-or-lose 'immediate))))
 
 ;;;; Function Call Parameters
 
@@ -374,3 +378,7 @@
 (!def-vm-support-routine combination-implementation-style (node)
   (declare (type sb!c::combination node) (ignore node))
   (values :default nil))
+
+(defun primitive-type-indirect-cell-type (ptype)
+  (declare (ignore ptype))
+  nil)

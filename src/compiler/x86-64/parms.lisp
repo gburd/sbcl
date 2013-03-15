@@ -103,25 +103,19 @@
 ;;; would be possible, but probably not worth the time and code bloat
 ;;; it would cause. -- JES, 2005-12-11
 
-(progn
-  (def!constant read-only-space-start     #x20000000)
-  (def!constant read-only-space-end       #x200ff000)
+;;; The default dynamic space size is lower on OpenBSD to allow SBCL to
+;;; run under the default 512M data size limit.
 
-  (def!constant static-space-start        #x20100000)
-  (def!constant static-space-end          #x201ff000)
+(!gencgc-space-setup #x20000000
+                     #x1000000000
 
-  (def!constant dynamic-space-start   #x1000000000)
-  #!-openbsd
-  (def!constant dynamic-space-end     #x11ffff0000)
-  #!+openbsd
-  ;; This is lower on OpenBSD to allow SBCL to run under the default
-  ;; 512M data size limit.
-  (def!constant dynamic-space-end     #x101bcf0000)
+                     ;; :default-dynamic-space-size
+                     #!+openbsd #x1bcf0000
 
-  (def!constant linkage-table-space-start #x20200000)
-  (def!constant linkage-table-space-end   #x202ff000)
+                     ;; :alignment
+                     #!+win32 #!+win32 nil #x10000)
 
-  (def!constant linkage-table-entry-size 16))
+(def!constant linkage-table-entry-size 16)
 
 
 ;;;; other miscellaneous constants
@@ -138,7 +132,9 @@
 
 (defenum (:start 24)
   object-not-list-trap
-  object-not-instance-trap)
+  object-not-instance-trap
+  #!+sb-safepoint global-safepoint-trap
+  #!+sb-safepoint csp-safepoint-trap)
 
 ;;;; static symbols
 
@@ -165,11 +161,6 @@
      ;; interrupt handling
      *pseudo-atomic-bits*
 
-     #!+sb-thread *stop-for-gc-pending*
-
-     #!+sb-thread *free-tls-index*
-     #!+sb-thread *tls-index-lock*
-
      *allocation-pointer*
      *binding-stack-pointer*
 
@@ -181,9 +172,6 @@
 
      ;; For GC-AND-SAVE
      *restart-lisp-function*
-
-     ;; For the UNWIND-TO-FRAME-AND-CALL VOP
-     *unwind-to-frame-function*
 
      ;; Needed for callbacks to work across saving cores. see
      ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory

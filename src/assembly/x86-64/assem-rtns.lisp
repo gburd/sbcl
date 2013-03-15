@@ -57,7 +57,7 @@
   ;; address. Therefore, we need to iterate from larger addresses to
   ;; smaller addresses. pfw-this says copy ecx words from esi to edi
   ;; counting down.
-  (inst shr ecx (1- n-lowtag-bits))
+  (inst shr ecx n-fixnum-tag-bits)
   (inst std)                            ; count down
   (inst sub esi n-word-bytes)
   (inst lea edi (make-ea :qword :base ebx :disp (- n-word-bytes)))
@@ -151,9 +151,11 @@
   ;; Calculate NARGS (as a fixnum)
   (move ecx esi)
   (inst sub ecx rsp-tn)
+  #!-#.(cl:if (cl:= sb!vm:word-shift sb!vm:n-fixnum-tag-bits) '(and) '(or))
+  (inst shr ecx (- word-shift n-fixnum-tag-bits))
 
   ;; Check for all the args fitting the registers.
-  (inst cmp ecx (fixnumize 3))
+  (inst cmp ecx (fixnumize register-arg-count))
   (inst jmp :le REGISTER-ARGS)
 
   ;; Save the OLD-FP and RETURN-PC because the blit is going to trash
@@ -166,10 +168,10 @@
   ;; Do the blit. Because we are coping from smaller addresses to
   ;; larger addresses, we have to start at the largest pair and work
   ;; our way down.
-  (inst shr ecx (1- n-lowtag-bits))
+  (inst shr ecx n-fixnum-tag-bits)
   (inst std)                            ; count down
   (inst lea edi (make-ea :qword :base rbp-tn :disp (frame-byte-offset 0)))
-  (inst sub esi (fixnumize 1))
+  (inst sub esi n-word-bytes)
   (inst rep)
   (inst movs :qword)
   (inst cld)
@@ -218,7 +220,7 @@
                               fun-pointer-lowtag))))
 
 (define-assembly-routine (throw
-                          (:return-style :none))
+                          (:return-style :raw))
                          ((:arg target (descriptor-reg any-reg) rdx-offset)
                           (:arg start any-reg rbx-offset)
                           (:arg count any-reg rcx-offset)
@@ -230,8 +232,18 @@
 
   LOOP
 
-  (let ((error (generate-error-code nil 'unseen-throw-tag-error target)))
-    (inst or catch catch)               ; check for NULL pointer
+  (let ((error (gen-label)))
+    (assemble (*elsewhere*)
+      (emit-label error)
+
+      ;; Fake up a stack frame so that backtraces come out right.
+      (inst push rbp-tn)
+      (inst mov rbp-tn rsp-tn)
+
+      (emit-error-break nil error-trap
+                        (error-number-or-lose 'unseen-throw-tag-error)
+                        (list target)))
+    (inst test catch catch)             ; check for NULL pointer
     (inst jmp :z error))
 
   (inst cmp target (make-ea-for-object-slot catch catch-block-tag-slot 0))
@@ -258,7 +270,7 @@
   (declare (ignore start count))
 
   (let ((error (generate-error-code nil 'invalid-unwind-error)))
-    (inst or block block)               ; check for NULL pointer
+    (inst test block block)             ; check for NULL pointer
     (inst jmp :z error))
 
   (load-tl-symbol-value uwp *current-unwind-protect-block*)

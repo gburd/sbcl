@@ -26,95 +26,44 @@
 #include "gencgc-internal.h"
 #endif
 
-#if defined LISP_FEATURE_SPARC
-#define OS_VM_DEFAULT_PAGESIZE 8192
-#elif defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64
-#define OS_VM_DEFAULT_PAGESIZE 4096
-#else
-#error "Don't know OS_VM_DEFAULT_PAGESIZE"
+#ifdef LISP_FEATURE_SB_WTIMER
+# include <port.h>
+# include <time.h>
+# include <errno.h>
 #endif
 
-long os_vm_page_size=(-1);
-static long os_real_page_size=(-1);
-
-static os_vm_size_t real_page_size_difference=0;
-
-/* So, this sucks. Versions of Solaris prior to 8 (SunOS releases
-   earlier than 5.8) do not support MAP_ANON passed as a flag to
-   mmap(). However, we would like SBCL compiled on SunOS 5.7 but
-   running on 5.8 to use MAP_ANON, but because of C's lack of
-   introspection at runtime, we can't grab the right value because
-   it's stuffed in a header file somewhere. We can, however, hardcode
-   it, and test at runtime for whether to use it... -- CSR, 2002-05-06
-
-   And, in fact, it sucks slightly more, as if you don't use MAP_ANON
-   you need to have /dev/zero open and pass the file descriptor to
-   mmap().  So overall, this counts as a KLUDGE. -- CSR, 2002-05-20 */
-int KLUDGE_MAYBE_MAP_ANON = 0x0;
-int kludge_mmap_fd = -1; /* default for MAP_ANON */
+os_vm_size_t os_vm_page_size=0;
 
 void
 os_init(char *argv[], char *envp[])
 {
-    struct utsname name;
-    int major_version;
-    int minor_version;
-
-    uname(&name);
-    major_version = atoi(name.release);
-    if (major_version != 5) {
-        lose("sunos major version=%d (which isn't 5!)\n", major_version);
-    }
-    minor_version = atoi(name.release+2);
-    if ((minor_version < 8)) {
-        kludge_mmap_fd = open("/dev/zero",O_RDONLY);
-        if (kludge_mmap_fd < 0) {
-            perror("open");
-            lose("Error in open(..)\n");
-        }
-    } else if (minor_version > 11) {
-        FSHOW((stderr, "os_init: Solaris version greater than 11?\nUnknown MAP_ANON behaviour.\n"));
-        lose("Unknown mmap() interaction with MAP_ANON\n");
-    } else {
-        /* Versions 8-11*/
-        KLUDGE_MAYBE_MAP_ANON = 0x100;
-    }
-
-    /* I do not understand this at all. FIXME. */
-    os_vm_page_size = os_real_page_size = sysconf(_SC_PAGESIZE);
-
-    if(os_vm_page_size>OS_VM_DEFAULT_PAGESIZE){
-        fprintf(stderr,"os_init: Pagesize too large (%d > %d)\n",
-                os_vm_page_size,OS_VM_DEFAULT_PAGESIZE);
-        exit(1);
-    } else {
-        /*
-         * we do this because there are apparently dependencies on
-         * the pagesize being OS_VM_DEFAULT_PAGESIZE somewhere...
-         * but since the OS doesn't know we're using this restriction,
-         * we have to grovel around a bit to enforce it, thus anything
-         * that uses real_page_size_difference.
-         */
-        /* FIXME: Is this still true? */
-        real_page_size_difference=OS_VM_DEFAULT_PAGESIZE-os_vm_page_size;
-        os_vm_page_size=OS_VM_DEFAULT_PAGESIZE;
-    }
+    /*
+     * historically, this used sysconf to select the runtime page size
+     * per recent changes on other arches and discussion on sbcl-devel,
+     * however, this is not necessary -- the VM page size need not match
+     * the OS page size (and the default backend page size has been
+     * ramped up accordingly for efficiency reasons).
+     */
+    os_vm_page_size = BACKEND_PAGE_BYTES;
 }
 
 os_vm_address_t os_validate(os_vm_address_t addr, os_vm_size_t len)
 {
-    int flags = MAP_PRIVATE | MAP_NORESERVE | KLUDGE_MAYBE_MAP_ANON;
+    int flags = MAP_PRIVATE | MAP_NORESERVE | MAP_ANON;
     if (addr)
         flags |= MAP_FIXED;
 
-    addr = mmap(addr, len,
-                OS_VM_PROT_ALL,
-                flags,
-                kludge_mmap_fd, 0);
+    addr = mmap(addr, len, OS_VM_PROT_ALL, flags, -1, 0);
 
     if (addr == MAP_FAILED) {
         perror("mmap");
-        lose ("Error in mmap(..)\n");
+        /* While it is generally hard to recover from out-of-memory
+         * situations, we require callers to decide on the right course
+         * of action here.  Consider thread creation: Failure to mmap
+         * here is common if users have started too many threads, and
+         * often we can recover from that and treat it as an ordinary
+         * error. */
+        return 0;
     }
 
     return addr;
@@ -201,6 +150,11 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
 {
     void* fault_addr = (void*)info->si_addr;
 
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+    if (handle_safepoint_violation(context, fault_addr))
+            return;
+#endif
+
     if (!gencgc_handle_wp_violation(fault_addr))
         if(!handle_guard_page_triggered(context, fault_addr))
             lisp_memory_fault_error(context, fault_addr);
@@ -215,7 +169,7 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
 
     if (!cheneygc_handle_wp_violation(context, addr)) {
         if (!handle_guard_page_triggered(context,addr))
-            lisp_memory_fault_error(context, fault_addr);
+            lisp_memory_fault_error(context, addr);
     }
 }
 
@@ -227,22 +181,123 @@ os_install_interrupt_handlers()
     undoably_install_low_level_interrupt_handler(SIG_MEMORY_FAULT,
                                                  sigsegv_handler);
 
+    /* OAOOM c.f. linux-os.c.
+     * Should we have a reusable function gc_install_interrupt_handlers? */
 #ifdef LISP_FEATURE_SB_THREAD
+# ifdef LISP_FEATURE_SB_SAFEPOINT
+#  ifdef LISP_FEATURE_SB_THRUPTION
+    undoably_install_low_level_interrupt_handler(SIGPIPE, thruption_handler);
+#  endif
+# else
     undoably_install_low_level_interrupt_handler(SIG_STOP_FOR_GC,
                                                  sig_stop_for_gc_handler);
+# endif
 #endif
 }
 
 char *
-os_get_runtime_executable_path()
+os_get_runtime_executable_path(int external)
 {
-    int ret;
     char path[] = "/proc/self/object/a.out";
 
-    ret = access(path, R_OK);
-    if (ret == -1)
+    if (external || access(path, R_OK) == -1)
         return NULL;
 
     return copied_string(path);
 }
 
+#ifdef LISP_FEATURE_SB_WTIMER
+/*
+ * Waitable timer implementation for the safepoint-based (SIGALRM-free)
+ * timer facility using SunOS completion ports.
+ */
+
+struct os_wtimer {
+    int port;
+    int timer;
+};
+
+struct os_wtimer *
+os_create_wtimer()
+{
+    int port = port_create();
+    if (port == -1) {
+        perror("port_create");
+        lose("os_create_wtimer");
+    }
+
+    port_notify_t pn;
+    pn.portnfy_port = port;
+    pn.portnfy_user = 0;
+
+    struct sigevent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.sigev_notify = SIGEV_PORT;
+    ev.sigev_value.sival_ptr = &pn;
+
+    timer_t timer;
+    if (timer_create(CLOCK_HIGHRES, &ev, &timer) == -1
+        && (errno != EPERM || timer_create(CLOCK_REALTIME, &ev, &timer) == -1))
+    {
+        perror("timer_create");
+        lose("os_create_wtimer");
+    }
+
+    struct os_wtimer *wt = malloc(sizeof(struct os_wtimer));
+    if (!wt)
+        lose("os_create_wtimer: malloc");
+
+    wt->port = port;
+    wt->timer = timer;
+    return wt;
+}
+
+int
+os_wait_for_wtimer(struct os_wtimer *wt)
+{
+    port_event_t pe;
+    if (port_get(wt->port, &pe, 0) == -1) {
+        if (errno == EINTR)
+            return 1;
+        perror("port_get");
+        lose("os_wtimer_listen failed");
+    }
+    return 0;
+}
+
+void
+os_close_wtimer(struct os_wtimer *wt)
+{
+    if (close(wt->port) == -1) {
+        perror("close");
+        lose("os_close_wtimer");
+    }
+    if (timer_delete(wt->timer) == -1) {
+        perror("timer_delete");
+        lose("os_close_wtimer");
+    }
+    free(wt);
+}
+
+void
+os_set_wtimer(struct os_wtimer *wt, int sec, int nsec)
+{
+    struct itimerspec spec;
+    spec.it_value.tv_sec = sec;
+    spec.it_value.tv_nsec = nsec;
+    spec.it_interval.tv_sec = 0;
+    spec.it_interval.tv_nsec = 0;
+    if (timer_settime(wt->timer, 0, &spec, 0) == -1) {
+        int x = errno;
+        perror("timer_settime");
+        if (x != EINVAL)
+            lose("os_set_wtimer");
+    }
+}
+
+void
+os_cancel_wtimer(struct os_wtimer *wt)
+{
+    os_set_wtimer(wt, 0, 0);
+}
+#endif

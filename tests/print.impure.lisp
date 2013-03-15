@@ -103,6 +103,10 @@
 (assert (raises-error? (format nil "~<~<~A~:>~>" '(foo))))
 (assert (string= (format nil "~<~<~A~>~>" 'foo) "FOO"))
 
+(with-test (:name (:format :justification-atsign-check))
+  (assert (raises-error? (format nil "~<~@>")))
+  (assert (raises-error? (eval '(format nil "~<~@>")))))
+
 ;;; Check that arrays that we print while *PRINT-READABLY* is true are
 ;;; in fact generating similar objects.
 (assert (equal (array-dimensions
@@ -268,11 +272,12 @@
 
 ;;; bug 350: bignum printing so memory-hungry that heap runs out
 ;;; -- just don't stall here forever on a slow box
-(handler-case
-    (with-timeout 10
-      (print (ash 1 1000000)))
-  (timeout ()
-    (print 'timeout!)))
+(with-test (:name bug-350)
+  (handler-case
+      (with-timeout 10
+        (print (ash 1 1000000)))
+    (timeout ()
+      (print 'timeout!))))
 
 ;;; bug 371: bignum print/read inconsistency
 (defvar *bug-371* -7043009959286724629649270926654940933664689003233793014518979272497911394287216967075767325693021717277238746020477538876750544587281879084559996466844417586093291189295867052594478662802691926547232838591510540917276694295393715934079679531035912244103731582711556740654671309980075069010778644542022/670550434139267031632063192770201289106737062379324644110801846820471752716238484923370056920388400273070254958650831435834503195629325418985020030706879602898158806736813101434594805676212779217311897830937606064579213895527844045511878668289820732425014254579493444623868748969110751636786165152601)
@@ -402,12 +407,10 @@
       (ignore-errors
         (delete-file file)))))
 
-#+sb-unicode
-(with-test (:name (:print-readable :character :utf-8))
+(with-test (:name (:print-readable :character :utf-8) :skipped-on '(not :sb-unicode))
   (test-readable-character (code-char #xfffe) :utf-8))
 
-#+sb-unicode
-(with-test (:name (:print-readable :character :iso-8859-1))
+(with-test (:name (:print-readable :character :iso-8859-1) :skipped-on '(not :sb-unicode))
   (test-readable-character (code-char #xfffe) :iso-8859-1))
 
 (assert (string= (eval '(format nil "~:C" #\a)) "a"))
@@ -471,5 +474,187 @@
                          (*print-right-margin* 10))
                      (format nil "~A" (make-instance 'a-class-name)))
                    :test #'char=)))
+
+;;; The PRINT-OBJECT method for RANDOM-STATE used to have a bogus
+;;; dimension argument for MAKE-ARRAY.
+(with-test (:name :print-random-state)
+  (assert (equalp *random-state*
+                  (read-from-string
+                   (write-to-string *random-state*)))))
+
+(with-test (:name :write-return-value)
+  (assert (= 123 (funcall (compile nil (lambda ()
+                                         (write 123)))))))
+
+(with-test (:name :write/write-to-string-compiler-macro-lp/598374+581564)
+  (let ((test (compile nil
+                       `(lambda (object &optional output-stream)
+                          (write object
+                                 :stream output-stream)))))
+    (assert (equal "(HELLO WORLD)"
+                   (with-output-to-string (*standard-output*)
+                     (let ((list '(hello world)))
+                       (assert (eq list (funcall test list)))))))
+    (assert (equal "12"
+                   (with-output-to-string (*standard-output*)
+                     (assert (eql 12 (funcall test 12)))))))
+  (let ((test (compile nil
+                       `(lambda ()
+                          (let ((*print-length* 42))
+                            (write-to-string *print-length* :length nil))))))
+    (assert (equal "42" (funcall test)))))
+
+(with-test (:name (:format :compile-literal-dest-string))
+  (assert (eq :warned
+              (handler-case
+                  (compile nil
+                           `(lambda (x) (format "~A" x)))
+                ((and warning (not style-warning)) ()
+                  :warned)))))
+
+(with-test (:name :bug-308961)
+  (assert (string= (format nil "~4,1F" 0.001) " 0.0"))
+  (assert (string= (format nil "~4,1@F" 0.001) "+0.0"))
+  (assert (string= (format nil "~E" 0.01) "1.e-2"))
+  (assert (string= (format nil "~G" 0.01) "1.00e-2")))
+
+(with-test (:name (:fp-print-read-consistency single-float))
+  (let ((*random-state* (make-random-state t))
+        (oops))
+    (loop for f = most-positive-single-float then (/ f 2.0)
+          while (> f 0.0)
+          do (loop repeat 10
+                   for fr = (random f)
+                   do (unless (eql fr (read-from-string (prin1-to-string fr)))
+                        (push fr oops)
+                        (return))))
+    (loop for f = most-negative-single-float then (/ f 2.0)
+          while (< f -0.0)
+          do (loop repeat 10
+                   for fr = (- (random (- f)))
+                   do (unless (eql fr (read-from-string (prin1-to-string fr)))
+                        (push fr oops)
+                        (return))))
+    (when oops
+      (error "FP print-read inconsistencies:~%~:{  ~S => ~S~%~}"
+             (mapcar (lambda (f)
+                       (list f (read-from-string (prin1-to-string f))))
+                     oops)))))
+
+(with-test (:name (:fp-print-read-consistency double-float))
+  (let ((*random-state* (make-random-state t))
+        (oops))
+    ;; FIXME skipping denormalized floats due to bug 793774.
+    (loop for f = most-positive-double-float then (/ f 2d0)
+          while (> f 0d0)
+          do (loop repeat 10
+                   for fr = (random f)
+                   do (unless (float-denormalized-p fr)
+                        (unless (eql fr (read-from-string (prin1-to-string fr)))
+                          (push fr oops)
+                          (return)))))
+    (loop for f = most-negative-double-float then (/ f 2d0)
+          while (< f -0d0)
+          do (loop repeat 10
+                   for fr = (- (random (- f)))
+                   do (unless (float-denormalized-p fr)
+                        (unless (eql fr (read-from-string (prin1-to-string fr)))
+                          (push fr oops)
+                          (return)))))
+    (when oops
+      (error "FP print-read inconsistencies:~%~:{  ~S => ~S~%~}"
+             (mapcar (lambda (f)
+                       (list f (read-from-string (prin1-to-string f))))
+                     oops)))))
+
+(with-test (:name :bug-811386)
+  (assert (equal "   0.00" (format nil "~7,2,-2f" 0)))
+  (assert (equal "   0.00" (format nil "~7,2,2f" 0)))
+  (assert (equal "   0.01" (format nil "~7,2,-2f" 1)))
+  (assert (equal " 100.00" (format nil "~7,2,2f" 1)))
+  (assert (equal "   0.00" (format nil "~7,2,-2f" 0.1)))
+  (assert (equal "  10.00" (format nil "~7,2,2f" 0.1)))
+  (assert (equal "   0.01" (format nil "~7,2,-2f" 0.5))))
+
+(with-test (:name :bug-867684)
+  (assert (equal "ab" (format nil "a~0&b"))))
+
+(with-test (:name :print-unreadably-function)
+  (assert (equal "\"foo\""
+                 (handler-bind ((print-not-readable #'sb-ext:print-unreadably))
+                   (write-to-string (coerce "foo" 'base-string) :readably t)))))
+
+(with-test (:name :printing-specialized-arrays-readably)
+  (let ((*read-eval* t)
+        (dimss (loop repeat 10
+                     collect (loop repeat (1+ (random 3))
+                                   collect (1+ (random 10)))))
+        (props sb-vm::*specialized-array-element-type-properties*))
+    (labels ((random-elt (type)
+               (case type
+                 (base-char
+                  (code-char (random 128)))
+                 (character
+                  (code-char (random char-code-limit)))
+                 (single-float
+                  (+ least-positive-normalized-single-float
+                     (random most-positive-single-float)))
+                 (double-float
+                  (+ least-positive-normalized-double-float
+                         (random most-positive-double-float)))
+                 (bit
+                  (random 2))
+                 (fixnum
+                  (random most-positive-fixnum))
+                 ((t)
+                  t)
+                 (otherwise
+                  (destructuring-bind (type x) type
+                    (ecase type
+                      (unsigned-byte
+                       (random (1- (expt 2 x))))
+                      (signed-byte
+                       (- (random (expt 2 (1- x)))))
+                      (complex
+                       (complex (random-elt x) (random-elt x)))))))))
+      (dotimes (i (length props))
+        (let ((et (sb-vm::saetp-specifier (aref props i))))
+          (when et
+            (when (eq 'base-char et)
+              ;; base-strings not included in the #. printing.
+              (go :next))
+            (dolist (dims dimss)
+              (let ((a (make-array dims :element-type et)))
+                (assert (equal et (array-element-type a)))
+                (dotimes (i (array-total-size a))
+                  (setf (row-major-aref a i) (random-elt et)))
+                (let ((copy (read-from-string (write-to-string a :readably t))))
+                  (assert (equal dims (array-dimensions copy)))
+                  (assert (equal et (array-element-type copy)))
+                  (assert (equal (array-total-size a) (array-total-size copy)))
+                  (dotimes (i (array-total-size a))
+                    (assert (equal (row-major-aref a i) (row-major-aref copy i)))))))))
+        :next))))
+
+(with-test (:name (:format :negative-colinc-and-mincol))
+  (assert (raises-error? (format nil "~-2a" 1)))
+  (assert (raises-error? (format nil "~,0a" 1))))
+
+(with-test (:name :bug-905817)
+  ;; The bug manifests itself in an endless loop in FORMAT.
+  ;; Correct behaviour is to signal an error.
+  (handler-case
+      (with-timeout 5
+        (assert (raises-error? (format nil "e~8,0s" 12395))))
+    (timeout ()
+      (error "Endless loop in FORMAT"))))
+
+(with-test (:name :format-type-check)
+  (assert (equal "1/10" (format nil "~2r" 1/2)))
+  (assert (raises-error? (format nil "~r" 1.32) sb-format:format-error))
+  (assert (raises-error? (format nil "~c" 1.32) sb-format:format-error))
+  (assert (equal "1/10" (eval '(format nil "~2r" 1/2))))
+  (assert (raises-error? (eval '(format nil "~r" 1.32)) sb-format:format-error))
+  (assert (raises-error? (eval '(format nil "~c" 1.32)) sb-format:format-error)))
 
 ;;; success

@@ -24,49 +24,95 @@
         element-type-specifier)))
 
 (defun upgraded-element-type-specifier (lvar)
-  (type-specifier (extract-upgraded-element-type lvar)))
+  (type-specifier (array-type-upgraded-element-type (lvar-type lvar))))
 
 ;;; Array access functions return an object from the array, hence its type is
 ;;; going to be the array upgraded element type. Secondary return value is the
 ;;; known supertype of the upgraded-array-element-type, if if the exact
 ;;; U-A-E-T is not known. (If it is NIL, the primary return value is as good
 ;;; as it gets.)
-(defun extract-upgraded-element-type (array)
-  (let ((type (lvar-type array)))
-    (cond
-      ;; Note that this IF mightn't be satisfied even if the runtime
-      ;; value is known to be a subtype of some specialized ARRAY, because
-      ;; we can have values declared e.g. (AND SIMPLE-VECTOR UNKNOWN-TYPE),
-      ;; which are represented in the compiler as INTERSECTION-TYPE, not
-      ;; array type.
-      ((array-type-p type)
-       (values (array-type-specialized-element-type type) nil))
-      ;; fix for bug #396. This type logic corresponds to the special case for
-      ;; strings in HAIRY-DATA-VECTOR-REF (generic/vm-tran.lisp)
-      ((csubtypep type (specifier-type 'string))
-       (cond
-         ((csubtypep type (specifier-type '(array character (*))))
-          (values (specifier-type 'character) nil))
-         #!+sb-unicode
-         ((csubtypep type (specifier-type '(array base-char (*))))
-          (values (specifier-type 'base-char) nil))
-         ((csubtypep type (specifier-type '(array nil (*))))
-          (values *empty-type* nil))
-         (t
-          ;; See KLUDGE below.
-          (values *wild-type* (specifier-type 'character)))))
-      (t
-       ;; KLUDGE: there is no good answer here, but at least
-       ;; *wild-type* won't cause HAIRY-DATA-VECTOR-{REF,SET} to be
-       ;; erroneously optimized (see generic/vm-tran.lisp) -- CSR,
-       ;; 2002-08-21
-       (values *wild-type* nil)))))
+(defun array-type-upgraded-element-type (type)
+  (typecase type
+    ;; Note that this IF mightn't be satisfied even if the runtime
+    ;; value is known to be a subtype of some specialized ARRAY, because
+    ;; we can have values declared e.g. (AND SIMPLE-VECTOR UNKNOWN-TYPE),
+    ;; which are represented in the compiler as INTERSECTION-TYPE, not
+    ;; array type.
+    (array-type
+     (values (array-type-specialized-element-type type) nil))
+    ;; Deal with intersection types (bug #316078)
+    (intersection-type
+     (let ((intersection-types (intersection-type-types type))
+           (element-type *wild-type*)
+           (element-supertypes nil))
+       (dolist (intersection-type intersection-types)
+         (multiple-value-bind (cur-type cur-supertype)
+             (array-type-upgraded-element-type intersection-type)
+           ;; According to ANSI, an array may have only one specialized
+           ;; element type - e.g. '(and (array foo) (array bar))
+           ;; is not a valid type unless foo and bar upgrade to the
+           ;; same element type.
+           (cond
+             ((eq cur-type *wild-type*)
+              nil)
+             ((eq element-type *wild-type*)
+              (setf element-type cur-type))
+             ((or (not (csubtypep cur-type element-type))
+                  (not (csubtypep element-type cur-type)))
+              ;; At least two different element types where given, the array
+              ;; is valid iff they represent the same type.
+              ;;
+              ;; FIXME: TYPE-INTERSECTION already takes care of disjoint array
+              ;; types, so I believe this code should be unreachable. Maybe
+              ;; signal a warning / error instead?
+              (setf element-type *empty-type*)))
+           (push (or cur-supertype (type-*-to-t cur-type))
+                 element-supertypes)))
+       (values element-type
+               (when (and (eq *wild-type* element-type) element-supertypes)
+                 (apply #'type-intersection element-supertypes)))))
+    (union-type
+     (let ((union-types (union-type-types type))
+           (element-type nil)
+           (element-supertypes nil))
+       (dolist (union-type union-types)
+         (multiple-value-bind (cur-type cur-supertype)
+             (array-type-upgraded-element-type union-type)
+           (cond
+             ((eq element-type *wild-type*)
+              nil)
+             ((eq element-type nil)
+              (setf element-type cur-type))
+             ((or (eq cur-type *wild-type*)
+                  ;; If each of the two following tests fail, it is not
+                  ;; possible to determine the element-type of the array
+                  ;; because more than one kind of element-type was provided
+                  ;; like in '(or (array foo) (array bar)) although a
+                  ;; supertype (or foo bar) may be provided as the second
+                  ;; returned value returned. See also the KLUDGE below.
+                  (not (csubtypep cur-type element-type))
+                  (not (csubtypep element-type cur-type)))
+              (setf element-type *wild-type*)))
+           (push (or cur-supertype (type-*-to-t cur-type))
+                 element-supertypes)))
+       (values element-type
+               (when (eq *wild-type* element-type)
+                 (apply #'type-union element-supertypes)))))
+    (member-type
+     ;; Convert member-type to an union-type.
+     (array-type-upgraded-element-type
+      (apply #'type-union (mapcar #'ctype-of (member-type-members type)))))
+    (t
+     ;; KLUDGE: there is no good answer here, but at least
+     ;; *wild-type* won't cause HAIRY-DATA-VECTOR-{REF,SET} to be
+     ;; erroneously optimized (see generic/vm-tran.lisp) -- CSR,
+     ;; 2002-08-21
+     (values *wild-type* nil))))
 
-(defun extract-declared-element-type (array)
-  (let ((type (lvar-type array)))
-    (if (array-type-p type)
-        (array-type-element-type type)
-        *wild-type*)))
+(defun array-type-declared-element-type (type)
+  (if (array-type-p type)
+      (array-type-element-type type)
+      *wild-type*))
 
 ;;; The ``new-value'' for array setters must fit in the array, and the
 ;;; return type is going to be the same as the new-value for SETF
@@ -80,14 +126,6 @@
        (lexenv-policy (node-lexenv (lvar-dest new-value))))))
   (lvar-type new-value))
 
-(defun assert-array-complex (array)
-  (assert-lvar-type
-   array
-   (make-array-type :complexp t
-                    :element-type *wild-type*)
-   (lexenv-policy (node-lexenv (lvar-dest array))))
-  nil)
-
 ;;; Return true if ARG is NIL, or is a constant-lvar whose
 ;;; value is NIL, false otherwise.
 (defun unsupplied-or-nil (arg)
@@ -95,6 +133,12 @@
   (or (not arg)
       (and (constant-lvar-p arg)
            (not (lvar-value arg)))))
+
+(defun supplied-and-true (arg)
+  (and arg
+       (constant-lvar-p arg)
+       (lvar-value arg)
+       t))
 
 ;;;; DERIVE-TYPE optimizers
 
@@ -107,7 +151,8 @@
    (lexenv-policy (node-lexenv (lvar-dest array)))))
 
 (defun derive-aref-type (array)
-  (multiple-value-bind (uaet other) (extract-upgraded-element-type array)
+  (multiple-value-bind (uaet other)
+      (array-type-upgraded-element-type (lvar-type array))
     (or other uaet)))
 
 (defoptimizer (array-in-bounds-p derive-type) ((array &rest indices))
@@ -124,6 +169,11 @@
     (block nil
       (let ((dimensions (array-type-dimensions-or-give-up
                          (lvar-conservative-type array))))
+        ;; Might be *. (Note: currently this is never true, because the type
+        ;; derivation infers the rank from the call to ARRAY-IN-BOUNDS-P, but
+        ;; let's keep this future proof.)
+        (when (eq '* dimensions)
+          (give-up-ir1-transform "array bounds unknown"))
         ;; shortcut for zero dimensions
         (when (some (lambda (dim)
                       (and (bound-known-p dim) (zerop dim)))
@@ -133,9 +183,14 @@
         ;; we can already decide on the result of the optimization without
         ;; even taking a look at the dimensions.
         (flet ((subscript-bounds (subscript)
-                 (let* ((type (lvar-type subscript))
-                        (low (numeric-type-low type))
-                        (high (numeric-type-high type)))
+                 (let* ((type1 (lvar-type subscript))
+                        (type2 (if (csubtypep type1 (specifier-type 'integer))
+                                   (weaken-integer-type type1 :range-only t)
+                                   (give-up)))
+                        (low (if (integer-type-p type2)
+                                 (numeric-type-low type2)
+                                 (give-up)))
+                        (high (numeric-type-high type2)))
                    (cond
                      ((and (or (not (bound-known-p low)) (minusp low))
                            (or (not (bound-known-p high)) (not (minusp high))))
@@ -228,51 +283,39 @@
 (defoptimizer (make-array derive-type)
               ((dims &key initial-element element-type initial-contents
                 adjustable fill-pointer displaced-index-offset displaced-to))
-  (let ((simple (and (unsupplied-or-nil adjustable)
-                     (unsupplied-or-nil displaced-to)
-                     (unsupplied-or-nil fill-pointer))))
-    (or (careful-specifier-type
-         `(,(if simple 'simple-array 'array)
-            ,(cond ((not element-type) t)
-                   ((constant-lvar-p element-type)
-                    (let ((ctype (careful-specifier-type
-                                  (lvar-value element-type))))
-                      (cond
-                        ((or (null ctype) (unknown-type-p ctype)) '*)
-                        (t (sb!xc:upgraded-array-element-type
-                            (lvar-value element-type))))))
-                   (t
-                    '*))
-            ,(cond ((constant-lvar-p dims)
-                    (let* ((val (lvar-value dims))
-                           (cdims (if (listp val) val (list val))))
-                      (if simple
-                          cdims
-                          (length cdims))))
-                   ((csubtypep (lvar-type dims)
-                               (specifier-type 'integer))
-                    '(*))
-                   (t
-                    '*))))
-        (specifier-type 'array))))
-
-;;; Complex array operations should assert that their array argument
-;;; is complex.  In SBCL, vectors with fill-pointers are complex.
-(defoptimizer (fill-pointer derive-type) ((vector))
-  (assert-array-complex vector))
-(defoptimizer (%set-fill-pointer derive-type) ((vector index))
-  (declare (ignorable index))
-  (assert-array-complex vector))
-
-(defoptimizer (vector-push derive-type) ((object vector))
-  (declare (ignorable object))
-  (assert-array-complex vector))
-(defoptimizer (vector-push-extend derive-type)
-    ((object vector &optional index))
-  (declare (ignorable object index))
-  (assert-array-complex vector))
-(defoptimizer (vector-pop derive-type) ((vector))
-  (assert-array-complex vector))
+  (let* ((simple (and (unsupplied-or-nil adjustable)
+                      (unsupplied-or-nil displaced-to)
+                      (unsupplied-or-nil fill-pointer)))
+         (spec
+          (or `(,(if simple 'simple-array 'array)
+                 ,(cond ((not element-type) t)
+                        ((constant-lvar-p element-type)
+                         (let ((ctype (careful-specifier-type
+                                       (lvar-value element-type))))
+                           (cond
+                             ((or (null ctype) (unknown-type-p ctype)) '*)
+                             (t (sb!xc:upgraded-array-element-type
+                                 (lvar-value element-type))))))
+                        (t
+                         '*))
+                 ,(cond ((constant-lvar-p dims)
+                         (let* ((val (lvar-value dims))
+                                (cdims (if (listp val) val (list val))))
+                           (if simple
+                               cdims
+                               (length cdims))))
+                        ((csubtypep (lvar-type dims)
+                                    (specifier-type 'integer))
+                         '(*))
+                        (t
+                         '*)))
+              'array)))
+    (if (and (not simple)
+             (or (supplied-and-true adjustable)
+                 (supplied-and-true displaced-to)
+                 (supplied-and-true fill-pointer)))
+        (careful-specifier-type `(and ,spec (not simple-array)))
+        (careful-specifier-type spec))))
 
 ;;;; constructors
 
@@ -290,21 +333,50 @@
                        ,@(when initial-element
                            '(:initial-element initial-element)))))
 
-;;; Prevent open coding DIMENSION and :INITIAL-CONTENTS arguments,
-;;; so that we can pick them apart.
-(define-source-transform make-array (&whole form dimensions &rest keyargs
-                                     &environment env)
-  (if (and (fun-lexically-notinline-p 'list)
-           (fun-lexically-notinline-p 'vector))
+(defun rewrite-initial-contents (rank initial-contents env)
+  (if (plusp rank)
+      (if (and (consp initial-contents)
+               (member (car initial-contents) '(list vector sb!impl::backq-list)))
+          `(list ,@(mapcar (lambda (dim)
+                             (rewrite-initial-contents (1- rank) dim env))
+                           (cdr initial-contents)))
+          initial-contents)
+      ;; This is the important bit: once we are past the level of
+      ;; :INITIAL-CONTENTS that relates to the array structure, reinline LIST
+      ;; and VECTOR so that nested DX isn't screwed up.
+      `(locally (declare (inline list vector))
+         ,initial-contents)))
+
+;;; Prevent open coding DIMENSION and :INITIAL-CONTENTS arguments, so that we
+;;; can pick them apart in the DEFTRANSFORMS, and transform '(3) style
+;;; dimensions to integer args directly.
+(define-source-transform make-array (dimensions &rest keyargs &environment env)
+  (if (or (and (fun-lexically-notinline-p 'list)
+               (fun-lexically-notinline-p 'vector))
+          (oddp (length keyargs)))
       (values nil t)
-      `(locally (declare (notinline list vector))
-         ;; Transform '(3) style dimensions to integer args directly.
-         ,(if (sb!xc:constantp dimensions env)
-              (let ((dims (constant-form-value dimensions env)))
-                (if (and (listp dims) (= 1 (length dims)))
-                    `(make-array ',(car dims) ,@keyargs)
-                    form))
-              form))))
+      (multiple-value-bind (new-dimensions rank)
+          (flet ((constant-dims (dimensions)
+                   (let* ((dims (constant-form-value dimensions env))
+                          (canon (if (listp dims) dims (list dims)))
+                          (rank (length canon)))
+                     (values (if (= rank 1)
+                                 (list 'quote (car canon))
+                                 (list 'quote canon))
+                             rank))))
+            (cond ((sb!xc:constantp dimensions env)
+                   (constant-dims dimensions))
+                  ((and (consp dimensions) (eq 'list dimensions))
+                   (values dimensions (length (cdr dimensions))))
+                  (t
+                   (values dimensions nil))))
+        (let ((initial-contents (getf keyargs :initial-contents)))
+          (when (and initial-contents rank)
+            (setf keyargs (copy-list keyargs)
+                  (getf keyargs :initial-contents)
+                  (rewrite-initial-contents rank initial-contents env))))
+        `(locally (declare (notinline list vector))
+           (make-array ,new-dimensions ,@keyargs)))))
 
 ;;; This baby is a bit of a monster, but it takes care of any MAKE-ARRAY
 ;;; call which creates a vector with a known element type -- and tries
@@ -606,23 +678,32 @@
 ;;; maybe this is just too sloppy for actual type logic.  -- CSR,
 ;;; 2004-02-18
 (defun array-type-dimensions-or-give-up (type)
-  (typecase type
-    (array-type (array-type-dimensions type))
-    (union-type
-     (let ((types (union-type-types type)))
-       ;; there are at least two types, right?
-       (aver (> (length types) 1))
-       (let ((result (array-type-dimensions-or-give-up (car types))))
-         (dolist (type (cdr types) result)
-           (unless (equal (array-type-dimensions-or-give-up type) result)
-             (give-up-ir1-transform
-              "~@<dimensions of arrays in union type ~S do not match~:@>"
-              (type-specifier type)))))))
-    ;; FIXME: intersection type [e.g. (and (array * (*)) (satisfies foo)) ]
-    (t
-     (give-up-ir1-transform
-      "~@<don't know how to extract array dimensions from type ~S~:@>"
-      (type-specifier type)))))
+  (labels ((maybe-array-type-dimensions (type)
+             (typecase type
+               (array-type
+                (array-type-dimensions type))
+               (union-type
+                (let* ((types (remove nil (mapcar #'maybe-array-type-dimensions
+                                                  (union-type-types type))))
+                       (result (car types)))
+                  (dolist (other (cdr types) result)
+                    (unless (equal result other)
+                      (give-up-ir1-transform
+                       "~@<dimensions of arrays in union type ~S do not match~:@>"
+                       (type-specifier type))))))
+               (intersection-type
+                (let* ((types (remove nil (mapcar #'maybe-array-type-dimensions
+                                                  (intersection-type-types type))))
+                       (result (car types)))
+                  (dolist (other (cdr types) result)
+                    (unless (equal result other)
+                      (abort-ir1-transform
+                       "~@<dimensions of arrays in intersection type ~S do not match~:@>"
+                       (type-specifier type)))))))))
+    (or (maybe-array-type-dimensions type)
+        (give-up-ir1-transform
+         "~@<don't know how to extract array dimensions from type ~S~:@>"
+         (type-specifier type)))))
 
 (defun conservative-array-type-complexp (type)
   (typecase type
@@ -995,13 +1076,13 @@
 ;; with sufficient precision, skip directly to DATA-VECTOR-REF.
 (deftransform aref ((array index) (t t) * :node node)
   (let* ((type (lvar-type array))
-         (element-ctype (extract-upgraded-element-type array)))
+         (element-ctype (array-type-upgraded-element-type type)))
     (cond
       ((and (array-type-p type)
             (null (array-type-complexp type))
             (not (eql element-ctype *wild-type*))
             (eql (length (array-type-dimensions type)) 1))
-       (let* ((declared-element-ctype (extract-declared-element-type array))
+       (let* ((declared-element-ctype (array-type-declared-element-type type))
               (bare-form
                `(data-vector-ref array
                  (%check-bound array (array-dimension array 0) index))))
@@ -1023,9 +1104,10 @@
 (macrolet ((define (name transform-to extra extra-type)
              (declare (ignore extra-type))
              `(deftransform ,name ((array index ,@extra))
-                (let ((type (lvar-type array))
-                      (element-type (extract-upgraded-element-type array))
-                      (declared-type (extract-declared-element-type array)))
+                (let* ((type (lvar-type array))
+                       (element-type (array-type-upgraded-element-type type))
+                       (declared-type (type-specifier
+                                       (array-type-declared-element-type type))))
                   ;; If an element type has been declared, we want to
                   ;; use that information it for type checking (even
                   ;; if the access can't be optimized due to the array

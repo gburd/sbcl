@@ -10,6 +10,7 @@
 ;;;; more information.
 
 (load "assertoid.lisp")
+(load "compiler-test-util.lisp")
 (use-package "ASSERTOID")
 
 ;;;; examples from, or close to, the Common Lisp DEFSTRUCT spec
@@ -461,11 +462,13 @@
             *manyraw*)))
   (room)
   (sb-ext:gc))
-(check-manyraws *manyraw*)
+(with-test (:name defstruct-raw-slot-gc)
+  (check-manyraws *manyraw*))
 
 ;;; try a full GC, too
 (sb-ext:gc :full t)
-(check-manyraws *manyraw*)
+(with-test (:name (defstruct-raw-slot-gc :full))
+  (check-manyraws *manyraw*))
 
 ;;; fasl dumper and loader also have special handling of raw slots, so
 ;;; dump all of them into a fasl
@@ -485,7 +488,8 @@
 
 ;;; re-read the dumped structures and check them
 (load "tmp-defstruct.manyraw.fasl")
-(check-manyraws (dumped-manyraws))
+(with-test (:name (defstruct-raw-slot load))
+  (check-manyraws (dumped-manyraws)))
 
 
 ;;;; miscellaneous old bugs
@@ -1061,3 +1065,77 @@ redefinition."
     (type-error (e)
       (assert (eq 'string (type-error-expected-type e)))
       (assert (zerop (type-error-datum e))))))
+
+(with-test (:name defstruct-copier-typechecks-argument)
+  (assert (not (raises-error? (copy-person (make-astronaut :name "Neil")))))
+  (assert (raises-error? (copy-astronaut (make-person :name "Fred")))))
+
+(with-test (:name :bug-528807)
+  (let ((*evaluator-mode* :compile))
+    (handler-bind ((style-warning #'error))
+      (eval `(defstruct (bug-528807 (:constructor make-528807 (&aux x)))
+               (x nil :type fixnum))))))
+
+(with-test (:name :bug-520607)
+  (assert
+    (raises-error?
+      (eval '(defstruct (typed-struct (:type list) (:predicate typed-struct-p))
+              (a 42 :type fixnum)))))
+  ;; NIL is ok, though.
+  (eval '(defstruct (typed-struct (:type list) (:predicate nil))
+          (a 42 :type fixnum)))
+  ;; So's empty.
+  (eval '(defstruct (typed-struct2 (:type list) (:predicate))
+          (a 42 :type fixnum))))
+
+(with-test (:name (:boa-supplied-p &optional))
+  (handler-bind ((warning #'error))
+    (eval `(defstruct (boa-supplied-p.1 (:constructor make-boa-supplied-p.1
+                                            (&optional (bar t barp))))
+             bar
+             barp)))
+  (let ((b1 (make-boa-supplied-p.1))
+        (b2 (make-boa-supplied-p.1 t)))
+    (assert (eq t (boa-supplied-p.1-bar b1)))
+    (assert (eq t (boa-supplied-p.1-bar b2)))
+    (assert (eq nil (boa-supplied-p.1-barp b1)))
+    (assert (eq t (boa-supplied-p.1-barp b2)))))
+
+(with-test (:name (:boa-supplied-p &key))
+  (handler-bind ((warning #'error))
+    (eval `(defstruct (boa-supplied-p.2 (:constructor make-boa-supplied-p.2
+                                            (&key (bar t barp))))
+             bar
+             barp)))
+  (let ((b1 (make-boa-supplied-p.2))
+        (b2 (make-boa-supplied-p.2 :bar t)))
+    (assert (eq t (boa-supplied-p.2-bar b1)))
+    (assert (eq t (boa-supplied-p.2-bar b2)))
+    (assert (eq nil (boa-supplied-p.2-barp b1)))
+    (assert (eq t (boa-supplied-p.2-barp b2)))))
+
+(defstruct structure-with-predicate)
+(defclass class-to-be-redefined () ())
+(let ((x (make-instance 'class-to-be-redefined)))
+  (defun function-trampoline (fun) (funcall fun x)))
+
+(with-test (:name (:struct-predicate :obsolete-instance))
+  (defclass class-to-be-redefined () ((a :initarg :a :initform 1)))
+  (function-trampoline #'structure-with-predicate-p))
+
+(with-test (:name (:defstruct :not-toplevel-silent))
+  (let ((sb-ext:*evaluator-mode* :compile))
+    (handler-bind ((warning #'error))
+     (eval `(let ()
+              (defstruct destruct-no-warning-not-at-toplevel bar))))))
+
+(with-test (:name :bug-941102)
+  (let ((test `((defstruct bug-941102)
+                 (setf (find-class 'bug-941102-alias) (find-class 'bug-941102))
+                 (setf (find-class 'bug-941102-alias) nil))))
+    (multiple-value-bind (warn fail) (ctu:file-compile test :load t)
+      (assert (not warn))
+      (assert (not fail)))
+    (multiple-value-bind (warn2 fail2) (ctu:file-compile test)
+      (assert (not warn2))
+      (assert (not fail2)))))

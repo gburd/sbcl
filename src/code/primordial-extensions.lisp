@@ -124,16 +124,6 @@
 
 ;;;; GENSYM tricks
 
-;;; GENSYM variant for easier debugging and better backtraces: append
-;;; the closest enclosing non-nil block name to the provided stem.
-(defun block-gensym (&optional (name "G") (env (when (boundp 'sb!c::*lexenv*)
-                                             (symbol-value 'sb!c::*lexenv*))))
-  (let ((block-name (when env
-                      (car (find-if #'car (sb!c::lexenv-blocks env))))))
-    (if block-name
-        (sb!xc:gensym (format nil "~A[~A]" name block-name))
-        (sb!xc:gensym name))))
-
 ;;; Compile a version of BODY for all TYPES, and dispatch to the
 ;;; correct one based on the value of VAR. This was originally used
 ;;; only for strings, hence the name. Renaming it to something more
@@ -164,15 +154,20 @@
                           (stem (if (every #'alpha-char-p symbol-name)
                                     symbol-name
                                     (concatenate 'string symbol-name "-"))))
-                     `(,symbol (block-gensym ,stem))))
+                     `(,symbol (sb!xc:gensym ,stem))))
                  symbols)
      ,@body))
 
 ;;; Return a list of N gensyms. (This is a common suboperation in
 ;;; macros and other code-manipulating code.)
-(declaim (ftype (function (index) list) make-gensym-list))
-(defun make-gensym-list (n)
-  (loop repeat n collect (block-gensym)))
+(declaim (ftype (function (index &optional t) (values list &optional))
+                make-gensym-list))
+(defun make-gensym-list (n &optional name)
+  (when (eq t name)
+    (break))
+  (if name
+      (loop repeat n collect (sb!xc:gensym (string name)))
+      (loop repeat n collect (sb!xc:gensym))))
 
 ;;;; miscellany
 
@@ -201,6 +196,11 @@
                  (len (length x)))
             (replace name x :start1 index)
             (incf index len)))))))
+
+(defun gensymify (x)
+  (if (symbolp x)
+      (sb!xc:gensym (symbol-name x))
+      (sb!xc:gensym)))
 
 ;;; like SYMBOLICATE, but producing keywords
 (defun keywordicate (&rest things)

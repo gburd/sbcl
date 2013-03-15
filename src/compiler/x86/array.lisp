@@ -141,8 +141,8 @@
   (def-full-data-vector-frobs simple-vector * descriptor-reg any-reg)
   (def-full-data-vector-frobs simple-array-unsigned-byte-32 unsigned-num
     unsigned-reg)
-  (def-full-data-vector-frobs simple-array-signed-byte-30 tagged-num any-reg)
-  (def-full-data-vector-frobs simple-array-unsigned-byte-29 positive-fixnum any-reg)
+  (def-full-data-vector-frobs simple-array-fixnum tagged-num any-reg)
+  (def-full-data-vector-frobs simple-array-unsigned-fixnum positive-fixnum any-reg)
   (def-full-data-vector-frobs simple-array-signed-byte-32 signed-num
     signed-reg)
   (def-full-data-vector-frobs simple-array-unsigned-byte-31 unsigned-num
@@ -696,3 +696,22 @@
 
 (define-vop (get-vector-subtype get-header-data))
 (define-vop (set-vector-subtype set-header-data))
+
+;;;; ATOMIC-INCF for arrays
+
+(define-vop (array-atomic-incf/word)
+  (:translate %array-atomic-incf/word)
+  (:policy :fast-safe)
+  (:args (array :scs (descriptor-reg))
+         (index :scs (any-reg))
+         (diff :scs (unsigned-reg) :target result))
+  (:arg-types * positive-fixnum unsigned-num)
+  (:results (result :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 4
+    (inst xadd (make-ea :dword :base array
+                        :scale 1 :index index
+                        :disp (- (* vector-data-offset n-word-bytes)
+                                 other-pointer-lowtag))
+          diff :lock)
+    (move result diff)))

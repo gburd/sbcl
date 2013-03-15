@@ -23,15 +23,18 @@
 (eval-when (:compile-toplevel :execute)
 
 (sb!xc:defmacro def-math-rtn (name num-args)
-  (let ((function (symbolicate "%" (string-upcase name))))
+  (let ((function (symbolicate "%" (string-upcase name)))
+        (args (loop for i below num-args
+                    collect (intern (format nil "ARG~D" i)))))
     `(progn
        (declaim (inline ,function))
-       (sb!alien:define-alien-routine (,name ,function) double-float
-         ,@(let ((results nil))
-             (dotimes (i num-args (nreverse results))
-               (push (list (intern (format nil "ARG-~D" i))
-                           'double-float)
-                     results)))))))
+       (defun ,function ,args
+         (alien-funcall
+          (extern-alien ,name
+                        (function double-float
+                                  ,@(loop repeat num-args
+                                          collect 'double-float)))
+          ,@args)))))
 
 (defun handle-reals (function var)
   `((((foreach fixnum single-float bignum ratio))
@@ -72,33 +75,37 @@
 #!-x86 (def-math-rtn "tan" 1)
 #!-x86 (def-math-rtn "atan" 1)
 #!-x86 (def-math-rtn "atan2" 2)
-#!-win32
+#!-(and win32 x86)
 (progn
   (def-math-rtn "acos" 1)
   (def-math-rtn "asin" 1)
   (def-math-rtn "cosh" 1)
   (def-math-rtn "sinh" 1)
   (def-math-rtn "tanh" 1)
-  (def-math-rtn "asinh" 1)
-  (def-math-rtn "acosh" 1)
-  (def-math-rtn "atanh" 1))
+  #!-win32
+  (progn
+    (def-math-rtn "asinh" 1)
+    (def-math-rtn "acosh" 1)
+    (def-math-rtn "atanh" 1)))
 #!+win32
 (progn
-  (declaim (inline %asin))
-  (defun %asin (number)
-    (%atan (/ number (sqrt (- 1 (* number number))))))
-  (declaim (inline %acos))
-  (defun %acos (number)
-    (- (/ pi 2) (%asin number)))
-  (declaim (inline %cosh))
-  (defun %cosh (number)
-    (/ (+ (exp number) (exp (- number))) 2))
-  (declaim (inline %sinh))
-  (defun %sinh (number)
-    (/ (- (exp number) (exp (- number))) 2))
-  (declaim (inline %tanh))
-  (defun %tanh (number)
-    (/ (%sinh number) (%cosh number)))
+  #!-x86-64
+  (progn
+    (declaim (inline %asin))
+    (defun %asin (number)
+      (%atan (/ number (sqrt (- 1 (* number number))))))
+    (declaim (inline %acos))
+    (defun %acos (number)
+      (- (/ pi 2) (%asin number)))
+    (declaim (inline %cosh))
+    (defun %cosh (number)
+      (/ (+ (exp number) (exp (- number))) 2))
+    (declaim (inline %sinh))
+    (defun %sinh (number)
+      (/ (- (exp number) (exp (- number))) 2))
+    (declaim (inline %tanh))
+    (defun %tanh (number)
+      (/ (%sinh number) (%cosh number))))
   (declaim (inline %asinh))
   (defun %asinh (number)
     (log (+ number (sqrt (+ (* number number) 1.0d0))) #.(exp 1.0d0)))
@@ -117,18 +124,33 @@
 #!-x86 (def-math-rtn "exp" 1)
 #!-x86 (def-math-rtn "log" 1)
 #!-x86 (def-math-rtn "log10" 1)
-#!-win32(def-math-rtn "pow" 2)
+#!-(and win32 x86) (def-math-rtn "pow" 2)
 #!-(or x86 x86-64) (def-math-rtn "sqrt" 1)
 #!-win32 (def-math-rtn "hypot" 2)
 #!-x86 (def-math-rtn "log1p" 1)
 
 #!+win32
 (progn
-  ;; FIXME: libc hypot "computes the sqrt(x*x+y*y) without undue overflow or underflow"
-  ;; ...we just do the stupid simple thing.
+  ;; This is written in a peculiar way to avoid overflow. Note that in
+  ;; sqrt(x^2 + y^2), either square or the sum can overflow.
+  ;;
+  ;; Factoring x^2 out of sqrt(x^2 + y^2) gives us the expression
+  ;; |x|sqrt(1 + (y/x)^2), which, assuming |x| >= |y|, can only overflow
+  ;; if |x| is sufficiently large.
+  ;;
+  ;; The ZEROP test suffices (y is non-negative) to guard against
+  ;; divisions by zero: x >= y > 0.
   (declaim (inline %hypot))
   (defun %hypot (x y)
-    (sqrt (+ (* x x) (* y y)))))
+    (declare (type double-float x y))
+    (let ((x (abs x))
+          (y (abs y)))
+      (when (> y x)
+        (rotatef x y))
+      (if (zerop y)
+          x
+          (let ((y/x (/ y x)))
+            (* x (sqrt (1+ (* y/x y/x)))))))))
 
 ;;;; power functions
 
@@ -178,10 +200,15 @@
   #!+sb-doc
   "Return BASE raised to the POWER."
   (if (zerop power)
-      (let ((result (1+ (* base power))))
-        (if (and (floatp result) (float-nan-p result))
-            (float 1 result)
-            result))
+    (if (and (zerop base) (floatp power))
+        (error 'arguments-out-of-domain-error
+               :operands (list base power)
+               :operation 'expt
+               :references (list '(:ansi-cl :function expt)))
+        (let ((result (1+ (* base power))))
+          (if (and (floatp result) (float-nan-p result))
+              (float 1 result)
+              result)))
     (labels (;; determine if the double float is an integer.
              ;;  0 - not an integer
              ;;  1 - an odd int
@@ -300,8 +327,12 @@
                                    (coerce (* pow (%cos y*pi))
                                            rtype)
                                    (coerce (* pow (%sin y*pi))
-                                           rtype)))))))))))))
-      (declare (inline real-expt))
+                                           rtype))))))))))))
+             (complex-expt (base power)
+               (if (and (zerop base) (plusp (realpart power)))
+                   (* base power)
+                   (exp (* power (log base))))))
+      (declare (inline real-expt complex-expt))
       (number-dispatch ((base number) (power number))
         (((foreach fixnum (or bignum ratio) (complex rational)) integer)
          (intexp base power))
@@ -315,19 +346,33 @@
          (real-expt base power 'double-float))
         ((double-float single-float)
          (real-expt base power 'double-float))
-        (((foreach (complex rational) (complex float)) rational)
+        ;; Handle (expt <complex> <rational>), except the case dealt with
+        ;; in the first clause above, (expt <(complex rational)> <integer>).
+        (((foreach (complex rational) (complex single-float)
+                   (complex double-float))
+          rational)
          (* (expt (abs base) power)
             (cis (* power (phase base)))))
-        (((foreach fixnum (or bignum ratio) single-float double-float)
-          complex)
-         (if (and (zerop base) (plusp (realpart power)))
-             (* base power)
-             (exp (* power (log base)))))
-        (((foreach (complex float) (complex rational))
+        ;; The next three clauses handle (expt <real> <complex>).
+        (((foreach fixnum (or bignum ratio) single-float)
+          (foreach (complex single-float) (complex rational)))
+         (complex-expt base power))
+        (((foreach fixnum (or bignum ratio) single-float)
+          (complex double-float))
+         (complex-expt (coerce base 'double-float) power))
+        ((double-float complex)
+         (complex-expt base power))
+        ;; The next three clauses handle (expt <complex> <float>) and
+        ;; (expt <complex> <complex>).
+        (((foreach (complex single-float) (complex rational))
+          (foreach (complex single-float) (complex rational) single-float))
+         (complex-expt base power))
+        (((foreach (complex single-float) (complex rational))
+          (foreach (complex double-float) double-float))
+         (complex-expt (coerce base '(complex double-float)) power))
+        (((complex double-float)
           (foreach complex double-float single-float))
-         (if (and (zerop base) (plusp (realpart power)))
-             (* base power)
-             (exp (* power (log base)))))))))
+         (complex-expt base power))))))
 
 ;;; FIXME: Maybe rename this so that it's clearer that it only works
 ;;; on integers?

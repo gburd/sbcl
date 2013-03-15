@@ -245,3 +245,49 @@
       (read-from-string "CL-USER:DOES-NOT-EXIST")
     (reader-error (c)
       (princ c))))
+
+;;; The GET-MACRO-CHARACTER in SBCL <= "1.0.34.2" bogusly computed its
+;;; second return value relative to *READTABLE* rather than the passed
+;;; readtable.
+(let* ((*readtable* (copy-readtable nil)))
+  (set-syntax-from-char #\" #\A)
+  (multiple-value-bind (reader-fn non-terminating-p)
+      (get-macro-character #\" (copy-readtable nil))
+    (declare (ignore reader-fn))
+    (assert (not non-terminating-p))))
+
+(with-test (:name :bug-309093)
+  (assert (eq :error
+              (handler-case
+                  (read-from-string "`#2A((,(1+ 0) 0) (0 0))")
+                (reader-error ()
+                  :error)))))
+
+(with-test (:name :set-syntax-from-char-dispatch-macro-char)
+  (let ((rt (copy-readtable)))
+    (make-dispatch-macro-character #\! nil rt)
+    (set-dispatch-macro-character #\! #\! (constantly 'bang^2) rt)
+    (flet ((maybe-bang ()
+             (let ((*readtable* rt))
+               (read-from-string "!!"))))
+      (assert (eq 'bang^2 (maybe-bang)))
+      (set-syntax-from-char #\! #\! rt)
+      (assert (eq '!! (maybe-bang))))))
+
+(with-test (:name :read-in-package-syntax)
+  (assert (equal '(sb-c::a (sb-kernel::x sb-kernel::y) sb-c::b)
+                 (read-from-string "sb-c::(a sb-kernel::(x y) b)")))
+  #+sb-package-locks
+  (assert (eq :violated!
+              (handler-case
+                  (read-from-string "cl::'foo")
+                (package-lock-violation ()
+                  :violated!)))))
+
+(with-test (:name :bug-309070)
+  (with-timeout 10
+    (assert (raises-error? (read-from-string "10e10000000000000000000")
+                           sb-kernel:reader-impossible-number-error))))
+
+(with-test (:name :bug-1095918)
+  (assert (= (length `#3(1)) 3)))

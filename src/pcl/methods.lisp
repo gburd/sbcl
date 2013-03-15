@@ -487,7 +487,7 @@
           ;; System lock because interrupts need to be disabled as
           ;; well: it would be bad to unwind and leave the gf in an
           ;; inconsistent state.
-          (sb-thread::with-recursive-system-spinlock (lock)
+          (sb-thread::with-recursive-system-lock (lock)
             (let ((existing (get-method generic-function
                                         qualifiers
                                         specializers
@@ -554,7 +554,6 @@
                        (warn "~@<Invalid qualifiers for ~S method combination ~
                               in method ~S:~2I~_~S.~@:>"
                              mc-name method qualifiers))))))
-
               (unless skip-dfun-update-p
                 (update-ctors 'add-method
                               :generic-function generic-function
@@ -575,7 +574,7 @@
       ;; System lock because interrupts need to be disabled as well:
       ;; it would be bad to unwind and leave the gf in an inconsistent
       ;; state.
-      (sb-thread::with-recursive-system-spinlock (lock)
+      (sb-thread::with-recursive-system-lock (lock)
         (let* ((specializers (method-specializers method))
                (methods (generic-function-methods generic-function))
                (new-methods (remove method methods)))
@@ -616,11 +615,11 @@
             ;; 7.6.4 point 5 probably entails that if any method says
             ;; &allow-other-keys then the gf should be construed to
             ;; accept any key.
-            (let ((allowp (or gf.allowp
-                              (find '&allow-other-keys methods
-                                    :test #'find
-                                    :key #'method-lambda-list))))
-              (setf (info :function :type name)
+            (let* ((allowp (or gf.allowp
+                               (find '&allow-other-keys methods
+                                     :test #'find
+                                     :key #'method-lambda-list)))
+                   (ftype
                     (specifier-type
                      `(function
                        (,@(mapcar tfun gf.required)
@@ -636,7 +635,7 @@
                                       (remove-duplicates
                                        (nconc
                                         (mapcan #'function-keywords methods)
-                                        (mapcar #'keywordicate gf.keys))))))
+                                        (mapcar #'keyword-spec-name gf.keys))))))
                                 (when all-keys
                                   (setq keysp t)
                                   `(&key ,@all-keys))))
@@ -644,10 +643,11 @@
                               `(&key))
                           ,@(when allowp
                               `(&allow-other-keys)))
-                       *))
+                       *))))
+              (setf (info :function :type name) ftype
                     (info :function :where-from name) :defined-method
-                    (gf-info-needs-update gf) nil))))))
-    (values)))
+                    (gf-info-needs-update gf) nil)
+              ftype)))))))
 
 (defun compute-applicable-methods-function (generic-function arguments)
   (values (compute-applicable-methods-using-types
@@ -783,7 +783,7 @@
           (let ((emf (get-effective-method-function generic-function
                                                     methods)))
             (invoke-emf emf args))
-          (apply #'no-applicable-method generic-function args)))))
+          (call-no-applicable-method generic-function args)))))
 
 (defun list-eq (x y)
   (loop (when (atom x) (return (eq x y)))
@@ -1183,35 +1183,6 @@
         (class-eq (cadr type))
         (class (cadr type)))))
 
-(defun precompute-effective-methods (gf caching-p &optional classes-list-p)
-  (let* ((arg-info (gf-arg-info gf))
-         (methods (generic-function-methods gf))
-         (precedence (arg-info-precedence arg-info))
-         (*in-precompute-effective-methods-p* t)
-         (classes-list nil))
-    (generate-discrimination-net-internal
-     gf methods nil
-     (lambda (methods known-types)
-       (when methods
-         (when classes-list-p
-           (push (mapcar #'class-from-type known-types) classes-list))
-         (let ((no-eql-specls-p (not (methods-contain-eql-specializer-p
-                                      methods))))
-           (map-all-orders
-            methods precedence
-            (lambda (methods)
-              (get-secondary-dispatch-function1
-               gf methods known-types
-               nil caching-p no-eql-specls-p))))))
-     (lambda (position type true-value false-value)
-       (declare (ignore position type true-value false-value))
-       nil)
-     (lambda (type)
-       (if (and (consp type) (eq (car type) 'eql))
-           `(class-eq ,(class-of (cadr type)))
-           type)))
-    classes-list))
-
 ;;; We know that known-type implies neither new-type nor `(not ,new-type).
 (defun augment-type (new-type known-type)
   (if (or (eq known-type t)
@@ -1443,7 +1414,7 @@
                         (make-dfun-lambda-list nargs applyp)
                         (make-fast-method-call-lambda-list nargs applyp))))
       (multiple-value-bind (cfunction constants)
-          (get-fun1 `(lambda
+          (get-fun1 `(named-lambda (gf-dispatch ,name)
                       ,arglist
                       ,@(unless function-p
                           `((declare (ignore .pv. .next-method-call.))))
@@ -1570,15 +1541,15 @@
 
 (defun slot-value-using-class-dfun (class object slotd)
   (declare (ignore class))
-  (function-funcall (slot-definition-reader-function slotd) object))
+  (funcall (slot-info-reader (slot-definition-info slotd)) object))
 
 (defun setf-slot-value-using-class-dfun (new-value class object slotd)
   (declare (ignore class))
-  (function-funcall (slot-definition-writer-function slotd) new-value object))
+  (funcall (slot-info-writer (slot-definition-info slotd)) new-value object))
 
 (defun slot-boundp-using-class-dfun (class object slotd)
   (declare (ignore class))
-  (function-funcall (slot-definition-boundp-function slotd) object))
+  (funcall (slot-info-boundp (slot-definition-info slotd)) object))
 
 (defun special-case-for-compute-discriminating-function-p (gf)
   (or (eq gf #'slot-value-using-class)
@@ -1746,7 +1717,7 @@
   ;; PARSE-LAMBDA-LIST to something handier.
   (multiple-value-bind (required optional restp rest keyp keys allowp
                         auxp aux morep more-context more-count)
-      (parse-lambda-list lambda-list)
+      (parse-lambda-list lambda-list :silent t)
     (declare (ignore restp keyp auxp aux morep))
     (declare (ignore more-context more-count))
     (values required optional rest keys allowp)))

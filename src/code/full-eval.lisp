@@ -522,9 +522,7 @@
           (t (values (cdr binding) :variable)))
         (case (sb!int:info :variable :kind symbol)
           (:macro (values (macroexpand-1 symbol) :expansion))
-          (:alien (let ((type (sb!int:info :variable :alien-info symbol)))
-                    (values (sb!alien::%heap-alien type)
-                            :variable)))
+          (:alien (values (sb!alien-internals:alien-value symbol) :variable))
           (t (values (symbol-value symbol) :variable))))))
 
 ;;; Retrieve the function/macro binding of the symbol NAME in
@@ -544,10 +542,8 @@
 
 ;;; Return true if EXP is a lambda form.
 (defun lambdap (exp)
-  (case (car exp) ((lambda
-                    sb!int:named-lambda
-                    sb!kernel:instance-lambda)
-                   t)))
+  (case (car exp)
+    ((lambda sb!int:named-lambda) t)))
 
 ;;; Split off the declarations (and the docstring, if
 ;;; DOC-STRING-ALLOWED is true) from the actual forms of BODY.
@@ -577,7 +573,7 @@
 ;;; in the environment ENV.
 (defun eval-lambda (exp env)
   (case (car exp)
-    ((lambda sb!kernel:instance-lambda)
+    ((lambda)
      (multiple-value-bind (body documentation declarations)
          (parse-lambda-headers (cddr exp) :doc-string-allowed t)
        (make-interpreted-function :lambda-list (second exp)

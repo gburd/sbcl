@@ -30,6 +30,7 @@
                   *allow-with-interrupts*
                   *interrupts-enabled*
                   *interrupt-pending*
+                  #!+sb-thruption *thruption-pending*
                   *type-system-initialized*))
 
 (defvar *cold-init-complete-p*)
@@ -56,16 +57,17 @@
 
 (defvar *sysinit-pathname-function* #'sysinit-pathname
   #!+sb-doc
-  "Designator for a function of zero arguments called to obtain a pathname
-designator for the default sysinit file, or NIL. If the function returns NIL,
-no sysinit file is used unless one has been specified on the command-line.")
+  "Designator for a function of zero arguments called to obtain a
+pathname designator for the default sysinit file, or NIL. If the
+function returns NIL, no sysinit file is used unless one has been
+specified on the command-line.")
 
 (defvar *userinit-pathname-function* #'userinit-pathname
   #!+sb-doc
-  "Designator for a function of zero arguments called to obtain a pathname
-designator or a stream for the default userinit file, or NIL. If the function
-returns NIL, no userinit file is used unless one has been specified on the
-command-line.")
+  "Designator for a function of zero arguments called to obtain a
+pathname designator or a stream for the default userinit file, or NIL.
+If the function returns NIL, no userinit file is used unless one has
+been specified on the command-line.")
 
 
 ;;;; miscellaneous utilities for working with with TOPLEVEL
@@ -74,17 +76,50 @@ command-line.")
 ;;; by QUIT) is caught and any final processing and return codes are
 ;;; handled appropriately.
 (defmacro handling-end-of-the-world (&body body)
-  (with-unique-names (caught)
-    `(let ((,caught (catch '%end-of-the-world
-                      (/show0 "inside CATCH '%END-OF-THE-WORLD")
-                      (unwind-protect
-                           (progn ,@body)
-                        (call-hooks "exit" *exit-hooks*)))))
-      (/show0 "back from CATCH '%END-OF-THE-WORLD, flushing output")
-      (flush-standard-output-streams)
-      (sb!thread::terminate-session)
-      (/show0 "calling UNIX-EXIT")
-      (sb!unix:unix-exit ,caught))))
+  `(without-interrupts
+     (catch '%end-of-the-world
+       (unwind-protect
+            (with-local-interrupts
+              (unwind-protect
+                   (progn ,@body)
+                (call-exit-hooks)))
+         (%exit)))))
+
+(defvar *exit-lock*)
+(defvar *exit-in-process* nil)
+(declaim (type (or null real) *exit-timeout*))
+(defvar *exit-timeout* 60
+  "Default amount of seconds, if any, EXIT should wait for other
+threads to finish after terminating them. Default value is 60. NIL
+means to wait indefinitely.")
+
+(defun os-exit-handler (condition)
+  (declare (ignore condition))
+  (os-exit *exit-in-process* :abort t))
+
+(defvar *exit-error-handler* #'os-exit-handler)
+
+(defun call-exit-hooks ()
+  (unless *exit-in-process*
+    (setf *exit-in-process* 0))
+  (handler-bind ((serious-condition *exit-error-handler*))
+    (call-hooks "exit" *exit-hooks* :on-error :warn)))
+
+(defun %exit ()
+  ;; If anything goes wrong, we will exit immediately and forcibly.
+  (handler-bind ((serious-condition *exit-error-handler*))
+    (let ((ok nil)
+          (code *exit-in-process*))
+      (if (consp code)
+          ;; Another thread called EXIT, and passed the buck to us -- only
+          ;; final call left to do.
+          (os-exit (car code) :abort nil)
+          (unwind-protect
+               (progn
+                 (flush-standard-output-streams)
+                 (sb!thread::%exit-other-threads)
+                 (setf ok t))
+            (os-exit code :abort (not ok)))))))
 
 ;;;; working with *CURRENT-ERROR-DEPTH* and *MAXIMUM-ERROR-DEPTH*
 
@@ -96,7 +131,7 @@ command-line.")
      (let ((*current-error-depth* (1+ *current-error-depth*)))
        (/show0 "in INFINITE-ERROR-PROTECT, incremented error depth")
        ;; arbitrary truncation
-       #!+sb-show (sb!debug:backtrace 8)
+       #!+sb-show (sb!debug:print-backtrace :count 8)
        ,@forms)))
 
 ;;; a helper function for INFINITE-ERROR-PROTECT
@@ -163,11 +198,12 @@ any non-negative real number."
   (when (or (not (realp seconds))
             (minusp seconds))
     (error 'simple-type-error
-           :format-control "invalid argument to SLEEP: ~S"
+           :format-control "Invalid argument to SLEEP: ~S, ~
+                            should be a non-negative real."
            :format-arguments (list seconds)
            :datum seconds
            :expected-type '(real 0)))
-  #!-win32
+  #!-(and win32 (not sb-thread))
   (multiple-value-bind (sec nsec)
       (if (integerp seconds)
           (values seconds 0)
@@ -181,7 +217,7 @@ any non-negative real number."
           do (decf sec (expt 10 8))
              (sb!unix:nanosleep (expt 10 8) 0))
     (sb!unix:nanosleep sec nsec))
-  #!+win32
+  #!+(and win32 (not sb-thread))
   (sb!win32:millisleep (truncate (* seconds 1000)))
   nil)
 
@@ -228,15 +264,40 @@ any non-negative real number."
 ;;; Flush anything waiting on one of the ANSI Common Lisp standard
 ;;; output streams before proceeding.
 (defun flush-standard-output-streams ()
-  (dolist (name '(*debug-io*
-                  *error-output*
-                  *query-io*
-                  *standard-output*
-                  *trace-output*
-                  *terminal-io*))
-    ;; FINISH-OUTPUT may block more easily than FORCE-OUTPUT
-    (force-output (symbol-value name)))
+  (let ((null (make-broadcast-stream)))
+    (dolist (name '(*debug-io*
+                    *error-output*
+                    *query-io*
+                    *standard-output*
+                    *trace-output*
+                    *terminal-io*))
+      ;; 0. Pull out the underlying stream, so we know what it is.
+      ;; 1. Handle errors on it. We're doing this on entry to
+      ;;    debugger, so we don't want recursive errors here.
+      ;; 2. Rebind the stream symbol in case some poor sod sees
+      ;;    a broken stream here while running with *BREAK-ON-ERRORS*.
+      (let ((stream (stream-output-stream (symbol-value name))))
+        (progv (list name) (list null)
+          (handler-bind ((stream-error
+                           (lambda (c)
+                             (when (eq stream (stream-error-stream c))
+                               (go :next)))))
+            (force-output stream))))
+      :next))
   (values))
+
+(defun stream-output-stream (stream)
+  (typecase stream
+    (fd-stream
+     stream)
+    (synonym-stream
+     (stream-output-stream
+      (symbol-value (synonym-stream-symbol stream))))
+    (two-way-stream
+     (stream-output-stream
+      (two-way-stream-output-stream stream)))
+    (t
+     stream)))
 
 (defun process-init-file (specified-pathname kind)
   (multiple-value-bind (context default-function)
@@ -245,30 +306,19 @@ any non-negative real number."
          (values "sysinit" *sysinit-pathname-function*))
         (:user
          (values "userinit" *userinit-pathname-function*)))
-    (flet ((process-stream (stream pathname)
-             (with-simple-restart (abort "Skip rest of ~A file ~S."
-                                         context (native-namestring pathname))
-               (loop
-                 (with-simple-restart
-                     (continue "Ignore error and continue processing ~A file ~S."
-                               context (native-namestring pathname))
-                   (let ((form (read stream nil stream)))
-                     (if (eq stream form)
-                         (return-from process-init-file nil)
-                         (eval form))))))))
-      (if specified-pathname
-          (with-open-file (stream (parse-native-namestring specified-pathname)
-                                  :if-does-not-exist nil)
-            (if stream
-                (process-stream stream (pathname stream))
-                (cerror "Ignore missing init file"
-                        "The specified ~A file ~A was not found."
-                        context specified-pathname)))
-          (let ((default (funcall default-function)))
-            (when default
-              (with-open-file (stream (pathname default) :if-does-not-exist nil)
-                (when stream
-                  (process-stream stream (pathname stream))))))))))
+    (if specified-pathname
+        (with-open-file (stream (parse-native-namestring specified-pathname)
+                                :if-does-not-exist nil)
+          (if stream
+              (load-as-source stream :context context)
+              (cerror "Ignore missing init file"
+                      "The specified ~A file ~A was not found."
+                      context specified-pathname)))
+        (let ((default (funcall default-function)))
+          (when default
+            (with-open-file (stream (pathname default) :if-does-not-exist nil)
+              (when stream
+                (load-as-source stream :context context))))))))
 
 (defun process-eval/load-options (options)
   (/show0 "handling --eval and --load options")
@@ -286,21 +336,41 @@ any non-negative real number."
                (:load
                 (with-simple-restart (continue "Ignore runtime option --load ~S."
                                                value)
-                  (load (native-pathname value))))))
+                  (load (native-pathname value))))
+               (:quit
+                (exit))))
            (flush-standard-output-streams)))
     (with-simple-restart (abort "Skip rest of --eval and --load options.")
       (dolist (option options)
         (process-1 option)))))
 
 (defun process-script (script)
-  (let ((pathname (native-pathname script)))
+  (flet ((load-script (stream)
+           ;; Scripts don't need to be stylish or fast, but silence is usually a
+           ;; desirable quality...
+           (handler-bind (((or style-warning compiler-note) #'muffle-warning)
+                          (stream-error (lambda (e)
+                                          ;; Shell-style.
+                                          (when (member (stream-error-stream e)
+                                                        (list *stdout* *stdin* *stderr*))
+                                            (exit)))))
+             ;; Let's not use the *TTY* for scripts, ok? Also, normally we use
+             ;; synonym streams, but in order to have the broken pipe/eof error
+             ;; handling right we want to bind them for scripts.
+             (let ((*terminal-io* (make-two-way-stream *stdin* *stdout*))
+                   (*debug-io* (make-two-way-stream *stdin* *stderr*))
+                   (*standard-input* *stdin*)
+                   (*standard-output* *stdout*)
+                   (*error-output* *stderr*))
+               (load stream :verbose nil :print nil)))))
     (handling-end-of-the-world
-      (with-open-file (f pathname :element-type :default)
-        (sb!fasl::maybe-skip-shebang-line f)
-        (load f :verbose nil :print nil)
-        (quit)))))
+      (if (eq t script)
+          (load-script *stdin*)
+          (with-open-file (f (native-pathname script) :element-type :default)
+            (sb!fasl::maybe-skip-shebang-line f)
+            (load-script f))))))
 
-;; Errors while processing the command line cause the system to QUIT,
+;; Errors while processing the command line cause the system to EXIT,
 ;; instead of trying to go into the Lisp debugger, because trying to
 ;; go into the Lisp debugger would get into various annoying issues of
 ;; where we should go after the user tries to return from the
@@ -310,7 +380,7 @@ any non-negative real number."
           "fatal error before reaching READ-EVAL-PRINT loop: ~%  ~?~%"
           control-string
           args)
-  (quit :unix-status 1))
+  (exit :code 1))
 
 ;;; the default system top level function
 (defun toplevel-init ()
@@ -336,6 +406,8 @@ any non-negative real number."
         (noprint nil)
         ;; Has a --script option been seen?
         (script nil)
+        ;; Quit after processing other options?
+        (finally-quit nil)
         ;; everything in *POSIX-ARGV* except for argv[0]=programname
         (options (rest *posix-argv*)))
 
@@ -362,7 +434,7 @@ any non-negative real number."
                     (setf disable-debugger t
                           no-userinit t
                           no-sysinit t
-                          script (pop-option))
+                          script (if options (pop-option) t))
                     (return))
                    ((string= option "--sysinit")
                     (pop-option)
@@ -391,6 +463,16 @@ any non-negative real number."
                     (setf noprint t))
                    ((string= option "--disable-debugger")
                     (pop-option)
+                    (setf disable-debugger t))
+                   ((string= option "--quit")
+                    (pop-option)
+                    (setf finally-quit t))
+                   ((string= option "--non-interactive")
+                    ;; This option is short for --quit and --disable-debugger,
+                    ;; which are needed in combination for reliable non-
+                    ;; interactive startup.
+                    (pop-option)
+                    (setf finally-quit t)
                     (setf disable-debugger t))
                    ((string= option "--end-toplevel-options")
                     (pop-option)
@@ -444,6 +526,8 @@ any non-negative real number."
               (process-init-file sysinit :system))
             (unless no-userinit
               (process-init-file userinit :user))
+            (when finally-quit
+              (push (list :quit) reversed-options))
             (process-eval/load-options (nreverse reversed-options))
             (when script
               (process-script script)
@@ -458,11 +542,11 @@ any non-negative real number."
                      s))
           (/show0 "CONTINUEing from pre-REPL RESTART-CASE")
           (values))                     ; (no-op, just fall through)
-        (quit ()
-          :report "Quit SBCL (calling #'QUIT, killing the process)."
+        (exit ()
+          :report "Exit SBCL (calling #'EXIT, killing the process)."
           :test (lambda (c) (declare (ignore c)) (not script))
-          (/show0 "falling through to QUIT from pre-REPL RESTART-CASE")
-          (quit :unix-status 1))))
+          (/show0 "falling through to EXIT from pre-REPL RESTART-CASE")
+          (exit :code 1))))
 
     ;; one more time for good measure, in case we fell out of the
     ;; RESTART-CASE above before one of the flushes in the ordinary
@@ -539,7 +623,7 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
   (let* ((eof-marker (cons nil nil))
          (form (read in nil eof-marker)))
     (if (eq form eof-marker)
-        (quit)
+        (exit)
         form)))
 
 (defun repl-fun (noprint)

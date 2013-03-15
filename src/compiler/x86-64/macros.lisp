@@ -41,11 +41,8 @@
   (once-only ((value value))
     `(cond ((and (integerp ,value)
                  (not (typep ,value '(signed-byte 32))))
-            (multiple-value-bind (lo hi) (dwords-for-quad ,value)
-              (inst mov (make-ea-for-object-slot-half
-                         ,ptr ,slot ,lowtag) lo)
-              (inst mov (make-ea-for-object-slot-half
-                         ,ptr (+ ,slot 1/2) ,lowtag) hi)))
+            (inst mov temp-reg-tn ,value)
+            (inst mov (make-ea-for-object-slot ,ptr ,slot ,lowtag) temp-reg-tn))
            (t
             (inst mov (make-ea-for-object-slot ,ptr ,slot ,lowtag) ,value)))))
 
@@ -102,14 +99,14 @@
 (defmacro load-binding-stack-pointer (reg)
   #!+sb-thread
   `(inst mov ,reg (make-ea :qword :base thread-base-tn
-                   :disp (* 8 thread-binding-stack-pointer-slot)))
+                   :disp (* n-word-bytes thread-binding-stack-pointer-slot)))
   #!-sb-thread
   `(load-symbol-value ,reg *binding-stack-pointer*))
 
 (defmacro store-binding-stack-pointer (reg)
   #!+sb-thread
   `(inst mov (make-ea :qword :base thread-base-tn
-              :disp (* 8 thread-binding-stack-pointer-slot))
+              :disp (* n-word-bytes thread-binding-stack-pointer-slot))
     ,reg)
   #!-sb-thread
   `(store-symbol-value ,reg *binding-stack-pointer*))
@@ -123,10 +120,10 @@
               (n-offset offset))
     (ecase *backend-byte-order*
       (:little-endian
-       `(inst mov ,n-target
+       `(inst movzx ,n-target
               (make-ea :byte :base ,n-source :disp ,n-offset)))
       (:big-endian
-       `(inst mov ,n-target
+       `(inst movzx ,n-target
               (make-ea :byte :base ,n-source
                              :disp (+ ,n-offset (1- n-word-bytes))))))))
 
@@ -236,7 +233,7 @@
 ;;;; error code
 (defun emit-error-break (vop kind code values)
   (assemble ()
-    #!-darwin
+    #!-ud2-breakpoints
     (inst int 3)                  ; i386 breakpoint instruction
     ;; On Darwin, we need to use #x0b0f instead of int3 in order
     ;; to generate a SIGILL instead of a SIGTRAP as darwin/x86
@@ -244,7 +241,7 @@
     ;; handlers. Hopefully this will be fixed by Apple at a
     ;; later date. Do the same on x86-64 as we do on x86 until this gets
     ;; sorted out.
-    #!+darwin
+    #!+ud2-breakpoints
     (inst word #x0b0f)
     ;; The return PC points here; note the location for the debugger.
     (when vop
@@ -292,24 +289,45 @@
        (progn ,@body)
        (pseudo-atomic ,@body)))
 
+;;; Unsafely clear pa flags so that the image can properly lose in a
+;;; pa section.
+#!+sb-thread
+(defmacro %clear-pseudo-atomic ()
+  '(inst mov (make-ea :qword :base thread-base-tn
+              :disp (* n-word-bytes thread-pseudo-atomic-bits-slot))
+    0))
+
+#!+sb-safepoint
+(defun emit-safepoint ()
+  (inst test al-tn (make-ea :byte :disp sb!vm::gc-safepoint-page-addr)))
+
 #!+sb-thread
 (defmacro pseudo-atomic (&rest forms)
+  #!+sb-safepoint-strictly
+  `(progn ,@forms (emit-safepoint))
+  #!-sb-safepoint-strictly
   (with-unique-names (label)
     `(let ((,label (gen-label)))
        (inst mov (make-ea :qword
                           :base thread-base-tn
-                          :disp (* 8 thread-pseudo-atomic-bits-slot))
+                          :disp (* n-word-bytes thread-pseudo-atomic-bits-slot))
              rbp-tn)
        ,@forms
        (inst xor (make-ea :qword
                           :base thread-base-tn
-                          :disp (* 8 thread-pseudo-atomic-bits-slot))
+                          :disp (* n-word-bytes thread-pseudo-atomic-bits-slot))
              rbp-tn)
        (inst jmp :z ,label)
        ;; if PAI was set, interrupts were disabled at the same time
        ;; using the process signal mask.
        (inst break pending-interrupt-trap)
-       (emit-label ,label))))
+       (emit-label ,label)
+       #!+sb-safepoint
+       ;; In this case, when allocation thinks a GC should be done, it
+       ;; does not mark PA as interrupted, but schedules a safepoint
+       ;; trap instead.  Let's take the opportunity to trigger that
+       ;; safepoint right now.
+       (emit-safepoint))))
 
 
 #!-sb-thread
@@ -357,6 +375,7 @@
        (:generator 5
          (move rax old-value)
          (inst cmpxchg (make-ea :qword :base object :index index
+                                :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                                 :disp (- (* ,offset n-word-bytes) ,lowtag))
                new-value :lock)
          (move value rax)))))
@@ -374,6 +393,7 @@
        (:result-types ,el-type)
        (:generator 3                    ; pw was 5
          (inst mov value (make-ea :qword :base object :index index
+                                  :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                                   :disp (- (* ,offset n-word-bytes)
                                            ,lowtag)))))
      (define-vop (,(symbolicate name "-C"))
@@ -408,6 +428,7 @@
        (:result-types ,el-type)
        (:generator 3                    ; pw was 5
          (inst mov value (make-ea :qword :base object :index index
+                                  :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                                   :disp (- (* (+ ,offset offset) n-word-bytes)
                                            ,lowtag)))))
      (define-vop (,(symbolicate name "-C"))
@@ -442,6 +463,7 @@
        (:result-types ,el-type)
        (:generator 4                    ; was 5
          (inst mov (make-ea :qword :base object :index index
+                            :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                             :disp (- (* ,offset n-word-bytes) ,lowtag))
                value)
          (move result value)))
@@ -484,6 +506,7 @@
        (:result-types ,el-type)
        (:generator 4                    ; was 5
          (inst mov (make-ea :qword :base object :index index
+                            :scale (ash 1 (- word-shift n-fixnum-tag-bits))
                             :disp (- (* (+ ,offset offset) n-word-bytes) ,lowtag))
                value)
          (move result value)))
@@ -519,7 +542,7 @@ Useful for e.g. foreign calls where another thread may trigger
 collection."
   (if objects
       (let ((pins (make-gensym-list (length objects)))
-            (wpo (block-gensym "WPO")))
+            (wpo (sb!xc:gensym "WITH-PINNED-OBJECTS-THUNK")))
         ;; BODY is stuffed in a function to preserve the lexical
         ;; environment.
         `(flet ((,wpo () (progn ,@body)))

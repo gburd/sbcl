@@ -34,4 +34,16 @@ typedef ucontext_t os_context_t;
 
 #define SIG_STOP_FOR_GC (SIGUSR2)
 
+#ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
+extern mach_port_t current_mach_task;
+#endif
+
+void darwin_init(void);
+
+#ifdef LISP_FEATURE_SB_THREAD
+#define CANNOT_USE_POSIX_SEM_T
+#include <mach/semaphore.h>
+typedef semaphore_t os_sem_t;
+#endif
+
 #endif /* _DARWIN_OS_H */

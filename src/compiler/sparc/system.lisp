@@ -42,7 +42,7 @@
     (inst b :eq done)
     ;; Okay, it is an immediate.  If fixnum, we want zero.  Otherwise,
     ;; we want the low 8 bits.
-    (inst andcc zero-tn object #b11)
+    (inst andcc zero-tn object fixnum-tag-mask)
     (inst b :eq done)
     (inst li result 0)
     ;; It wasn't a fixnum, so get the low 8 bits.
@@ -117,7 +117,7 @@
     (inst and t1 widetag-mask)
     (sc-case data
       (any-reg
-       (inst sll t2 data (- n-widetag-bits 2))
+       (inst sll t2 data (- n-widetag-bits n-fixnum-tag-bits))
        (inst or t1 t2))
       (immediate
        (inst or t1 (ash (tn-value data) n-widetag-bits)))
@@ -136,22 +136,6 @@
     ;; and shift the result into a positive fixnum like on x86.
     (inst sll res ptr 3)
     (inst srl res res 1)))
-
-(define-vop (make-other-immediate-type)
-  (:args (val :scs (any-reg descriptor-reg))
-         (type :scs (any-reg descriptor-reg immediate)
-               :target temp))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:generator 2
-    (sc-case type
-      (immediate
-       (inst sll temp val n-widetag-bits)
-       (inst or res temp (tn-value type)))
-      (t
-       (inst sra temp type 2)
-       (inst sll res val (- n-widetag-bits 2))
-       (inst or res res temp)))))
 
 
 ;;;; allocation
@@ -246,3 +230,9 @@
       (inst ld count count-vector offset)
       (inst add count 1)
       (inst st count count-vector offset))))
+
+;;;; Dummy definition for a spin-loop hint VOP
+(define-vop (spin-loop-hint)
+  (:translate spin-loop-hint)
+  (:policy :fast-safe)
+  (:generator 0))

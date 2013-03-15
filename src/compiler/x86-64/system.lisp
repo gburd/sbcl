@@ -28,49 +28,48 @@
   (:translate widetag-of)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :offset eax-offset :to (:result 0)) rax)
+  (:temporary (:sc unsigned-reg :offset rax-offset :target result
+                   :to (:result 0)) rax)
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (inst mov rax object)
+    (inst movzx rax (reg-in-size object :byte))
     (inst and al-tn lowtag-mask)
     (inst cmp al-tn other-pointer-lowtag)
     (inst jmp :e OTHER-PTR)
     (inst cmp al-tn fun-pointer-lowtag)
     (inst jmp :e FUNCTION-PTR)
 
-    ;; Pick off structures and list pointers.
-    (inst test al-tn 1)
-    (inst jmp :ne DONE)
-
     ;; Pick off fixnums.
-    (inst and al-tn 7)
+    (inst test al-tn fixnum-tag-mask)
     (inst jmp :e DONE)
 
+    ;; Pick off structures and list pointers.
+    (inst test al-tn 2)
+    (inst jmp :ne DONE)
+
     ;; must be an other immediate
-    (inst mov rax object)
+    (inst movzx rax (reg-in-size object :byte))
     (inst jmp DONE)
 
     FUNCTION-PTR
-    (load-type al-tn object (- fun-pointer-lowtag))
+    (load-type rax object (- fun-pointer-lowtag))
     (inst jmp DONE)
 
     OTHER-PTR
-    (load-type al-tn object (- other-pointer-lowtag))
+    (load-type rax object (- other-pointer-lowtag))
 
     DONE
-    (inst movzx result al-tn)))
+    (move result rax)))
 
 (define-vop (fun-subtype)
   (:translate fun-subtype)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
-  (:temporary (:sc byte-reg :from (:eval 0) :to (:eval 1)) temp)
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (load-type temp function (- fun-pointer-lowtag))
-    (inst movzx result temp)))
+    (load-type result function (- fun-pointer-lowtag))))
 
 (define-vop (set-fun-subtype)
   (:translate (setf fun-subtype))
@@ -137,17 +136,6 @@
     ;; fixnum.
     (inst and res (lognot lowtag-mask))
     (inst shr res 1)))
-
-(define-vop (make-other-immediate-type)
-  (:args (val :scs (any-reg descriptor-reg) :target res)
-         (type :scs (unsigned-reg immediate)))
-  (:results (res :scs (any-reg descriptor-reg) :from (:argument 0)))
-  (:generator 2
-    (move res val)
-    (inst shl res (- n-widetag-bits n-fixnum-tag-bits))
-    (inst or res (sc-case type
-                   (unsigned-reg type)
-                   (immediate (tn-value type))))))
 
 ;;;; allocation
 
@@ -260,6 +248,13 @@
   (:generator 1
     (inst break pending-interrupt-trap)))
 
+#!+sb-safepoint
+(define-vop (insert-safepoint)
+  (:policy :fast-safe)
+  (:translate sb!kernel::gc-safepoint)
+  (:generator 0
+    (emit-safepoint)))
+
 #!+sb-thread
 (defknown current-thread-offset-sap ((unsigned-byte 64))
   system-area-pointer (flushable))
@@ -361,3 +356,42 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
     (inst inc (make-ea :qword :base count-vector
                        :disp (- (* (+ vector-data-offset index) n-word-bytes)
                                 other-pointer-lowtag)))))
+
+;;;; Memory barrier support
+
+#!+memory-barrier-vops
+(define-vop (%compiler-barrier)
+  (:policy :fast-safe)
+  (:translate %compiler-barrier)
+  (:generator 3))
+
+#!+memory-barrier-vops
+(define-vop (%memory-barrier)
+  (:policy :fast-safe)
+  (:translate %memory-barrier)
+  (:generator 3
+    (inst mfence)))
+
+#!+memory-barrier-vops
+(define-vop (%read-barrier)
+  (:policy :fast-safe)
+  (:translate %read-barrier)
+  (:generator 3))
+
+#!+memory-barrier-vops
+(define-vop (%write-barrier)
+  (:policy :fast-safe)
+  (:translate %write-barrier)
+  (:generator 3))
+
+#!+memory-barrier-vops
+(define-vop (%data-dependency-barrier)
+  (:policy :fast-safe)
+  (:translate %data-dependency-barrier)
+  (:generator 3))
+
+(define-vop (pause)
+  (:translate spin-loop-hint)
+  (:policy :fast-safe)
+  (:generator 0
+    (inst pause)))

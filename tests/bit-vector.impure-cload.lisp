@@ -78,17 +78,32 @@
 
 (test-small-bit-vectors)
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defun dynamic-space-size ()
-    #+gencgc
-    (- sb-vm:dynamic-space-end sb-vm:dynamic-space-start)
-    #-gencgc
-    (- sb-vm:dynamic-0-space-end sb-vm:dynamic-0-space-start)))
-
 ;; except on machines where the arrays won't fit into the dynamic space.
-#+#.(cl:if (cl:> (cl-user::dynamic-space-size)
+#+#.(cl:if (cl:> (sb-ext:dynamic-space-size)
                  (cl:truncate (cl:1- cl:array-dimension-limit)
                               sb-vm:n-word-bits))
            '(and)
            '(or))
 (test-big-bit-vectors)
+
+(with-test (:name :find-non-bit-from-bit-vector)
+  (assert (not (find #\a #*0101)))
+  (assert (not (position #\a #*0101)))
+  (let ((f1 (compile nil
+                     `(lambda (b)
+                        (find b #*0101))))
+        (f2 (compile nil
+                     `(lambda (b)
+                        (position b #*0101)))))
+    (assert (not (funcall f1 t)))
+    (assert (not (funcall f2 t))))
+  (let ((f1 (compile nil
+                     `(lambda (b)
+                        (declare (bit-vector b))
+                        (find t b))))
+        (f2 (compile nil
+                     `(lambda (b)
+                        (declare (bit-vector b))
+                        (position t b)))))
+    (assert (not (funcall f1 #*010101)))
+    (assert (not (funcall f2 #*101010)))))

@@ -23,29 +23,37 @@
 
 (defvar *test-path* "external-format-test.tmp")
 
-(do-external-formats (xf)
-  (with-open-file (s #-win32 "/dev/null" #+win32 "nul" :direction :input :external-format xf)
-    (assert (eq (read-char s nil s) s))))
+(with-test (:name :end-of-file)
+  (do-external-formats (xf)
+    (with-open-file (s #-win32 "/dev/null" #+win32 "nul" :direction :input :external-format xf)
+      (assert (eq (read-char s nil s) s)))))
 
 ;;; Test standard character read-write equivalency over all external formats.
-(let ((standard-characters "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!$\"'(),_-./:;?+<=>#%&*@[\\]{|}`^~"))
-  (do-external-formats (xf)
-    (with-open-file (s *test-path* :direction :output
-                     :if-exists :supersede :external-format xf)
-      (loop for character across standard-characters
-            do (write-char character s)))
-    (with-open-file (s *test-path* :direction :input
-                     :external-format xf)
-      (loop for character across standard-characters
-            do (let ((got (read-char s)))
-                 (unless (eql character got)
-                   (error "wanted ~S, got ~S" character got)))))))
+(macrolet
+    ((frob ()
+       (let ((tests nil))
+         (do-external-formats (xf)
+           (pushnew `(with-test (:name (:standard-character :read-write-equivalency ,xf))
+                       (let ((standard-characters "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!$\"'(),_-./:;?+<=>#%&*@[\\]{|}`^~"))
+                         (with-open-file (s *test-path* :direction :output
+                                            :if-exists :supersede :external-format ,xf)
+                           (loop for character across standard-characters
+                                 do (write-char character s)))
+                         (with-open-file (s *test-path* :direction :input
+                                            :external-format ,xf)
+                           (loop for character across standard-characters
+                                 do (let ((got (read-char s)))
+                                      (unless (eql character got)
+                                        (error "wanted ~S, got ~S" character got)))))))
+                    tests :key #'cadr :test #'equal))
+         `(progn ,@tests))))
+  (frob))
 
 (delete-file *test-path*)
 #-sb-unicode
 (progn
   (test-util:report-test-status)
-  (sb-ext:quit :unix-status 104))
+  (sb-ext:exit :code 104))
 
 ;;; Test UTF-8 writing and reading of 1, 2, 3 and 4 octet characters with
 ;;; all possible offsets. Tests for buffer edge bugs. fd-stream buffers are
@@ -315,22 +323,27 @@
 ;;; External format support in SB-ALIEN
 
 (with-test (:name (:sb-alien :vanilla))
-  (define-alien-routine strdup c-string (str c-string))
+  (define-alien-routine (#-win32 "strdup" #+win32 "_strdup" strdup)
+      c-string
+    (str c-string))
   (assert (equal "foo" (strdup "foo"))))
 
 (with-test (:name (:sb-alien :utf-8 :utf-8))
-  (define-alien-routine strdup (c-string :external-format :utf-8)
+  (define-alien-routine (#-win32 "strdup" #+win32 "_strdup" strdup)
+      (c-string :external-format :utf-8)
     (str (c-string :external-format :utf-8)))
   (assert (equal "foo" (strdup "foo"))))
 
 (with-test (:name (:sb-alien :latin-1 :utf-8))
-  (define-alien-routine strdup (c-string :external-format :latin-1)
+  (define-alien-routine (#-win32 "strdup" #+win32 "_strdup" strdup)
+      (c-string :external-format :latin-1)
     (str (c-string :external-format :utf-8)))
   (assert (= (length (strdup (string (code-char 246))))
              2)))
 
 (with-test (:name (:sb-alien :utf-8 :latin-1))
-  (define-alien-routine strdup (c-string :external-format :utf-8)
+  (define-alien-routine (#-win32 "strdup" #+win32 "_strdup" strdup)
+      (c-string :external-format :utf-8)
     (str (c-string :external-format :latin-1)))
   (assert (equal (string (code-char 228))
                  (strdup (concatenate 'string
@@ -338,18 +351,21 @@
                                       (list (code-char 164)))))))
 
 (with-test (:name (:sb-alien :ebcdic :ebcdic))
-  (define-alien-routine strdup (c-string :external-format :ebcdic-us)
+  (define-alien-routine (#-win32 "strdup" #+win32 "_strdup" strdup)
+      (c-string :external-format :ebcdic-us)
     (str (c-string :external-format :ebcdic-us)))
   (assert (equal "foo" (strdup "foo"))))
 
 (with-test (:name (:sb-alien :latin-1 :ebcdic))
-  (define-alien-routine strdup (c-string :external-format :latin-1)
+  (define-alien-routine (#-win32 "strdup" #+win32 "_strdup" strdup)
+      (c-string :external-format :latin-1)
     (str (c-string :external-format :ebcdic-us)))
   (assert (not (equal "foo" (strdup "foo")))))
 
 (with-test (:name (:sb-alien :simple-base-string))
-  (define-alien-routine strdup (c-string :external-format :ebcdic-us
-                                         :element-type base-char)
+  (define-alien-routine (#-win32 "strdup" #+win32 "_strdup" strdup)
+      (c-string :external-format :ebcdic-us
+                :element-type base-char)
     (str (c-string :external-format :ebcdic-us)))
   (assert (typep (strdup "foo") 'simple-base-string)))
 
@@ -906,5 +922,124 @@
         (assert (char= (char new 0) #\replacement_character))
         (assert (char= (char new (1- size)) #\replacement_character))
         (assert (string= string new :start1 1 :start2 1 :end1 (1- size) :end2 (1- size)))))))
+
+(with-test (:name (:multibyte :input-replacement :ucs4le))
+  (let ((octets (coerce '(0 1 1 0 1 0 0 1) '(vector (unsigned-byte 8)))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
+      (write-sequence octets s))
+    (with-open-file (s *test-path* :external-format '(:ucs4le :replacement #\replacement_character))
+      (let ((string (read-line s)))
+        (assert (char= (char string 0) (code-char #x10100)))
+        (assert (char= (char string 1) #\replacement_character))))))
+
+(with-test (:name (:multibyte :input-replacement :ucs4le))
+  (let ((octets (coerce '(0 1 1 0 1 0 0 1) '(vector (unsigned-byte 8)))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
+      (write-sequence octets s))
+    (with-open-file (s *test-path* :external-format '(:ucs4be :replacement #\replacement_character))
+      (let ((string (read-line s)))
+        (assert (char= (char string 0) (code-char #x10100)))
+        (assert (char= (char string 1) #\replacement_character))))))
+
+;;; utf tests
+(with-test (:name (:utf-16le :roundtrip))
+  (let ((string (map 'string 'code-char '(#x20 #x200 #x2000 #xfffd #x10fffd))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede
+                       :external-format :utf-16le)
+      (write-string string s))
+    (with-open-file (s *test-path* :external-format :utf-16le)
+      (assert (string= string (read-line s))))))
+(with-test (:name (:utf-16be :roundtrip))
+  (let ((string (map 'string 'code-char '(#x20 #x200 #x2000 #xfffd #x10fffd))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede
+                       :external-format :utf-16be)
+      (write-string string s))
+    (with-open-file (s *test-path* :external-format :utf-16be)
+      (assert (string= string (read-line s))))))
+(with-test (:name (:utf-16le :encoding-error))
+  (let ((string (map 'string 'code-char '(#x20 #xfffe #xdc00 #xd800 #x1fffe #x20))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede
+                       :external-format '(:utf-16le :replacement #\?))
+      (write-string string s))
+    (with-open-file (s *test-path* :external-format :utf-16le)
+      (assert (string= " ???? " (read-line s))))))
+(with-test (:name (:utf-16be :encoding-error))
+  (let ((string (map 'string 'code-char '(#x20 #xfffe #xdc00 #xd800 #x1fffe #x20))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede
+                       :external-format '(:utf-16be :replacement #\?))
+      (write-string string s))
+    (with-open-file (s *test-path* :external-format :utf-16be)
+      (assert (string= " ???? " (read-line s))))))
+
+(with-test (:name (:utf-32le :roundtrip))
+  (let ((string (map 'string 'code-char '(#x20 #x200 #x2000 #xfffd #x10fffd))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede
+                       :external-format :utf-32le)
+      (write-string string s))
+    (with-open-file (s *test-path* :external-format :utf-32le)
+      (assert (string= string (read-line s))))))
+(with-test (:name (:utf-32be :roundtrip))
+  (let ((string (map 'string 'code-char '(#x20 #x200 #x2000 #xfffd #x10fffd))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede
+                       :external-format :utf-32be)
+      (write-string string s))
+    (with-open-file (s *test-path* :external-format :utf-32be)
+      (assert (string= string (read-line s))))))
+(with-test (:name (:utf-32le :encoding-error))
+  (let ((string (map 'string 'code-char '(#x20 #xfffe #xdc00 #xd800 #x1fffe #x20))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede
+                       :external-format '(:utf-32le :replacement #\?))
+      (write-string string s))
+    (with-open-file (s *test-path* :external-format :utf-32le)
+      (assert (string= " ???? " (read-line s))))))
+(with-test (:name (:utf-32be :encoding-error))
+  (let ((string (map 'string 'code-char '(#x20 #xfffe #xdc00 #xd800 #x1fffe #x20))))
+    (with-open-file (s *test-path* :direction :output :if-exists :supersede
+                       :external-format '(:utf-32be :replacement #\?))
+      (write-string string s))
+    (with-open-file (s *test-path* :external-format :utf-32be)
+      (assert (string= " ???? " (read-line s))))))
+
+(with-test (:name :invalid-external-format :fails-on :win32)
+  (labels ((test-error (e)
+             (assert (typep e 'error))
+             (unless (equal "Undefined external-format: :BAD-FORMAT"
+                            (princ-to-string e))
+               (error "Bad error:~%  ~A" e)))
+           (test (direction)
+             (test-error
+              (handler-case
+                  (open "/dev/null" :direction direction :external-format :bad-format
+                        :if-exists :overwrite)
+                (error (e) e)))))
+    (test :input)
+    (test :output)
+    (test :io)
+    (test-error
+     (handler-case
+         (run-program "sh" '() :input :stream :external-format :bad-format)
+       (error (e) e)))
+    (test-error
+     (handler-case
+         (string-to-octets "foobar" :external-format :bad-format)
+       (error (e) e)))
+    (test-error
+     (let ((octets (string-to-octets "foobar" :external-format :latin1)))
+       (handler-case
+           (octets-to-string octets :external-format :bad-format)
+         (error (e) e))))))
+
+(with-test (:name :lp713063)
+  (with-open-file (f *test-path*
+                     :direction :output
+                     :external-format '(:euc-jp :replacement #\?)
+                     :if-exists :supersede)
+    (write-string (make-string 3 :initial-element #\horizontal_bar) f))
+  (assert (equal "???"
+                 (with-open-file (f *test-path*
+                                    :direction :input
+                                    :external-format :euc-jp)
+                   (read-line f))))
+  (delete-file *test-path*))
 
 ;;;; success

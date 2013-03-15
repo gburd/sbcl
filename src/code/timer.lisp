@@ -156,14 +156,15 @@ future versions."
 
 (defun make-timer (function &key name (thread sb!thread:*current-thread*))
   #!+sb-doc
-  "Create a timer object that's when scheduled runs FUNCTION. If
-THREAD is a thread then that thread is to be interrupted with
-FUNCTION. If THREAD is T then a new thread is created each timer
-FUNCTION is run. If THREAD is NIL then FUNCTION can be run in any
-thread. When THREAD is not T, INTERRUPT-THREAD is used to run FUNCTION
-and the ordering guarantees of INTERRUPT-THREAD also apply here.
-FUNCTION always runs with interrupts disabled but WITH-INTERRUPTS is
-allowed."
+  "Create a timer that runs FUNCTION when triggered.
+
+If a THREAD is supplied, FUNCTION is run in that thread. If THREAD is
+T, a new thread is created for FUNCTION each time the timer is
+triggered. If THREAD is NIL, FUNCTION is run in an unspecified thread.
+
+When THREAD is not T, INTERRUPT-THREAD is used to run FUNCTION and the
+ordering guarantees of INTERRUPT-THREAD apply. FUNCTION runs with
+interrupts disabled but WITH-INTERRUPTS is allowed."
   (%make-timer :name name :function function :thread thread))
 
 (defun timer-name (timer)
@@ -285,6 +286,8 @@ triggers."
     (setf (%timer-expire-time timer) nil
           (%timer-repeat-interval timer) nil)
     (let ((old-position (priority-queue-remove *schedule* timer)))
+      ;; Don't use cancel-function as the %timer-cancel-function
+      ;; may have changed before we got the scheduler lock.
       (when old-position
         (funcall (%timer-cancel-function timer)))
       (when (eql 0 old-position)
@@ -312,20 +315,87 @@ triggers."
             (incf (%timer-expire-time timer) (%timer-repeat-interval timer))
             (%schedule-timer timer))))))
 
+;;; setitimer is unavailable for win32, but we can emulate it when
+;;; threads are available -- using win32 waitable timers.
+;;;
+;;; Conversely, when we want to minimize signal use on POSIX, we emulate
+;;; win32 waitable timers using a timerfd-like portability layer in
+;;; the runtime.
+
+#!+sb-wtimer
+(define-alien-type wtimer
+    #!+win32 system-area-pointer ;HANDLE, but that's not defined yet
+    #!+sunos system-area-pointer ;struct os_wtimer *
+    #!+(or linux bsd) int)
+
+#!+sb-wtimer
+(progn
+  (define-alien-routine "os_create_wtimer" wtimer)
+  (define-alien-routine "os_wait_for_wtimer" int (wt wtimer))
+  (define-alien-routine "os_close_wtimer" void (wt wtimer))
+  (define-alien-routine "os_cancel_wtimer" void (wt wtimer))
+  (define-alien-routine "os_set_wtimer" void (wt wtimer) (sec int) (nsec int))
+
+  ;; scheduler lock already protects us
+
+  (defvar *waitable-timer-handle* nil)
+
+  (defvar *timer-thread* nil)
+
+  (defun get-waitable-timer ()
+    (assert (under-scheduler-lock-p))
+    (or *waitable-timer-handle*
+        (prog1
+            (setf *waitable-timer-handle* (os-create-wtimer))
+          (setf *timer-thread*
+                (sb!thread:make-thread
+                 (lambda ()
+                   (loop while
+                        (or (zerop
+                             (os-wait-for-wtimer *waitable-timer-handle*))
+                            *waitable-timer-handle*)
+                        doing (run-expired-timers)))
+                 :ephemeral t
+                 :name "System timer watchdog thread")))))
+
+  (defun itimer-emulation-deinit ()
+    (with-scheduler-lock ()
+      (when *timer-thread*
+        (sb!thread:terminate-thread *timer-thread*)
+        (sb!thread:join-thread *timer-thread* :default nil))
+      (when *waitable-timer-handle*
+        (os-close-wtimer *waitable-timer-handle*)
+        (setf *waitable-timer-handle* nil))))
+
+  (defun %clear-system-timer ()
+    (os-cancel-wtimer (get-waitable-timer)))
+
+  (defun %set-system-timer (sec nsec)
+    (os-set-wtimer (get-waitable-timer) sec nsec)))
+
 ;;; Expiring timers
 
-(defun real-time->sec-and-usec (time)
+(defun real-time->sec-and-nsec (time)
   ;; KLUDGE: Always leave 0.0001 second for other stuff in order to
   ;; avoid starvation.
-  (let ((min-usec 100))
+  (let ((min-nsec 100000))
     (if (minusp time)
-        (list 0 min-usec)
+        (values 0 min-nsec)
         (multiple-value-bind (s u) (floor time internal-time-units-per-second)
-          (setf u (floor (* (/ u internal-time-units-per-second) 1000000)))
-          (if (and (= 0 s) (< u min-usec))
+          (setf u (floor (* (/ u internal-time-units-per-second)
+                            #.(expt 10 9))))
+          (if (and (= 0 s) (< u min-nsec))
               ;; 0 0 means "shut down the timer" for setitimer
-              (list 0 min-usec)
-              (list s u))))))
+              (values 0 min-nsec)
+              (values s u))))))
+
+#!-(or sb-wtimer win32)
+(progn
+  (defun %set-system-timer (sec nsec)
+    (sb!unix:unix-setitimer :real 0 0 sec (ceiling nsec 1000)))
+
+  (defun %clear-system-timer ()
+    (sb!unix:unix-setitimer :real 0 0 0 0)))
 
 (defun set-system-timer ()
   (assert (under-scheduler-lock-p))
@@ -334,9 +404,9 @@ triggers."
     (if next-timer
         (let ((delta (- (%timer-expire-time next-timer)
                         (get-internal-real-time))))
-          (apply #'sb!unix:unix-setitimer
-                 :real 0 0 (real-time->sec-and-usec delta)))
-        (sb!unix:unix-setitimer :real 0 0 0 0))))
+          (multiple-value-call #'%set-system-timer
+            (real-time->sec-and-nsec delta)))
+        (%clear-system-timer))))
 
 (defun run-timer (timer)
   (let ((function (%timer-interrupt-function timer))
@@ -355,23 +425,26 @@ triggers."
               (warn "Timer ~S failed to interrupt thread ~S."
                     timer thread)))))))
 
-;;; Called from the signal handler.
+;;; Called from the signal handler. We loop until all the expired timers
+;;; have been run.
 (defun run-expired-timers ()
-  (let (timer)
-    (with-scheduler-lock ()
-      (setq timer (peek-schedule))
-      (when (or (null timer)
-                (< (get-internal-real-time)
-                   (%timer-expire-time timer)))
-        ;; Seemingly this is a spurious SIGALRM, but play it safe and
-        ;; reset the system timer because if the system clock was set
-        ;; back after the SIGALRM had been delivered then we won't get
-        ;; another chance.
-        (set-system-timer)
-        (return-from run-expired-timers nil))
-      (assert (eq timer (priority-queue-extract-maximum *schedule*)))
-      (set-system-timer))
-    (run-timer timer)))
+  (loop
+    (let ((now (get-internal-real-time))
+          (timers nil))
+      (flet ((run-timers ()
+               (dolist (timer (nreverse timers))
+                 (run-timer timer))))
+        (with-scheduler-lock ()
+          (loop for timer = (peek-schedule)
+                when (or (null timer) (< now (%timer-expire-time timer)))
+                ;; No more timers to run for now, reset the system timer.
+                do (run-timers)
+                   (set-system-timer)
+                   (return-from run-expired-timers nil)
+                else
+                do (assert (eq timer (priority-queue-extract-maximum *schedule*)))
+                   (push timer timers)))
+        (run-timers)))))
 
 (defun timeout-cerror ()
   (cerror "Continue" 'sb!ext::timeout))

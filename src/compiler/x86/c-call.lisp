@@ -262,15 +262,24 @@
                    :from :eval :to :result) ecx)
   (:temporary (:sc unsigned-reg :offset edx-offset
                    :from :eval :to :result) edx)
-  (:node-var node)
+  #!+sb-safepoint (:temporary (:sc unsigned-reg :offset esi-offset) esi)
+  #!+sb-safepoint (:temporary (:sc unsigned-reg :offset edi-offset) edi)
+  #!-sb-safepoint (:node-var node)
   (:vop-var vop)
   (:save-p t)
-  (:ignore args ecx edx)
+  (:ignore args ecx edx
+           #!+sb-safepoint esi
+           #!+sb-safepoint edi)
   (:generator 0
     ;; FIXME & OAOOM: This is brittle and error-prone to maintain two
     ;; instances of the same logic, on in arch-assem.S, and one in
     ;; c-call.lisp. If you modify this, modify that one too...
-    (cond ((policy node (> space speed))
+    (cond ((and
+            ;; On safepoints builds, we currently use the out-of-line
+            ;; calling routine irrespectively of SPACE and SPEED policy.
+            ;; An inline version of said changes is left to the
+            ;; sufficiently motivated maintainer.
+            #!-sb-safepoint (policy node (> space speed)))
            (move eax function)
            (inst call (make-fixup "call_into_c" :foreign)))
           (t
@@ -346,9 +355,10 @@
     (aver (not (location= result esp-tn)))
     (unless (zerop amount)
       (let ((delta (logandc2 (+ amount 3) 3)))
-        (inst mov temp
-              (make-ea-for-symbol-tls-index *alien-stack*))
-        (inst sub (make-ea :dword :base temp) delta :fs)))
+        (with-tls-ea (EA :base temp
+                         :disp-type :index
+                         :disp (make-ea-for-symbol-tls-index *alien-stack*))
+          (inst sub EA delta :maybe-fs))))
     (load-tl-symbol-value result *alien-stack*))
   #!-sb-thread
   (:generator 0
@@ -366,9 +376,10 @@
   (:generator 0
     (unless (zerop amount)
       (let ((delta (logandc2 (+ amount 3) 3)))
-        (inst mov temp
-              (make-ea-for-symbol-tls-index *alien-stack*))
-        (inst add (make-ea :dword :base temp) delta :fs))))
+        (with-tls-ea (EA :base temp
+                         :disp-type :index
+                         :disp (make-ea-for-symbol-tls-index *alien-stack*))
+          (inst add EA delta :maybe-fs)))))
   #!-sb-thread
   (:generator 0
     (unless (zerop amount)
@@ -392,7 +403,8 @@
   `(deref (sap-alien (sap+ ,sp ,offset) (* ,type))))
 
 #-sb-xc-host
-(defun alien-callback-assembler-wrapper (index return-type arg-types)
+(defun alien-callback-assembler-wrapper
+    (index return-type arg-types &optional (stack-offset 0))
   "Cons up a piece of code which calls call-callback with INDEX and a
 pointer to the arguments."
   (declare (ignore arg-types))
@@ -413,15 +425,23 @@ pointer to the arguments."
               (inst push eax)                       ; arg1
               (inst push (ash index 2))             ; arg0
 
-              ;; Indirect the access to ENTER-ALIEN-CALLBACK through
-              ;; the symbol-value slot of SB-ALIEN::*ENTER-ALIEN-CALLBACK*
-              ;; to ensure it'll work even if the GC moves ENTER-ALIEN-CALLBACK.
-              ;; Skip any SB-THREAD TLS magic, since we don't expecte anyone
-              ;; to rebind the variable. -- JES, 2006-01-01
-              (load-symbol-value eax sb!alien::*enter-alien-callback*)
-              (inst push eax) ; function
-              (inst mov  eax (foreign-symbol-address "funcall3"))
-              (inst call eax)
+              #!+sb-safepoint
+              (progn
+                (inst mov eax (foreign-symbol-address "callback_wrapper_trampoline"))
+                (inst call eax))
+
+              #!-sb-safepoint
+              (progn
+                ;; Indirect the access to ENTER-ALIEN-CALLBACK through
+                ;; the symbol-value slot of SB-ALIEN::*ENTER-ALIEN-CALLBACK*
+                ;; to ensure it'll work even if the GC moves ENTER-ALIEN-CALLBACK.
+                ;; Skip any SB-THREAD TLS magic, since we don't expecte anyone
+                ;; to rebind the variable. -- JES, 2006-01-01
+                (load-symbol-value eax sb!alien::*enter-alien-callback*)
+                (inst push eax)         ; function
+                (inst mov  eax (foreign-symbol-address "funcall3"))
+                (inst call eax))
+
               ;; now put the result into the right register
               (cond
                 ((and (alien-integer-type-p return-type)
@@ -442,7 +462,7 @@ pointer to the arguments."
                  (error "unrecognized alien type: ~A" return-type)))
               (inst mov esp ebp)                   ; discard frame
               (inst pop ebp)                       ; restore frame pointer
-              (inst ret))
+              (inst ret stack-offset))
     (finalize-segment segment)
     ;; Now that the segment is done, convert it to a static
     ;; vector we can point foreign code to.

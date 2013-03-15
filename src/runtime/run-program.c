@@ -25,10 +25,15 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-
+#include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <errno.h>
 
+#ifdef LISP_FEATURE_OPENBSD
+/* FIXME: there has to be a better way to avoid ./util.h here */
+#include </usr/include/util.h>
+#endif
 
 /* borrowed from detachtty's detachtty.c, in turn borrowed from APUE
  * example code found at
@@ -54,22 +59,103 @@ int set_noecho(int fd)
     return 1;
 }
 
+#if defined(LISP_FEATURE_OPENBSD)
+
+int
+set_pty(char *pty_name)
+{
+    int fd;
+
+    if ((fd = open(pty_name, O_RDWR, 0)) == -1 ||
+        login_tty(fd) == -1)
+        return (0);
+    return (set_noecho(STDIN_FILENO));
+}
+
+#else /* !LISP_FEATURE_OPENBSD */
+
+int
+set_pty(char *pty_name)
+{
+    int fd;
+
+#if !defined(LISP_FEATURE_HPUX) && !defined(SVR4)
+    fd = open("/dev/tty", O_RDWR, 0);
+    if (fd >= 0) {
+        ioctl(fd, TIOCNOTTY, 0);
+        close(fd);
+    }
+#endif
+    if ((fd = open(pty_name, O_RDWR, 0)) == -1)
+        return (-1);
+    dup2(fd, 0);
+    set_noecho(0);
+    dup2(fd, 1);
+    dup2(fd, 2);
+    close(fd);
+    return (0);
+}
+
+#endif /* !LISP_FEATURE_OPENBSD */
+
 extern char **environ;
 int spawn(char *program, char *argv[], int sin, int sout, int serr,
           int search, char *envp[], char *pty_name, int wait)
 {
-    int pid = fork();
+    pid_t pid;
     int fd;
+    int channel[2];
     sigset_t sset;
 
-    if (pid != 0)
+    channel[0] = -1;
+    channel[1] = -1;
+    if (!pipe(channel)) {
+        if (-1==fcntl(channel[1], F_SETFD,  FD_CLOEXEC)) {
+            close(channel[1]);
+            channel[1] = -1;
+        }
+    }
+
+    pid = fork();
+    if (pid) {
+        if ((-1 != pid) && (-1 != channel[1])) {
+            int child_errno = 0;
+            int bytes = sizeof(int);
+            int n;
+            char *p = (char*)&child_errno;
+            close(channel[1]);
+            /* Try to read child errno from channel. */
+            while ((bytes > 0) &&
+                   (n = read(channel[0], p, bytes))) {
+                if (-1 == n) {
+                    if (EINTR == errno) {
+                        continue;
+                    } else {
+                        break;
+                    }
+                } else {
+                    bytes -= n;
+                    p += n;
+                }
+            }
+            close(channel[0]);
+            if (child_errno) {
+                waitpid(pid, NULL, 0);
+                /* Our convention to tell Lisp that it was the exec that
+                 * failed, not the fork. */
+                pid = -2;
+                errno = child_errno;
+            }
+        }
         return pid;
+    }
+    close (channel[0]);
 
     /* Put us in our own process group, but only if we need not
      * share stdin with our parent. In the latter case we claim
      * control of the terminal. */
     if (sin >= 0) {
-#if defined(LISP_FEATURE_HPUX)
+#if defined(LISP_FEATURE_HPUX) || defined(LISP_FEATURE_OPENBSD)
       setsid();
 #elif defined(LISP_FEATURE_DARWIN)
       setpgid(0, getpid());
@@ -87,21 +173,9 @@ int spawn(char *program, char *argv[], int sin, int sout, int serr,
     sigprocmask(SIG_SETMASK, &sset, NULL);
 
     /* If we are supposed to be part of some other pty, go for it. */
-    if (pty_name) {
-#if !defined(LISP_FEATURE_HPUX) && !defined(SVR4)
-        fd = open("/dev/tty", O_RDWR, 0);
-        if (fd >= 0) {
-            ioctl(fd, TIOCNOTTY, 0);
-            close(fd);
-        }
-#endif
-        fd = open(pty_name, O_RDWR, 0);
-        dup2(fd, 0);
-        set_noecho(0);
-        dup2(fd, 1);
-        dup2(fd, 2);
-        close(fd);
-    } else{
+    if (pty_name)
+        set_pty(pty_name);
+    else {
     /* Set up stdin, stdout, and stderr */
     if (sin >= 0)
         dup2(sin, 0);
@@ -113,20 +187,43 @@ int spawn(char *program, char *argv[], int sin, int sout, int serr,
     /* Close all other fds. */
 #ifdef SVR4
     for (fd = sysconf(_SC_OPEN_MAX)-1; fd >= 3; fd--)
-        close(fd);
+        if (fd != channel[1]) close(fd);
 #else
     for (fd = getdtablesize()-1; fd >= 3; fd--)
-        close(fd);
+        if (fd != channel[1]) close(fd);
 #endif
 
-    environ = envp;
+    if (envp) {
+      environ = envp;
+    }
     /* Exec the program. */
     if (search)
       execvp(program, argv);
     else
       execv(program, argv);
 
-    exit (1);
+    /* When exec fails and channel is available, send the errno value. */
+    if (-1 != channel[1]) {
+        int our_errno = errno;
+        int bytes = sizeof(int);
+        int n;
+        char *p = (char*)&our_errno;
+        while ((bytes > 0) &&
+               (n = write(channel[1], p, bytes))) {
+            if (-1 == n) {
+                if (EINTR == errno) {
+                    continue;
+                } else {
+                    break;
+                }
+            } else {
+                bytes -= n;
+                p += n;
+            }
+        }
+        close(channel[1]);
+    }
+    _exit(1);
 }
 #else  /* !LISP_FEATURE_WIN32 */
 
@@ -196,9 +293,9 @@ HANDLE spawn (
 
     /* Spawn process given on the command line*/
     if (search)
-        hProcess = (HANDLE) spawnvp ( wait_mode, program, argv );
+        hProcess = (HANDLE) spawnvp ( wait_mode, program, (char* const* )argv );
     else
-        hProcess = (HANDLE) spawnv ( wait_mode, program, argv );
+        hProcess = (HANDLE) spawnv ( wait_mode, program, (char* const* )argv );
 
     /* Now that the process is launched, replace the original
      * in/out/err handles and close the backups. */

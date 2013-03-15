@@ -51,6 +51,12 @@
      (%format destination control-string format-arguments)
      nil)))
 
+(define-compiler-macro format (&whole form destination control &rest args)
+  (declare (ignore control args))
+  (when (stringp destination)
+    (warn "Literal string as destination in FORMAT:~%  ~S" form))
+  form)
+
 (defun %format (stream string-or-fun orig-args &optional (args orig-args))
   (if (functionp string-or-fun)
       (apply string-or-fun stream args)
@@ -164,6 +170,14 @@
 ;;;; format interpreters and support functions for simple output
 
 (defun format-write-field (stream string mincol colinc minpad padchar padleft)
+  (when (and colinc (<= colinc 0))
+    (error 'format-error
+           :complaint "The value of colinc is ~a, should be a positive integer"
+           :args (list colinc)))
+  (when (and mincol (< mincol 0))
+    (error 'format-error
+           :complaint "The value of mincol is ~a, should be a non-negative integer"
+           :args (list mincol)))
   (unless padleft
     (write-string string stream))
   (dotimes (i minpad)
@@ -220,11 +234,17 @@
 
 (def-format-interpreter #\C (colonp atsignp params)
   (interpret-bind-defaults () params
-    (if colonp
-        (format-print-named-character (next-arg) stream)
-        (if atsignp
-            (prin1 (next-arg) stream)
-            (write-char (next-arg) stream)))))
+    (let ((arg (next-arg)))
+      (unless (typep arg 'character)
+        (error 'format-error
+               :complaint "~s is not of type CHARACTER."
+               :args (list arg)))
+      (cond (colonp
+             (format-print-named-character arg stream))
+            (atsignp
+             (prin1 arg stream))
+            (t
+             (write-char arg stream))))))
 
 ;;; "printing" as defined in the ANSI CL glossary, which is normative.
 (defun char-printing-p (char)
@@ -312,6 +332,11 @@
        (commainterval 3))
       params
     (let ((arg (next-arg)))
+      (unless (or base
+                  (integerp arg))
+        (error 'format-error
+               :complaint "~s is not of type INTEGER."
+               :args (list arg)))
       (if base
           (format-print-integer stream arg colonp atsignp base mincol
                                 padchar commachar commainterval)
@@ -598,7 +623,8 @@
           (float-nan-p number))
       (prin1 number stream)
       (multiple-value-bind (num expt) (sb!impl::scale-exponent (abs number))
-        (let* ((expt (- expt k))
+        (let* ((k (if (= num 1.0) (1- k) k))
+               (expt (- expt k))
                (estr (decimal-string (abs expt)))
                (elen (if e (max (length estr) e) (length estr)))
                spaceleft)
@@ -615,14 +641,6 @@
                   (when (and d (zerop d)) (setq tpoint nil))
                   (when w
                     (decf spaceleft flen)
-                    ;; See CLHS 22.3.3.2.  "If the parameter d is
-                    ;; omitted, ... [and] if the fraction to be
-                    ;; printed is zero then a single zero digit should
-                    ;; appear after the decimal point."  So we need to
-                    ;; subtract one from here because we're going to
-                    ;; add an extra 0 digit later. [rtoy]
-                    (when (and (zerop number) (null d))
-                      (decf spaceleft))
                     (when lpoint
                       (if (or (> spaceleft 0) tpoint)
                           (decf spaceleft)
@@ -639,10 +657,6 @@
                                (if atsign (write-char #\+ stream)))
                            (when lpoint (write-char #\0 stream))
                            (write-string fstr stream)
-                           (when (and (zerop number) (null d))
-                             ;; It's later and we're adding the zero
-                             ;; digit.
-                             (write-char #\0 stream))
                            (write-char (if marker
                                            marker
                                            (format-exponent-marker number))
@@ -757,9 +771,10 @@
            :complaint
            "cannot specify either colon or atsign for this directive"))
   (interpret-bind-defaults ((count 1)) params
-    (fresh-line stream)
-    (dotimes (i (1- count))
-      (terpri stream))))
+    (when (plusp count)
+      (fresh-line stream)
+      (dotimes (i (1- count))
+       (terpri stream)))))
 
 (def-format-interpreter #\| (colonp atsignp params)
   (when (or colonp atsignp)
@@ -1085,7 +1100,7 @@
   (multiple-value-bind (segments first-semi close remaining)
       (parse-format-justification directives)
     (setf args
-          (if (format-directive-colonp close)
+          (if (format-directive-colonp close) ; logical block vs. justification
               (multiple-value-bind (prefix per-line-p insides suffix)
                   (parse-format-logical-block segments colonp first-semi
                                               close params string end)
@@ -1100,6 +1115,16 @@
                          :complaint "~D illegal directive~:P found inside justification block"
                          :args (list count)
                          :references (list '(:ansi-cl :section (22 3 5 2)))))
+                ;; ANSI does not explicitly say that an error should
+                ;; be signalled, but the @ modifier is not explicitly
+                ;; allowed for ~> either.
+                (when (format-directive-atsignp close)
+                  (error 'format-error
+                         :complaint "@ modifier not allowed in close ~
+                         directive of justification ~
+                         block (i.e. ~~<...~~@>."
+                         :offset (1- (format-directive-end close))
+                         :references (list '(:ansi-cl :section (22 3 6 2)))))
                 (interpret-format-justification stream orig-args args
                                                 segments colonp atsignp
                                                 first-semi params))))

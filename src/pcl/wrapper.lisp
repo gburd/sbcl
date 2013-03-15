@@ -34,7 +34,7 @@
 ;;; This is called in BRAID when we are making wrappers for classes
 ;;; whose slots are not initialized yet, and which may be built-in
 ;;; classes. We pass in the class name in addition to the class.
-(defun boot-make-wrapper (length name &optional class)
+(defun !boot-make-wrapper (length name &optional class)
   (let ((found (find-classoid name nil)))
     (cond
      (found
@@ -153,7 +153,7 @@
     (remhash owrapper *previous-nwrappers*)
     (setf (gethash nwrapper *previous-nwrappers*) new-previous)))
 
-;;; FIXME: This is not a good name: part of the constract here is that
+;;; FIXME: This is not a good name: part of the contract here is that
 ;;; we return the valid wrapper, which is not obvious from the name
 ;;; (or the names of our callees.)
 (defun check-wrapper-validity (instance)
@@ -177,11 +177,28 @@
              ;;    previous call to REGISTER-LAYOUT for a superclass of
              ;;    INSTANCE's class.  See also the comment above
              ;;    FORCE-CACHE-FLUSHES.  Paul Dietz has test cases for this.
-             (%force-cache-flushes (class-of instance))
-             ;; KLUDGE avoid an infinite recursion, it's still better to
-             ;; bail out with an AVER for server softwares. see FIXME above.
-             ;; details: http://thread.gmane.org/gmane.lisp.steel-bank.devel/10175
-             (aver (not (eq (layout-invalid (wrapper-of instance)) t)))
+             (let ((class (wrapper-class* owrapper)))
+               (%force-cache-flushes class)
+               ;; KLUDGE: avoid an infinite recursion, it's still better to
+               ;; bail out with an error for server softwares. see FIXME above.
+               ;; details: http://thread.gmane.org/gmane.lisp.steel-bank.devel/10175
+               ;;
+               ;; Error message here is trying to figure out a bit more about the
+               ;; situation, since we don't have anything approaching a test-case
+               ;; for the bug.
+               (let ((new-state (layout-invalid (wrapper-of instance))))
+                 (unless (neq t new-state)
+                   (cerror "Nevermind and recurse." 'bug
+                           :format-control "~@<~4IProblem forcing cache flushes. Please report ~
+                                               to sbcl-devel.~
+                                            ~% Owrapper: ~S~
+                                            ~% Wrapper-of: ~S~
+                                            ~% Class-wrapper: ~S~%~:@>"
+                           :format-arguments (mapcar (lambda (x)
+                                                       (cons x (layout-invalid x)))
+                                                     (list owrapper
+                                                           (wrapper-of instance)
+                                                           (class-wrapper class)))))))
              (check-wrapper-validity instance))
             ((consp state)
              (ecase (car state)
@@ -236,13 +253,13 @@
 ;;;  specialize cache implementation or discrimination nets, but this
 ;;;  has not occurred as yet.
 (defun raise-metatype (metatype new-specializer)
-  (let ((slot      (find-class 'slot-class))
-        (standard  (find-class 'standard-class))
-        (fsc       (find-class 'funcallable-standard-class))
-        (condition (find-class 'condition-class))
-        (structure (find-class 'structure-class))
-        (built-in  (find-class 'built-in-class))
-        (frc       (find-class 'forward-referenced-class)))
+  (let ((slot      *the-class-slot-class*)
+        (standard  *the-class-standard-class*)
+        (fsc       *the-class-funcallable-standard-class*)
+        (condition *the-class-condition-class*)
+        (structure *the-class-structure-class*)
+        (built-in  *the-class-built-in-class*)
+        (frc       *the-class-forward-referenced-class*))
     (flet ((specializer->metatype (x)
              (let* ((specializer-class (if (eq **boot-state** 'complete)
                                            (specializer-class-or-nil x)

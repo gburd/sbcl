@@ -244,28 +244,48 @@
 ;;; complain about absence of manifest winnage.
 (declaim (ftype (function (list fixnum fun-type) (values)) check-key-args))
 (defun check-key-args (args pre-key type)
-  (do ((key (nthcdr pre-key args) (cddr key))
-       (n (1+ pre-key) (+ n 2)))
-      ((null key))
-    (declare (fixnum n))
-    (let ((k (car key)))
-      (cond
-       ((not (check-arg-type k (specifier-type 'symbol) n)))
-       ((not (constant-lvar-p k))
-        (note-unwinnage "The ~:R argument (in keyword position) is not a ~
-                         constant."
-                        n))
-       (t
-        (let* ((name (lvar-value k))
-               (info (find name (fun-type-keywords type)
-                           :key #'key-info-name)))
-          (cond ((not info)
-                 (unless (fun-type-allowp type)
-                   (note-lossage "~S is not a known argument keyword."
-                                 name)))
-                (t
-                 (check-arg-type (second key) (key-info-type info)
-                                 (1+ n)))))))))
+  (let (lossages allow-other-keys)
+    (do ((key (nthcdr pre-key args) (cddr key))
+         (n (1+ pre-key) (+ n 2)))
+        ((null key))
+      (declare (fixnum n))
+      (let ((k (first key))
+            (v (second key)))
+        (cond
+          ((not (check-arg-type k (specifier-type 'symbol) n)))
+          ((not (constant-lvar-p k))
+           (note-unwinnage "~@<The ~:R argument (in keyword position) is not ~
+                            a constant, weakening keyword argument ~
+                            checking.~:@>" n)
+           ;; An unknown key may turn out to be :ALLOW-OTHER-KEYS at runtime,
+           ;; so we cannot signal full warnings for keys that look bad.
+           (unless allow-other-keys
+             (setf allow-other-keys :maybe)))
+          (t
+           (let* ((name (lvar-value k))
+                  (info (find name (fun-type-keywords type)
+                              :key #'key-info-name)))
+             (cond ((eq name :allow-other-keys)
+                    (unless allow-other-keys
+                      (if (constant-lvar-p v)
+                          (setf allow-other-keys (if (lvar-value v)
+                                                     :yes
+                                                     :no))
+                          (setf allow-other-keys :maybe))))
+                   ((not info)
+                    (unless (fun-type-allowp type)
+                      (pushnew name lossages :test #'eq)))
+                   (t
+                    (check-arg-type (second key) (key-info-type info)
+                                    (1+ n)))))))))
+    (when (and lossages (member allow-other-keys '(nil :no)))
+      (setf lossages (nreverse lossages))
+      (if (cdr lossages)
+          (note-lossage "~@<~{~S~^, ~} and ~S are not a known argument keywords.~:@>"
+                        (butlast lossages)
+                        (car (last lossages)))
+          (note-lossage "~S is not a known argument keyword."
+                        (car lossages)))))
   (values))
 
 ;;; Construct a function type from a definition.
@@ -616,7 +636,7 @@
       (unless (optional-dispatch-keyp od)
         (frob (not (null (optional-dispatch-more-entry od)))
               (not (null (fun-type-rest type)))
-              "&REST arguments"))
+              "&REST argument"))
       (frob (optional-dispatch-allowp od) (fun-type-allowp type)
             "&ALLOW-OTHER-KEYS"))
 
@@ -776,14 +796,36 @@
   (let ((type (info :function :type name))
         (where (info :function :where-from name)))
     (when (eq where :declared)
-      (setf (leaf-type fun) type)
-      (assert-definition-type
-       fun type
-       :unwinnage-fun #'compiler-notify
-       :where "proclamation"
-       :really-assert (not (awhen (info :function :info name)
-                             (ir1-attributep (fun-info-attributes it)
-                                             explicit-check)))))))
+      (let ((type (massage-global-definition-type type fun)))
+        (setf (leaf-type fun) type)
+        (assert-definition-type
+         fun type
+         :unwinnage-fun #'compiler-notify
+         :where "proclamation"
+         :really-assert (not (awhen (info :function :info name)
+                               (ir1-attributep (fun-info-attributes it)
+                                               explicit-check))))))))
+
+;;; If the function has both &REST and &KEY, FIND-OPTIONAL-DISPATCH-TYPES
+;;; doesn't complain about the type missing &REST -- which is good, because in
+;;; that case &REST is really an implementation detail and not part of the
+;;; interface. However since we set the leaf type missing &REST from there
+;;; would be a bad thing -- to make up a new type if necessary.
+(defun massage-global-definition-type (type fun)
+  (if (and (fun-type-p type)
+           (optional-dispatch-p fun)
+           (optional-dispatch-keyp fun)
+           (optional-dispatch-more-entry fun)
+           (not (or (fun-type-rest type)
+                    (fun-type-wild-args type))))
+      (make-fun-type :required (fun-type-required type)
+                     :optional (fun-type-optional type)
+                     :rest *universal-type*
+                     :keyp (fun-type-keyp type)
+                     :keywords (fun-type-keywords type)
+                     :allowp (fun-type-allowp type)
+                     :returns (fun-type-returns type))
+      type))
 
 ;;; Call FUN with (arg-lvar arg-type)
 (defun map-combination-args-and-types (fun call)
@@ -809,19 +851,39 @@
       (let ((name (key-info-name key)))
         (do ((arg args (cddr arg)))
             ((null arg))
-          (when (eq (lvar-value (first arg)) name)
-            (funcall fun (second arg) (key-info-type key))))))))
+          (let ((keyname (first arg)))
+            (when (and (constant-lvar-p keyname)
+                       (eq (lvar-value keyname) name))
+              (funcall fun (second arg) (key-info-type key)))))))))
 
 ;;; Assert that CALL is to a function of the specified TYPE. It is
 ;;; assumed that the call is legal and has only constants in the
 ;;; keyword positions.
-(defun assert-call-type (call type)
+(defun assert-call-type (call type &optional (trusted t))
   (declare (type combination call) (type fun-type type))
-  (derive-node-type call (fun-type-returns type))
-  (let ((policy (lexenv-policy (node-lexenv call))))
+  (let ((policy (lexenv-policy (node-lexenv call)))
+        (returns (fun-type-returns type)))
+    (if trusted
+        (derive-node-type call returns)
+        (let ((lvar (node-lvar call)))
+          ;; If the value is used in a non-tail position, and the lvar
+          ;; is a single-use, assert the type. Multiple use sites need
+          ;; to be elided because the assertion has to apply to all
+          ;; uses. Tail positions are elided because the assertion
+          ;; would cause us not the be in a tail-position anymore. MV
+          ;; calls are elided because not only are the assertions of
+          ;; less use there, but they can cause the MV call conversion
+          ;; to cause astray.
+          (when (and lvar
+                     (not (return-p (lvar-dest lvar)))
+                     (not (mv-combination-p (lvar-dest lvar)))
+                     (lvar-has-single-use-p lvar))
+            (when (assert-lvar-type lvar returns policy)
+              (reoptimize-lvar lvar)))))
     (map-combination-args-and-types
      (lambda (arg type)
-       (assert-lvar-type arg type policy))
+       (when (assert-lvar-type arg type policy)
+         (unless trusted (reoptimize-lvar arg))))
      call))
   (values))
 
@@ -836,26 +898,49 @@
                            (lvar-source tag)
                            (type-specifier (lvar-type tag))))))
 
-(defun %compile-time-type-error (values atype dtype)
+(defun %compile-time-type-error (values atype dtype context)
   (declare (ignore dtype))
-  (if (and (consp atype)
-           (eq (car atype) 'values))
-      (error 'values-type-error :datum values :expected-type atype)
-      (error 'type-error :datum (car values) :expected-type atype)))
+  (destructuring-bind (form . detail) context
+    (if (and (consp atype) (eq (car atype) 'values))
+        (error 'simple-type-error
+               :datum (car values)
+               :expected-type atype
+               :format-control
+               "~@<Value set ~2I~_[~{~S~^ ~}] ~I~_from ~S in ~2I~_~S ~I~_is ~
+                   not of type ~2I~_~S.~:>"
+               :format-arguments (list values
+                                       detail form
+                                       atype))
+        (error 'simple-type-error
+               :datum (car values)
+               :expected-type atype
+               :format-control "~@<Value of ~S in ~2I~_~S ~I~_is ~2I~_~S, ~
+                                ~I~_not a ~2I~_~S.~:@>"
+               :format-arguments (list detail form
+                                       (car values)
+                                       atype)))))
 
 (defoptimizer (%compile-time-type-error ir2-convert)
-    ((objects atype dtype) node block)
+    ((objects atype dtype context) node block)
   (let ((*compiler-error-context* node))
     (setf (node-source-path node)
           (cdr (node-source-path node)))
-    (destructuring-bind (values atype dtype)
+    (destructuring-bind (values atype dtype context)
         (basic-combination-args node)
       (declare (ignore values))
       (let ((atype (lvar-value atype))
-            (dtype (lvar-value dtype)))
-      (unless (eq atype nil)
-        (warn 'type-warning
-              :format-control
-              "~@<Asserted type ~S conflicts with derived type ~S.~@:>"
-              :format-arguments (list atype dtype)))))
+            (dtype (lvar-value dtype))
+            (detail (cdr (lvar-value context))))
+        (unless (eq atype nil)
+          (if (constantp detail)
+              (warn 'type-warning
+                 :format-control
+                 "~@<Constant ~2I~_~S ~Iconflicts with its asserted type ~
+                     ~2I~_~S.~@:>"
+                 :format-arguments (list (eval detail) atype))
+              (warn 'type-warning
+                 :format-control
+                 "~@<Derived type of ~S is ~2I~_~S, ~I~_conflicting with ~
+                     its asserted type ~2I~_~S.~@:>"
+                 :format-arguments (list detail dtype atype))))))
     (ir2-convert-full-call node block)))

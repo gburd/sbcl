@@ -38,12 +38,21 @@
   (with-compilation-unit (:source-plist (plist-file-source-plist com))
     (call-next-method)))
 
+(defclass source-only-file (cl-source-file)
+  ())
+
+(defmethod perform ((op compile-op) (com source-only-file)))
+
+(defmethod output-files ((op compile-op) (com source-only-file))
+  (list (component-pathname com)))
+
 (defsystem :sb-introspect-tests
   :depends-on (:sb-introspect :sb-rt)
   :components ((:file "xref-test-data")
                (:file "xref-test" :depends-on ("xref-test-data"))
                (:plist-file "test" :source-plist (:test-outer "OUT"))
-               (:file "test-driver" :depends-on ("test"))))
+               (:source-only-file "load-test")
+               (:file "test-driver" :depends-on ("test" "load-test"))))
 
 (defmethod perform ((op test-op) (com (eql (find-system :sb-introspect-tests))))
   ;; N.b. At least DEFINITION-SOURCE-PLIST.1 assumes that CWD is the
@@ -54,5 +63,20 @@
          (make-pathname :directory (pathname-directory
                                     '#.(or *compile-file-pathname*
                                            *load-pathname*)))))
-    (or (funcall (intern "DO-TESTS" (find-package "SB-RT")))
-        (error "~S failed" 'test-op))))
+    (multiple-value-bind (soft strict pending)
+        (funcall (intern "DO-TESTS" (find-package "SB-RT")))
+      (fresh-line)
+      (unless strict
+        #+sb-testing-contrib
+        ;; We create TEST-PASSED from a shell script if tests passed.  But
+        ;; since the shell script only `touch'es it, we can actually create
+        ;; it ahead of time -- as long as we're certain that tests truly
+        ;; passed, hence the check for SOFT.
+        (when soft
+          (with-open-file (s #p"SYS:CONTRIB;SB-INTROSPECT;TEST-PASSED"
+                             :direction :output)
+            (dolist (pend pending)
+              (format s "Expected failure: ~A~%" pend))))
+        (warn "ignoring expected failures in test-op"))
+      (unless soft
+        (error "test-op failed with unexpected failures")))))

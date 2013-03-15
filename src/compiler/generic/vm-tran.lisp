@@ -109,11 +109,12 @@
 ;;; This and the corresponding -SET transform work equally well on non-simple
 ;;; arrays, but after benchmarking (on x86), Nikodemus didn't find any cases
 ;;; where it actually helped with non-simple arrays -- to the contrary, it
-;;; only made for bigger and up 1o 100% slower code.
+;;; only made for bigger and up to 100% slower code.
 (deftransform hairy-data-vector-ref ((array index) (simple-array t) *)
   "avoid runtime dispatch on array element type"
-  (let ((element-ctype (extract-upgraded-element-type array))
-        (declared-element-ctype (extract-declared-element-type array)))
+  (let* ((type (lvar-type array))
+         (element-ctype (array-type-upgraded-element-type type))
+         (declared-element-ctype (array-type-declared-element-type type)))
     (declare (type ctype element-ctype))
     (when (eq *wild-type* element-ctype)
       (give-up-ir1-transform
@@ -200,8 +201,9 @@
                                      (simple-array t t)
                                      *)
   "avoid runtime dispatch on array element type"
-  (let ((element-ctype (extract-upgraded-element-type array))
-        (declared-element-ctype (extract-declared-element-type array)))
+  (let* ((type (lvar-type array))
+         (element-ctype (array-type-upgraded-element-type type))
+         (declared-element-ctype (array-type-declared-element-type type)))
     (declare (type ctype element-ctype))
     (when (eq *wild-type* element-ctype)
       (give-up-ir1-transform
@@ -264,14 +266,32 @@
                              sb!vm:vector-data-offset
                              index offset t))))
 
-(defoptimizer (%data-vector-and-index derive-type) ((array index))
-  (let ((atype (lvar-type array)))
+(defun maybe-array-data-vector-type-specifier (array-lvar)
+  (let ((atype (lvar-type array-lvar)))
     (when (array-type-p atype)
-      (values-specifier-type
-       `(values (simple-array ,(type-specifier
-                                (array-type-specialized-element-type atype))
-                              (*))
-                index)))))
+      (let ((dims (array-type-dimensions atype)))
+        (if (or (array-type-complexp atype)
+                (eq '* dims)
+                (notevery #'integerp dims))
+           `(simple-array ,(type-specifier
+                            (array-type-specialized-element-type atype))
+                          (*))
+           `(simple-array ,(type-specifier
+                            (array-type-specialized-element-type atype))
+                          (,(apply #'* dims))))))))
+
+(macrolet ((def (name)
+             `(defoptimizer (,name derive-type) ((array-lvar))
+                (let ((spec (maybe-array-data-vector-type-specifier array-lvar)))
+                  (when spec
+                    (specifier-type spec))))))
+  (def %array-data-vector)
+  (def array-storage-vector))
+
+(defoptimizer (%data-vector-and-index derive-type) ((array index))
+  (let ((spec (maybe-array-data-vector-type-specifier array)))
+    (when spec
+      (values-specifier-type `(values ,spec index)))))
 
 (deftransform %data-vector-and-index ((%array %index)
                                       (simple-array t)
@@ -295,41 +315,6 @@
   '(if (array-header-p %array)
        (values (%array-data-vector %array) %index)
        (values %array %index)))
-
-;;; transforms for getting at simple arrays of (UNSIGNED-BYTE N) when (< N 8)
-;;;
-;;; FIXME: In CMU CL, these were commented out with #+NIL. Why? Should
-;;; we fix them or should we delete them? (Perhaps these definitions
-;;; predate the various DATA-VECTOR-REF-FOO VOPs which have
-;;; (:TRANSLATE DATA-VECTOR-REF), and are redundant now?)
-#+nil
-(macrolet
-    ((frob (type bits)
-       (let ((elements-per-word (truncate sb!vm:n-word-bits bits)))
-         `(progn
-            (deftransform data-vector-ref ((vector index)
-                                           (,type *))
-              `(multiple-value-bind (word bit)
-                   (floor index ,',elements-per-word)
-                 (ldb ,(ecase sb!vm:target-byte-order
-                         (:little-endian '(byte ,bits (* bit ,bits)))
-                         (:big-endian '(byte ,bits (- sb!vm:n-word-bits
-                                                      (* (1+ bit) ,bits)))))
-                      (%vector-raw-bits vector word))))
-            (deftransform data-vector-set ((vector index new-value)
-                                           (,type * *))
-              `(multiple-value-bind (word bit)
-                   (floor index ,',elements-per-word)
-                 (setf (ldb ,(ecase sb!vm:target-byte-order
-                               (:little-endian '(byte ,bits (* bit ,bits)))
-                               (:big-endian
-                                '(byte ,bits (- sb!vm:n-word-bits
-                                                (* (1+ bit) ,bits)))))
-                            (%vector-raw-bits vector word))
-                       new-value)))))))
-  (frob simple-bit-vector 1)
-  (frob (simple-array (unsigned-byte 2) (*)) 2)
-  (frob (simple-array (unsigned-byte 4) (*)) 4))
 
 ;;;; BIT-VECTOR hackery
 
@@ -639,14 +624,13 @@
   ;; This should really be dependent on SB!VM:N-WORD-BITS, but since we
   ;; don't have a true Alpha64 port yet, we'll have to stick to
   ;; SB!VM:N-MACHINE-WORD-BITS for the time being.  --njf, 2004-08-14
-  #!+#.(cl:if (cl:= 32 sb!vm:n-machine-word-bits) '(and) '(or))
-  (progn
-    #!+x86 (def sb!vm::ash-left-smod30 :tagged 30 t)
-    (def sb!vm::ash-left-mod32 :untagged 32 nil))
-  #!+#.(cl:if (cl:= 64 sb!vm:n-machine-word-bits) '(and) '(or))
-  (progn
-    #!+x86-64 (def sb!vm::ash-left-smod61 :tagged 61 t)
-    (def sb!vm::ash-left-mod64 :untagged 64 nil)))
+  #.`(progn
+       #!+(or x86 x86-64)
+       (def sb!vm::ash-left-modfx
+           :tagged ,(- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits) t)
+       (def ,(intern (format nil "ASH-LEFT-MOD~D" sb!vm:n-machine-word-bits)
+                     "SB!VM")
+           :untagged ,sb!vm:n-machine-word-bits nil)))
 
 ;;;; word-wise logical operations
 

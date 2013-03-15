@@ -29,15 +29,10 @@
 (/show "starting pcl/macros.lisp")
 
 (declaim (declaration
-          ;; As of sbcl-0.7.0.6, SBCL actively uses this declaration
-          ;; to propagate information needed to set up nice debug
-          ;; names (as seen e.g. in BACKTRACE) for method functions.
-          %method-name
           ;; These nonstandard declarations seem to be used privately
           ;; within PCL itself to pass information around, so we can't
           ;; just delete them.
           %class
-          %method-lambda-list
           ;; This declaration may also be used within PCL to pass
           ;; information around, I'm not sure. -- WHN 2000-12-30
           %variable-rebinding))
@@ -96,7 +91,8 @@
                   (ensure-non-standard-class symbol classoid))))))
       (cond ((null errorp) nil)
             ((legal-class-name-p symbol)
-             (error "There is no class named ~S." symbol))
+             (error "There is no class named ~
+                     ~/sb-impl::print-symbol-with-prefix/." symbol))
             (t
              (error "~S is not a legal class name." symbol)))))
 

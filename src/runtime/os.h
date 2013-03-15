@@ -75,6 +75,10 @@ extern void os_zero(os_vm_address_t addr, os_vm_size_t length);
  * "hp-ux.c" in the old CMU CL code. Perhaps move/merge it in here. */
 extern os_vm_address_t os_validate(os_vm_address_t addr, os_vm_size_t len);
 
+#ifdef LISP_FEATURE_WIN32
+void* os_validate_recommit(os_vm_address_t addr, os_vm_size_t len);
+#endif
+
 /* This function seems to undo the effect of os_validate(..). */
 extern void os_invalidate(os_vm_address_t addr, os_vm_size_t len);
 
@@ -152,12 +156,12 @@ extern void os_deallocate(os_vm_address_t addr, os_vm_size_t len);
  * be functions. */
 
 #define os_trunc_to_page(addr) \
-    (os_vm_address_t)(((long)(addr))&~(os_vm_page_size-1))
+    (os_vm_address_t)(((uword_t)(addr))&~(os_vm_page_size-1))
 #define os_round_up_to_page(addr) \
     os_trunc_to_page((addr)+(os_vm_page_size-1))
 
 #define os_trunc_size_to_page(size) \
-    (os_vm_size_t)(((long)(size))&~(os_vm_page_size-1))
+    (os_vm_size_t)(((uword_t)(size))&~(os_vm_page_size-1))
 #define os_round_up_size_to_page(size) \
     os_trunc_size_to_page((size)+(os_vm_page_size-1))
 
@@ -173,8 +177,42 @@ extern void os_deallocate(os_vm_address_t addr, os_vm_size_t len);
 int os_get_errno(void);
 
 /* Return an absolute path to the runtime executable, or NULL if this
- * information is unavailable.  If a non-null pathname is returned, it
- * must be 'free'd. */
-extern char *os_get_runtime_executable_path(void);
+ * information is unavailable.  Unless external_path is non-zero the
+ * returned path may only be valid for the current process, ie:
+ * something like /proc/curproc/file.  If a non-null pathname is
+ * returned, it must be 'free'd. */
+extern char *os_get_runtime_executable_path(int external_path);
+
+/* Write platforms specific ones when necessary. This is to get us off
+ * the ground. */
+#if N_WORD_BITS == 32
+# define OS_VM_SIZE_FMT "u"
+# define OS_VM_SIZE_FMTX "x"
+#else
+#if defined(LISP_FEATURE_SB_WIN32)
+# define OS_VM_SIZE_FMT "Iu"
+# define OS_VM_SIZE_FMTX "Ix"
+#else
+# define OS_VM_SIZE_FMT "lu"
+# define OS_VM_SIZE_FMTX "lx"
+#endif
+#endif
+
+/* FIXME: this is not the right place for this, but here we have
+ * a convenient base type to hand. If it turns out we can just use
+ * size_t everywhere, this can more to runtime.h. */
+typedef os_vm_size_t word_t;
+#define WORD_FMTX OS_VM_SIZE_FMTX
+
+#ifdef LISP_FEATURE_SB_THREAD
+#  ifndef CANNOT_USE_POSIX_SEM_T
+#    include <semaphore.h>
+     typedef sem_t os_sem_t;
+#  endif
+   void os_sem_init(os_sem_t *sem, unsigned int value);
+   void os_sem_wait(os_sem_t *sem, char *what);
+   void os_sem_post(os_sem_t *sem, char *what);
+   void os_sem_destroy(os_sem_t *sem);
+#endif
 
 #endif

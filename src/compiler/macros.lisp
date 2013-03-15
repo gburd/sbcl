@@ -469,12 +469,16 @@
 ;;; the function might have.
 (defmacro defknown (name arg-types result-type &optional (attributes '(any))
                     &body keys)
+  #-sb-xc-host
+  (when (member 'unsafe attributes)
+    (style-warn "Ignoring legacy attribute UNSAFE. Replaced by its inverse: DX-SAFE.")
+    (setf attributes (remove 'unsafe attributes)))
   (when (and (intersection attributes '(any call unwind))
              (intersection attributes '(movable)))
     (error "function cannot have both good and bad attributes: ~S" attributes))
 
   (when (member 'any attributes)
-    (setq attributes (union '(call unsafe unwind) attributes)))
+    (setq attributes (union '(call unwind) attributes)))
   (when (member 'flushable attributes)
     (pushnew 'unsafely-flushable attributes))
 
@@ -681,17 +685,25 @@
     (aver-live-component *current-component*)
     (funcall fun)))
 
+(defmacro with-source-paths (&body forms)
+  (with-unique-names (source-paths)
+    `(let* ((,source-paths (make-hash-table :test 'eq))
+            (*source-paths* ,source-paths))
+      (unwind-protect
+           (progn ,@forms)
+        (clrhash ,source-paths)))))
+
 ;;; Bind the hashtables used for keeping track of global variables,
 ;;; functions, etc. Also establish condition handlers.
 (defmacro with-ir1-namespace (&body forms)
   `(let ((*free-vars* (make-hash-table :test 'eq))
          (*free-funs* (make-hash-table :test 'equal))
-         (*constants* (make-hash-table :test 'equal))
-         (*source-paths* (make-hash-table :test 'eq)))
-     (handler-bind ((compiler-error #'compiler-error-handler)
-                    (style-warning #'compiler-style-warning-handler)
-                    (warning #'compiler-warning-handler))
-       ,@forms)))
+         (*constants* (make-hash-table :test 'equal)))
+     (unwind-protect
+          (progn ,@forms)
+       (clrhash *free-funs*)
+       (clrhash *free-vars*)
+       (clrhash *constants*))))
 
 ;;; Look up NAME in the lexical environment namespace designated by
 ;;; SLOT, returning the <value, T>, or <NIL, NIL> if no entry. The
@@ -983,3 +995,19 @@ specify bindings for printer control variables.")
         (nreverse (mapcar #'car *compiler-print-variable-alist*))
         (nreverse (mapcar #'cdr *compiler-print-variable-alist*))
       ,@forms)))
+
+;;; Like DESTRUCTURING-BIND, but generates a COMPILER-ERROR on failure
+(defmacro compiler-destructuring-bind (lambda-list thing context
+                                       &body body)
+  (let ((whole-name (gensym "WHOLE")))
+    (multiple-value-bind (body local-decls)
+        (parse-defmacro lambda-list whole-name body nil
+                        context
+                        :anonymousp t
+                        :doc-string-allowed nil
+                        :wrap-block nil
+                        :error-fun 'compiler-error)
+      `(let ((,whole-name ,thing))
+         (declare (type list ,whole-name))
+         ,@local-decls
+         ,body))))

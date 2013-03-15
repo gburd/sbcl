@@ -41,6 +41,7 @@
   (recheck-dynamic-extent-lvars component)
   (find-cleanup-points component)
   (tail-annotate component)
+  (analyze-indirect-lambda-vars component)
 
   (dolist (fun (component-lambdas component))
     (when (null (leaf-refs fun))
@@ -207,13 +208,106 @@
                                 (flood (get-node-physenv ref))))))))))
       (flood ref-physenv)))
   (values))
+
+;;; Find LAMBDA-VARs that are marked as needing to support indirect
+;;; access (SET at some point after initial creation) that are present
+;;; in CLAMBDAs not marked as being DYNAMIC-EXTENT (meaning that the
+;;; value-cell involved must be able to survive past the extent of the
+;;; allocating frame), and mark them (the LAMBDA-VARs) as needing
+;;; explicit value-cells.  Because they are already closed-over, the
+;;; LAMBDA-VARs already appear in the closures of all of the CLAMBDAs
+;;; that need checking.
+(defun analyze-indirect-lambda-vars (component)
+  (dolist (fun (component-lambdas component))
+    (let ((entry-fun (functional-entry-fun fun)))
+      ;; We also check the ENTRY-FUN, as XEPs for LABELS or FLET
+      ;; functions aren't set to be DX even if their underlying
+      ;; CLAMBDAs are, and if we ever get LET-bound anonymous function
+      ;; DX working, it would mark the XEP as being DX but not the
+      ;; "real" CLAMBDA.  This works because a FUNCTIONAL-ENTRY-FUN is
+      ;; either NULL, a self-pointer (for :TOPLEVEL functions), a
+      ;; pointer from an XEP to its underlying function (for :EXTERNAL
+      ;; functions), or a pointer from an underlying function to its
+      ;; XEP (for non-:TOPLEVEL functions with XEPs).
+      (unless (or (leaf-dynamic-extent fun)
+                  ;; Functions without XEPs can be treated as if they
+                  ;; are DYNAMIC-EXTENT, even without being so
+                  ;; declared, as any escaping closure which /isn't/
+                  ;; DYNAMIC-EXTENT but calls one of these functions
+                  ;; will also close over the required variables, thus
+                  ;; forcing the allocation of value cells.  Since the
+                  ;; XEP is stored in the ENTRY-FUN slot, we can pick
+                  ;; off the non-XEP case here.
+                  (not entry-fun)
+                  (leaf-dynamic-extent entry-fun))
+        (let ((closure (physenv-closure (lambda-physenv fun))))
+          (dolist (var closure)
+            (when (and (lambda-var-p var)
+                       (lambda-var-indirect var))
+              (setf (lambda-var-explicit-value-cell var) t))))))))
 
 ;;;; non-local exit
 
-#!-sb-fluid (declaim (inline should-exit-check-tag-p))
+(defvar *functional-escape-info*)
+
+(defun functional-may-escape-p (functional)
+  (let ((table *functional-escape-info*))
+    (unless table
+      ;; Many components never need the table since they have no escapes -- so
+      ;; we allocate it lazily.
+      (setf table (make-hash-table)
+            *functional-escape-info* table))
+    (multiple-value-bind (bool ok) (gethash functional table)
+      (if ok
+          bool
+          (let ((entry (functional-entry-fun functional)))
+            ;; First stick a NIL in there: break cycles.
+            (setf (gethash functional table) nil)
+            ;; Then compute the real value.
+            (setf (gethash functional table)
+                  (or
+                   ;; If the functional has a XEP, it's kind is :EXTERNAL --
+                   ;; which means it may escape. ...but if it
+                   ;; HAS-EXTERNAL-REFERENCES-P, then that XEP is actually a
+                   ;; TL-XEP, which means it's a toplevel function -- which in
+                   ;; turn means our search has bottomed out without an escape
+                   ;; path. AVER just to make sure, though.
+                   (and (eq :external (functional-kind functional))
+                        (if (functional-has-external-references-p functional)
+                            (aver (eq 'tl-xep (car (functional-debug-name functional))))
+                            t))
+                   ;; If it has an entry point that may escape, that just as bad.
+                   (and entry (functional-may-escape-p entry))
+                   ;; If it has references to it in functions that may escape, that's bad
+                   ;; too.
+                   (dolist (ref (functional-refs functional) nil)
+                     (let* ((lvar (ref-lvar ref))
+                            (dest (when lvar (lvar-dest lvar))))
+                       (when (functional-may-escape-p (node-home-lambda dest))
+                         (return t)))))))))))
+
 (defun exit-should-check-tag-p (exit)
   (declare (type exit exit))
-  (not (zerop (policy exit check-tag-existence))))
+  (let ((exit-lambda (lexenv-lambda (node-lexenv exit))))
+    (unless (or
+             ;; Unsafe but fast...
+             (policy exit (zerop check-tag-existence))
+             ;; Dynamic extent is a promise things won't escape --
+             ;; and an explicit request to avoid heap consing.
+             (member (lambda-extent exit-lambda) '(:always-dynamic :maybe-dynamic))
+             ;; If the exit lambda cannot escape, then we should be safe.
+             ;; ...since the escape analysis is kinda new, and not particularly
+             ;; exhaustively tested, let alone proven, disable it for SAFETY 3.
+             (and (policy exit (< safety 3))
+                  (not (functional-may-escape-p exit-lambda))))
+      (when (policy exit (> speed safety))
+        (let ((*compiler-error-context* (exit-entry exit)))
+          (compiler-notify "~@<Allocating a value-cell at runtime for ~
+                            checking possibly out of extent exit via ~S. Use ~
+                            GO/RETURN-FROM with SAFETY 0, or declare the exit ~
+                            function DYNAMIC-EXTENT to avoid.~:@>"
+                           (node-source-form exit))))
+      t)))
 
 ;;; Insert the entry stub before the original exit target, and add a
 ;;; new entry to the PHYSENV-NLX-INFO. The %NLX-ENTRY call in the
@@ -314,13 +408,14 @@
 ;;; for later phases.
 (defun find-non-local-exits (component)
   (declare (type component component))
-  (dolist (lambda (component-lambdas component))
-    (dolist (entry (lambda-entries lambda))
-      (dolist (exit (entry-exits entry))
-        (let ((target-physenv (node-physenv entry)))
-          (if (eq (node-physenv exit) target-physenv)
-              (maybe-delete-exit exit)
-              (note-non-local-exit target-physenv exit))))))
+  (let ((*functional-escape-info* nil))
+    (dolist (lambda (component-lambdas component))
+      (dolist (entry (lambda-entries lambda))
+        (dolist (exit (entry-exits entry))
+          (let ((target-physenv (node-physenv entry)))
+            (if (eq (node-physenv exit) target-physenv)
+                (maybe-delete-exit exit)
+                (note-non-local-exit target-physenv exit)))))))
   (values))
 
 ;;;; final decision on stack allocation of dynamic-extent structures
@@ -363,7 +458,7 @@
                                    (cond (closure
                                           (setq dx t))
                                          (t
-                                          (setf (leaf-dynamic-extent fun) nil)))))
+                                          (setf (leaf-extent fun) nil)))))
                                (when dx
                                  (setf (lvar-dynamic-extent arg) cleanup)
                                  (real-dx-lvars arg))))))
@@ -458,26 +553,24 @@
   (declare (type component component))
   (dolist (fun (component-lambdas component))
     (let ((ret (lambda-return fun)))
-      ;; Nodes whose type is NIL (i.e. don't return) such as calls to
-      ;; ERROR are never annotated as TAIL-P, in order to preserve
-      ;; debugging information.
-      ;;
-      ;; FIXME: It might be better to add another DEFKNOWN property
-      ;; (e.g. NO-TAIL-RECURSION) and use it for error-handling
-      ;; functions like ERROR, instead of spreading this special case
-      ;; net so widely. --WHN?
-      ;;
-      ;; Why is that bad? Because this non-elimination of
-      ;; non-returning tail calls causes the XEP for FOO appear in
-      ;; backtrace for (defun foo (x) (error "foo ~S" x)) wich seems
-      ;; less then optimal. --NS 2005-02-28
       (when ret
         (let ((result (return-result ret)))
           (do-uses (use result)
-            (when (and (policy use merge-tail-calls)
-                       (basic-combination-p use)
+            (when (and (basic-combination-p use)
                        (immediately-used-p result use)
-                       (or (not (eq (node-derived-type use) *empty-type*))
-                           (eq (basic-combination-kind use) :local)))
+                       (or (eq (basic-combination-kind use) :local)
+                           ;; Nodes whose type is NIL (i.e. don't return) such
+                           ;; as calls to ERROR are never annotated as TAIL-P,
+                           ;; in order to preserve debugging information, so that
+                           ;;
+                           ;; We spread this net wide enough to catch
+                           ;; untrusted NIL return types as well, so that
+                           ;; frames calling functions such as FOO-ERROR are
+                           ;; kept in backtraces:
+                           ;;
+                           ;;  (defun foo-error (x) (error "oops: ~S" x))
+                           ;;
+                           (not (or (eq *empty-type* (node-derived-type use))
+                                    (eq *empty-type* (combination-defined-type use))))))
               (setf (node-tail-p use) t)))))))
   (values))

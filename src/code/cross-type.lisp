@@ -108,7 +108,7 @@
 ;;; T unless it's certain) and the second value to tell whether it's
 ;;; certain.
 (defun cross-typep (host-object raw-target-type)
-  (let ((target-type (type-expand raw-target-type)))
+  (let ((target-type (typexpand raw-target-type)))
     (flet ((warn-and-give-up ()
            ;; We don't have to keep track of this as long as system
            ;; performance is acceptable, since giving up
@@ -248,7 +248,7 @@
              (if (stringp host-object)
                  (warn-and-give-up)
                  (values nil t)))
-            ((target-type-is-in '(character base-char))
+            ((target-type-is-in '(character base-char standard-char))
              (cond ((typep host-object 'standard-char)
                     (values t t))
                    ((not (characterp host-object))
@@ -289,6 +289,12 @@
                  ;; trivial.
                  (and (every/type #'cross-typep host-object rest))
                  (or  (any/type   #'cross-typep host-object rest))
+                 (not
+                  (multiple-value-bind (value surep)
+                      (cross-typep host-object (car rest))
+                    (if surep
+                        (values (not value) t)
+                        (warn-and-give-up))))
                  ;; If we want to work with the KEYWORD type, we need
                  ;; to grok (SATISFIES KEYWORDP).
                  (satisfies

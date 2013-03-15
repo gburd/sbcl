@@ -15,6 +15,17 @@
 #ifndef _SBCL_RUNTIME_H_
 #define _SBCL_RUNTIME_H_
 
+#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
+# include "pthreads_win32.h"
+#else
+# include <signal.h>
+# ifdef LISP_FEATURE_SB_THREAD
+#  include <pthread.h>
+# endif
+#endif
+
+#include <stdint.h>
+
 #if defined(LISP_FEATURE_SB_THREAD)
 #define thread_self() pthread_self()
 #define thread_kill pthread_kill
@@ -29,8 +40,44 @@
 #define thread_mutex_unlock(l) 0
 #endif
 
-/* Block blockable interrupts for each SHOW, if not 0. */
+#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
+void os_preinit();
+#endif
+
+#if defined(LISP_FEATURE_SB_SAFEPOINT)
+
+typedef enum {
+    GC_NONE=0,
+    GC_FLIGHT,
+    GC_MESSAGE,
+    GC_INVOKED,
+    GC_QUIET,
+    GC_SETTLED,
+    GC_COLLECT,
+    GC_NPHASES
+}  gc_phase_t;
+
+void map_gc_page();
+void unmap_gc_page();
+int check_pending_interrupts();
+void gc_state_lock();
+void gc_state_wait(gc_phase_t);
+void gc_state_unlock();
+
+#endif
+
+/*
+ * The next few defines serve as configuration -- edit them inline if
+ * you are a developer and want to affect FSHOW behaviour.
+ */
+
+/* Block blockable interrupts for each SHOW, if not 0.
+ * (On Windows, this setting has no effect.)
+ *
+ * In principle, this is a "configuration option", but I am not aware of
+ * any reason why or when it would be advantageous to disable it. */
 #define QSHOW_SIGNAL_SAFE 1
+
 /* Enable extra-verbose low-level debugging output for signals? (You
  * probably don't want this unless you're trying to debug very early
  * cold boot on a new machine, or one where you've just messed up
@@ -40,55 +87,108 @@
  * causes output from signal handlers, and the i/o libraries aren't
  * necessarily reentrant. But it can still be very convenient for
  * figuring out what's going on when you have a signal handling
- * problem. */
-#define QSHOW_SIGNALS 0
+ * problem.
+ *
+ * Possible values are:
+ *   0 -- Never show signal-related output.  There is absolutely no
+ *        run-time overhead from FSHOW_SIGNAL in this case.
+ *
+ *   1 -- (recommended)
+ *        Show signal-related output only if selected at run-time
+ *        (otherwise almost no run-time overhead).
+ *
+ *   2 -- Unconditionally show signal-related output.
+ *        Very significant overhead.
+ *
+ * For reasons of tradition, we default to 0 on POSIX and 1 on Windows
+ * through :SB-QSHOW.
+ *
+ * With option 1, set up environment variable SBCL_DYNDEBUG to include
+ * "fshow" or "fshow_signal" before starting SBCL to enable output.
+ *
+ * There is no particular advantage to option 2 except that you do not
+ * need to set environment variables in this case.
+ */
+#ifdef LISP_FEATURE_SB_QSHOW
+# define QSHOW_SIGNALS 1
+#else
+# define QSHOW_SIGNALS 0
+#endif
+
 /* Enable low-level debugging output, if not zero. Defaults to enabled
- * if QSHOW_SIGNALS, disabled otherwise. Change it to 1 if you want
+ * if QSHOW_SIGNALS, disabled otherwise. Change it to 1 or 2 if you want
  * low-level debugging output but not the whole signal mess. */
 #define QSHOW QSHOW_SIGNALS
 
-#if QSHOW
+/*
+ * Configuration options end here -- the following defines do not
+ * generally need customization.
+ */
+
+#define odxprint(topic, fmt, ...)                       \
+    do                                                  \
+        if (dyndebug_config.dyndebug_##topic)           \
+            odxprint_fun(fmt "\n", ##__VA_ARGS__);      \
+    while (0)
+
+void odxprint_fun(const char *fmt, ...);
+void fshow_fun(void *ignored, const char *fmt, ...);
+
+/* Flags defined in a structure to avoid code duplication between
+ * declaration and definition. */
+extern struct dyndebug_config {
+    int dyndebug_fshow;
+    int dyndebug_fshow_signal;
+    int dyndebug_gencgc_verbose;
+    int dyndebug_safepoints;
+    int dyndebug_seh;
+    int dyndebug_misc;
+    int dyndebug_pagefaults;
+    int dyndebug_backtrace_when_lost;
+    int dyndebug_sleep_when_lost;
+    int dyndebug_io;
+    int dyndebug_runtime_link;
+} dyndebug_config;
+
+#ifdef LISP_FEATURE_GENCGC
+extern int gencgc_verbose;
+#endif
+
+void dyndebug_init(void);
 
 #if QSHOW_SIGNAL_SAFE == 1 && !defined(LISP_FEATURE_WIN32)
 
-#include <signal.h>
 extern sigset_t blockable_sigset;
 
 #define QSHOW_BLOCK                                             \
         sigset_t oldset;                                        \
-        thread_sigmask(SIG_BLOCK, &blockable_sigset, &oldset);
-#define QSHOW_UNBLOCK thread_sigmask(SIG_SETMASK,&oldset,0);
+        thread_sigmask(SIG_BLOCK, &blockable_sigset, &oldset)
+#define QSHOW_UNBLOCK thread_sigmask(SIG_SETMASK,&oldset,0)
 #else
 #define QSHOW_BLOCK
 #define QSHOW_UNBLOCK
 #endif
 
-#ifdef LISP_FEATURE_SB_THREAD
-#define QSHOW_PREFIX fprintf(stderr, "%lu ", pthread_self());
+/* The following macros duplicate the expansion of odxprint, because the
+ * extra level of parentheses around `args' prevents us from
+ * implementing FSHOW in terms of odxprint directly.  (They also differ
+ * in a newline.)
+ */
+
+#if QSHOW
+# define FSHOW(args) \
+    do if (dyndebug_config.dyndebug_fshow) fshow_fun args; while (0)
+# define SHOW(string) FSHOW((stderr, "/%s\n", string))
 #else
-#define QSHOW_PREFIX
-#endif
-
-#define FSHOW(args)                                             \
-    do {                                                        \
-        QSHOW_BLOCK                                             \
-        QSHOW_PREFIX                                            \
-        fprintf args;                                           \
-        QSHOW_UNBLOCK                                           \
-    } while (0)
-#define SHOW(string) FSHOW((stderr, "/%s\n", string))
-
-#else
-
-#define FSHOW(args)
-#define SHOW(string)
-
+# define FSHOW(args)
+# define SHOW(string)
 #endif
 
 #if QSHOW_SIGNALS
-#define FSHOW_SIGNAL FSHOW
+# define FSHOW_SIGNAL(args)                                             \
+    do if (dyndebug_config.dyndebug_fshow_signal) fshow_fun args; while (0)
 #else
-#define FSHOW_SIGNAL(args)
+# define FSHOW_SIGNAL(args)
 #endif
 
 /* KLUDGE: These are in theory machine-dependent and OS-dependent, but
@@ -99,29 +199,44 @@ extern sigset_t blockable_sigset;
 /* even on alpha, int happens to be 4 bytes.  long is longer. */
 /* FIXME: these names really shouldn't reflect their length and this
    is not quite right for some of the FFI stuff */
+#if defined(LISP_FEATURE_WIN32)&&defined(LISP_FEATURE_X86_64)
+typedef unsigned long long u64;
+typedef signed long long s64;
+#else
 typedef unsigned long u64;
 typedef signed long s64;
+#endif
 typedef unsigned int u32;
 typedef signed int s32;
 
 /* this is an integral type the same length as a machine pointer */
-typedef unsigned long pointer_sized_uint_t ;
+typedef uintptr_t pointer_sized_uint_t;
+
+#ifdef _WIN64
+#define AMD64_SYSV_ABI __attribute__((sysv_abi))
+#else
+#define AMD64_SYSV_ABI
+#endif
 
 #include <sys/types.h>
 
 #if defined(LISP_FEATURE_SB_THREAD)
-#include <pthread.h>
 typedef pthread_t os_thread_t;
 #else
 typedef pid_t os_thread_t;
 #endif
 
+typedef uintptr_t uword_t;
+typedef intptr_t  sword_t;
+
 /* FIXME: we do things this way because of the alpha32 port.  once
    alpha64 has arrived, all this nastiness can go away */
 #if 64 == N_WORD_BITS
 #define LOW_WORD(c) ((pointer_sized_uint_t)c)
-typedef unsigned long lispobj;
+#define OBJ_FMTX "lx"
+typedef uintptr_t lispobj;
 #else
+#define OBJ_FMTX "x"
 #define LOW_WORD(c) ((long)(c) & 0xFFFFFFFFL)
 /* fake it on alpha32 */
 typedef unsigned int lispobj;
@@ -139,7 +254,7 @@ widetag_of(lispobj obj)
     return obj & WIDETAG_MASK;
 }
 
-static inline unsigned long
+static inline uword_t
 HeaderValue(lispobj obj)
 {
   return obj >> N_WIDETAG_BITS;
@@ -168,7 +283,11 @@ FDEFN(lispobj obj)
 static inline int
 is_lisp_pointer(lispobj obj)
 {
+#if N_WORD_BITS == 64
+    return (obj & 3) == 3;
+#else
     return obj & 1;
+#endif
 }
 
 #include "fixnump.h"
@@ -202,13 +321,14 @@ make_lispobj(void *o, int low_tag)
     return LOW_WORD(o) | low_tag;
 }
 
+#define MAKE_FIXNUM(n) (n << N_FIXNUM_TAG_BITS)
 static inline lispobj
-make_fixnum(long n)
+make_fixnum(sword_t n)
 {
-    return n << N_FIXNUM_TAG_BITS;
+    return MAKE_FIXNUM(n);
 }
 
-static inline long
+static inline sword_t
 fixnum_value(lispobj n)
 {
     return n >> N_FIXNUM_TAG_BITS;
@@ -232,19 +352,8 @@ typedef int boolean;
 static inline boolean
 other_immediate_lowtag_p(lispobj header)
 {
-    switch (lowtag_of(header)) {
-    case OTHER_IMMEDIATE_0_LOWTAG:
-    case OTHER_IMMEDIATE_1_LOWTAG:
-#ifdef OTHER_IMMEDIATE_2_LOWTAG
-    case OTHER_IMMEDIATE_2_LOWTAG:
-#endif
-#ifdef OTHER_IMMEDIATE_3_LOWTAG
-    case OTHER_IMMEDIATE_3_LOWTAG:
-#endif
-        return 1;
-    default:
-        return 0;
-    }
+    /* These lowtags are spaced 4 apart throughout the lowtag space. */
+    return (lowtag_of(header) & 3) == OTHER_IMMEDIATE_0_LOWTAG;
 }
 
 /* KLUDGE: As far as I can tell there's no ANSI C way of saying
@@ -263,13 +372,24 @@ other_immediate_lowtag_p(lispobj header)
 extern void *successful_malloc (size_t size);
 extern char *copied_string (char *string);
 
-#define RUNTIME_OPTIONS_MAGIC 0x31EBF355
-/* 1 for magic, 1 for boolean, 2 for struct runtime_options fields */
-#define RUNTIME_OPTIONS_WORDS (1 + 1 + 2)
+#if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_SB_SAFEPOINT)
+# define THREADS_USING_GCSIGNAL 1
+#endif
 
-struct runtime_options {
-    size_t dynamic_space_size;
-    size_t thread_control_stack_size;
-};
+/* Now that SPARC has precise GENCGC, several places that used to be
+ * #ifdef PCC need adjustment.  Clearly, "PPC or SPARC" is as unhelpful
+ * a test as its reverse, "x86 or x86-64".  However, the feature
+ * commonly used to differentiate between those two worlds is
+ * C_STACK_IS_CONTROL_STACK, and clearly (or at least in my humble
+ * opinion), at some point we'd like to have precise GC on x86 while
+ * still sharing the C stack, so stack usage ought not imply GC
+ * conservativeness.  So let's have a helper feature that makes the code
+ * a bit more future-proof, even if it is itself currently defined in
+ * the naive way: */
+#if defined(LISP_FEATURE_GENCGC) && !defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
+# define GENCGC_IS_PRECISE 1
+#endif
+
+void *os_dlsym_default(char *name);
 
 #endif /* _SBCL_RUNTIME_H_ */

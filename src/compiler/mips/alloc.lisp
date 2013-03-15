@@ -213,7 +213,7 @@
 
 (define-vop (make-unbound-marker)
   (:args)
-  (:results (result :scs (any-reg)))
+  (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
     (inst li result unbound-marker-widetag)))
 
@@ -260,7 +260,7 @@
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
   (:generator 6
     (inst addu bytes extra (* (1+ words) n-word-bytes))
-    (inst sll header bytes (- n-widetag-bits 2))
+    (inst sll header bytes (- n-widetag-bits n-fixnum-tag-bits))
     (inst addu header header (+ (ash -2 n-widetag-bits) type))
     (inst srl bytes bytes n-lowtag-bits)
     (inst sll bytes bytes n-lowtag-bits)

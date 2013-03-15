@@ -16,10 +16,14 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <signal.h>
 #include <sys/file.h>
 
 #include "sbcl.h"
+#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
+#include "pthreads_win32.h"
+#else
+#include <signal.h>
+#endif
 #include "runtime.h"
 #include "os.h"
 #include "core.h"
@@ -34,8 +38,8 @@
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 
-#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_LUTEX)
-#include "genesis/lutex.h"
+#ifdef LISP_FEATURE_SB_CORE_COMPRESSION
+# include <zlib.h>
 #endif
 
 /* write_runtime_options uses a simple serialization scheme that
@@ -70,14 +74,81 @@ write_lispobj(lispobj obj, FILE *file)
     }
 }
 
-static long
-write_bytes(FILE *file, char *addr, long bytes, os_vm_offset_t file_offset)
+static void
+write_bytes_to_file(FILE * file, char *addr, long bytes, int compression)
 {
-    long count, here, data;
+    if (compression == COMPRESSION_LEVEL_NONE) {
+        while (bytes > 0) {
+            sword_t count = fwrite(addr, 1, bytes, file);
+            if (count > 0) {
+                bytes -= count;
+                addr += count;
+            }
+            else {
+                perror("error writing to save file");
+                bytes = 0;
+            }
+        }
+#ifdef LISP_FEATURE_SB_CORE_COMPRESSION
+    } else if ((compression >= -1) && (compression <= 9)) {
+# define ZLIB_BUFFER_SIZE (1u<<16)
+        z_stream stream;
+        unsigned char buf[ZLIB_BUFFER_SIZE];
+        unsigned char * written, * end;
+        long total_written = 0;
+        int ret;
+        stream.zalloc = NULL;
+        stream.zfree = NULL;
+        stream.opaque = NULL;
+        stream.avail_in = bytes;
+        stream.next_in  = (void*)addr;
+        ret = deflateInit(&stream, compression);
+        if (ret != Z_OK)
+            lose("deflateInit: %i\n", ret);
+        do {
+            stream.avail_out = sizeof(buf);
+            stream.next_out = buf;
+            ret = deflate(&stream, Z_FINISH);
+            if (ret < 0) lose("zlib deflate error: %i... exiting\n", ret);
+            written = buf;
+            end     = buf+sizeof(buf)-stream.avail_out;
+            total_written += end - written;
+            while (written < end) {
+                long count = fwrite(written, 1, end-written, file);
+                if (count > 0) {
+                    written += count;
+                } else {
+                    lose("unable to write to core file\n");
+                }
+            }
+        } while (stream.avail_out == 0);
+        deflateEnd(&stream);
+        printf("compressed %lu bytes into %lu at level %i\n",
+               bytes, total_written, compression);
+# undef ZLIB_BUFFER_SIZE
+#endif
+    } else {
+#ifdef LISP_FEATURE_SB_CORE_COMPRESSION
+        lose("Unknown core compression level %i, exiting\n", compression);
+#else
+        lose("zlib-compressed core support not built in this runtime\n");
+#endif
+    }
+
+    fflush(file);
+};
+
+
+static long
+write_and_compress_bytes(FILE *file, char *addr, long bytes, os_vm_offset_t file_offset,
+                         int compression)
+{
+    long here, data;
 
     bytes = (bytes+os_vm_page_size-1)&~(os_vm_page_size-1);
 
 #ifdef LISP_FEATURE_WIN32
+    long count;
     /* touch every single page in the space to force it to be mapped. */
     for (count = 0; count < bytes; count += 0x1000) {
         volatile int temp = addr[count];
@@ -89,120 +160,44 @@ write_bytes(FILE *file, char *addr, long bytes, os_vm_offset_t file_offset)
     fseek(file, 0, SEEK_END);
     data = (ftell(file)+os_vm_page_size-1)&~(os_vm_page_size-1);
     fseek(file, data, SEEK_SET);
-
-    while (bytes > 0) {
-        count = fwrite(addr, 1, bytes, file);
-        if (count > 0) {
-            bytes -= count;
-            addr += count;
-        }
-        else {
-            perror("error writing to save file");
-            bytes = 0;
-        }
-    }
-    fflush(file);
+    write_bytes_to_file(file, addr, bytes, compression);
     fseek(file, here, SEEK_SET);
     return ((data - file_offset) / os_vm_page_size) - 1;
 }
 
-#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_LUTEX)
-/* saving lutexes in the core */
-static void **lutex_addresses;
-static long n_lutexes = 0;
-static long max_lutexes = 0;
-
 static long
-default_scan_action(lispobj *obj)
+write_bytes(FILE *file, char *addr, long bytes, os_vm_offset_t file_offset)
 {
-    return (sizetab[widetag_of(*obj)])(obj);
-}
-
-static long
-lutex_scan_action(lispobj *obj)
-{
-    /* note the address of the lutex */
-    if(n_lutexes >= max_lutexes) {
-        max_lutexes *= 2;
-        lutex_addresses = realloc(lutex_addresses, max_lutexes * sizeof(void *));
-        gc_assert(lutex_addresses);
-    }
-
-    lutex_addresses[n_lutexes++] = obj;
-
-    return (*sizetab[widetag_of(*obj)])(obj);
-}
-
-typedef long (*scan_table[256])(lispobj *obj);
-
-static void
-scan_objects(lispobj *start, long n_words, scan_table table)
-{
-    lispobj *end = start + n_words;
-    lispobj *object_ptr;
-    long n_words_scanned;
-    for (object_ptr = start;
-         object_ptr < end;
-         object_ptr += n_words_scanned) {
-        lispobj obj = *object_ptr;
-
-        n_words_scanned = (table[widetag_of(obj)])(object_ptr);
-    }
+    return write_and_compress_bytes(file, addr, bytes, file_offset,
+                                    COMPRESSION_LEVEL_NONE);
 }
 
 static void
-scan_for_lutexes(lispobj *addr, long n_words)
+output_space(FILE *file, int id, lispobj *addr, lispobj *end,
+             os_vm_offset_t file_offset,
+             int core_compression_level)
 {
-    static int initialized = 0;
-    static scan_table lutex_scan_table;
-
-    if (!initialized) {
-        int i;
-
-        /* allocate a little space to get started */
-        lutex_addresses = malloc(16*sizeof(void *));
-        gc_assert(lutex_addresses);
-        max_lutexes = 16;
-
-        /* initialize the mapping table */
-        for(i = 0; i < ((sizeof lutex_scan_table)/(sizeof lutex_scan_table[0])); ++i) {
-            lutex_scan_table[i] = default_scan_action;
-        }
-
-        lutex_scan_table[LUTEX_WIDETAG] = lutex_scan_action;
-
-        initialized = 1;
-    }
-
-    /* do the scan */
-    scan_objects(addr, n_words, lutex_scan_table);
-}
-#endif
-
-static void
-output_space(FILE *file, int id, lispobj *addr, lispobj *end, os_vm_offset_t file_offset)
-{
-    size_t words, bytes, data;
+    size_t words, bytes, data, compressed_flag;
     static char *names[] = {NULL, "dynamic", "static", "read-only"};
 
-    write_lispobj(id, file);
+    compressed_flag
+            = ((core_compression_level != COMPRESSION_LEVEL_NONE)
+               ? DEFLATED_CORE_SPACE_ID_FLAG : 0);
+
+    write_lispobj(id | compressed_flag, file);
     words = end - addr;
     write_lispobj(words, file);
 
     bytes = words * sizeof(lispobj);
 
-#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_LUTEX)
-    printf("scanning space for lutexes...\n");
-    scan_for_lutexes((char *)addr, words);
-#endif
+    printf("writing %lu bytes from the %s space at 0x%p\n",
+           bytes, names[id], addr);
 
-    printf("writing %lu bytes from the %s space at 0x%08lx\n",
-           (unsigned long)bytes, names[id], (unsigned long)addr);
-
-    data = write_bytes(file, (char *)addr, bytes, file_offset);
+    data = write_and_compress_bytes(file, (char *)addr, bytes, file_offset,
+                                    core_compression_level);
 
     write_lispobj(data, file);
-    write_lispobj((long)addr / os_vm_page_size, file);
+    write_lispobj((uword_t)addr / os_vm_page_size, file);
     write_lispobj((bytes + os_vm_page_size - 1) / os_vm_page_size, file);
 }
 
@@ -219,7 +214,8 @@ open_core_for_saving(char *filename)
 boolean
 save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                    boolean make_executable,
-                   boolean save_runtime_options)
+                   boolean save_runtime_options,
+                   int core_compression_level)
 {
     struct thread *th;
     os_vm_offset_t core_start_pos;
@@ -269,12 +265,14 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  READ_ONLY_CORE_SPACE_ID,
                  (lispobj *)READ_ONLY_SPACE_START,
                  (lispobj *)SymbolValue(READ_ONLY_SPACE_FREE_POINTER,0),
-                 core_start_pos);
+                 core_start_pos,
+                 core_compression_level);
     output_space(file,
                  STATIC_CORE_SPACE_ID,
                  (lispobj *)STATIC_SPACE_START,
                  (lispobj *)SymbolValue(STATIC_SPACE_FREE_POINTER,0),
-                 core_start_pos);
+                 core_start_pos,
+                 core_compression_level);
 #ifdef LISP_FEATURE_GENCGC
     /* Flush the current_region, updating the tables. */
     gc_alloc_update_all_page_tables();
@@ -286,20 +284,23 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  DYNAMIC_CORE_SPACE_ID,
                  (lispobj *)DYNAMIC_SPACE_START,
                  dynamic_space_free_pointer,
-                 core_start_pos);
+                 core_start_pos,
+                 core_compression_level);
 #else
     output_space(file,
                  DYNAMIC_CORE_SPACE_ID,
                  (lispobj *)current_dynamic_space,
                  dynamic_space_free_pointer,
-                 core_start_pos);
+                 core_start_pos,
+                 core_compression_level);
 #endif
 #else
     output_space(file,
                  DYNAMIC_CORE_SPACE_ID,
                  (lispobj *)DYNAMIC_SPACE_START,
                  (lispobj *)SymbolValue(ALLOCATION_POINTER,0),
-                 core_start_pos);
+                 core_start_pos,
+                 core_compression_level);
 #endif
 
     write_lispobj(INITIAL_FUN_CORE_ENTRY_TYPE_CODE, file);
@@ -308,13 +309,13 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
 
 #ifdef LISP_FEATURE_GENCGC
     {
-        size_t size = (last_free_page*sizeof(long)+os_vm_page_size-1)
+        size_t size = (last_free_page*sizeof(sword_t)+os_vm_page_size-1)
             &~(os_vm_page_size-1);
-        unsigned long *data = calloc(size, 1);
+        uword_t *data = calloc(size, 1);
         if (data) {
-            unsigned long word;
-            long offset;
-            int i;
+            uword_t word;
+            sword_t offset;
+            page_index_t i;
             for (i = 0; i < last_free_page; i++) {
                 /* Thanks to alignment requirements, the two low bits
                  * are always zero, so we can use them to store the
@@ -330,24 +331,6 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
             offset = write_bytes(file, (char *)data, size, core_start_pos);
             write_lispobj(offset, file);
         }
-    }
-#endif
-
-#if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_SB_LUTEX)
-    if(n_lutexes > 0) {
-        long offset;
-        printf("writing %ld lutexes to the core...\n", n_lutexes);
-        write_lispobj(LUTEX_TABLE_CORE_ENTRY_TYPE_CODE, file);
-        /* word count of the entry */
-        write_lispobj(4, file);
-        /* indicate how many lutexes we saved */
-        write_lispobj(n_lutexes, file);
-        /* save the lutexes */
-        offset = write_bytes(file, (char *) lutex_addresses,
-                             n_lutexes * sizeof(*lutex_addresses),
-                             core_start_pos);
-
-        write_lispobj(offset, file);
     }
 #endif
 
@@ -383,6 +366,25 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     exit(0);
 }
 
+/* Check if the build_id for the current runtime is present in a
+ * buffer. */
+int
+check_runtime_build_id(void *buf, size_t size)
+{
+    size_t idlen;
+    char *pos;
+
+    idlen = strlen(build_id) - 1;
+    while ((pos = memchr(buf, build_id[0], size)) != NULL) {
+        size -= (pos + 1) - (char *)buf;
+        buf = (pos + 1);
+        if (idlen <= size && memcmp(buf, build_id + 1, idlen) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
 /* Slurp the executable portion of the runtime into a malloced buffer
  * and return it.  Places the size in bytes of the runtime into
  * 'size_out'.  Returns NULL if the runtime cannot be loaded from
@@ -411,6 +413,12 @@ load_runtime(char *runtime_path, size_t *size_out)
     buf = successful_malloc(size);
     if ((count = fread(buf, 1, size, input)) != size) {
         fprintf(stderr, "Premature EOF while reading runtime.\n");
+        goto lose;
+    }
+
+    if (!check_runtime_build_id(buf, size)) {
+        fprintf(stderr, "Failed to locate current build_id in runtime: %s\n",
+            runtime_path);
         goto lose;
     }
 
@@ -460,15 +468,19 @@ prepare_to_save(char *filename, boolean prepend_runtime, void **runtime_bytes,
     char *runtime_path;
 
     if (prepend_runtime) {
-        runtime_path = os_get_runtime_executable_path();
+        runtime_path = os_get_runtime_executable_path(0);
 
-        if (runtime_path == NULL) {
+        if (runtime_path == NULL && saved_runtime_path == NULL) {
             fprintf(stderr, "Unable to get default runtime path.\n");
             return NULL;
         }
 
-        *runtime_bytes = load_runtime(runtime_path, runtime_size);
-        free(runtime_path);
+        if (runtime_path == NULL)
+            *runtime_bytes = load_runtime(saved_runtime_path, runtime_size);
+        else {
+            *runtime_bytes = load_runtime(runtime_path, runtime_size);
+            free(runtime_path);
+        }
 
         if (*runtime_bytes == NULL)
             return 0;
@@ -486,7 +498,7 @@ prepare_to_save(char *filename, boolean prepend_runtime, void **runtime_bytes,
 
 boolean
 save(char *filename, lispobj init_function, boolean prepend_runtime,
-     boolean save_runtime_options)
+     boolean save_runtime_options, boolean compressed, int compression_level)
 {
     FILE *file;
     void *runtime_bytes = NULL;
@@ -500,5 +512,6 @@ save(char *filename, lispobj init_function, boolean prepend_runtime,
         save_runtime_to_filehandle(file, runtime_bytes, runtime_size);
 
     return save_to_filehandle(file, filename, init_function, prepend_runtime,
-                              save_runtime_options);
+                              save_runtime_options,
+                              compressed ? compressed : COMPRESSION_LEVEL_NONE);
 }

@@ -248,8 +248,9 @@
   (flag nil)
   ;; some kind of info used by the back end
   (info nil)
-  ;; what macroexpansions happened "in" this block, used for xref
-  (macroexpands nil :type list)
+  ;; what macroexpansions and source transforms happened "in" this block, used
+  ;; for xref
+  (xrefs nil :type list)
   ;; Cache the physenv of a block during lifetime analysis. :NONE if
   ;; no cached value has been stored yet.
   (physenv-cache :none :type (or null physenv (member :none))))
@@ -618,25 +619,27 @@
   ;; the type which values of this leaf have last been defined to have
   ;; (but maybe won't have in future, in case of redefinition)
   (defined-type *universal-type* :type ctype)
-  ;; where the TYPE information came from:
+  ;; where the TYPE information came from (in order, from strongest to weakest):
   ;;  :DECLARED, from a declaration.
-  ;;  :ASSUMED, from uses of the object.
-  ;;  :DEFINED, from examination of the definition.
+  ;;  :DEFINED-HERE, from examination of the definition in the same file.
+  ;;  :DEFINED, from examination of the definition elsewhere.
   ;;  :DEFINED-METHOD, implicit, piecemeal declarations from CLOS.
-  ;; FIXME: This should be a named type. (LEAF-WHERE-FROM? Or
-  ;; perhaps just WHERE-FROM, since it's not just used in LEAF,
-  ;; but also in various DEFINE-INFO-TYPEs in globaldb.lisp,
-  ;; and very likely elsewhere too.)
-  (where-from :assumed :type (member :declared :assumed :defined :defined-method))
+  ;;  :ASSUMED, from uses of the object.
+  (where-from :assumed :type (member :declared :assumed :defined-here :defined :defined-method))
   ;; list of the REF nodes for this leaf
   (refs () :type list)
   ;; true if there was ever a REF or SET node for this leaf. This may
   ;; be true when REFS and SETS are null, since code can be deleted.
   (ever-used nil :type boolean)
   ;; is it declared dynamic-extent, or truly-dynamic-extent?
-  (dynamic-extent nil :type (member nil t :truly))
+  (extent nil :type (member nil :maybe-dynamic :always-dynamic :indefinite))
   ;; some kind of info used by the back end
   (info nil))
+
+(defun leaf-dynamic-extent (leaf)
+  (let ((extent (leaf-extent leaf)))
+    (unless (member extent '(nil :indefinite))
+      extent)))
 
 ;;; LEAF name operations
 ;;;
@@ -673,7 +676,9 @@
                                                    (where-from :defined)))
                       (:include leaf))
   ;; the value of the constant
-  (value (missing-arg) :type t))
+  (value (missing-arg) :type t)
+  ;; Boxed TN for this constant, if any.
+  (boxed-tn nil :type (or null tn)))
 (defprinter (constant :identity t)
   value)
 
@@ -694,6 +699,7 @@
   %source-name
   #!+sb-show id
   (type :test (not (eq type *universal-type*)))
+  (defined-type :test (not (eq defined-type *universal-type*)))
   (where-from :test (not (eq where-from :assumed)))
   kind)
 
@@ -1074,6 +1080,9 @@
   ;; the default for a keyword or optional, represented as the
   ;; original Lisp code. This is set to NIL in &KEY arguments that are
   ;; defaulted using the SUPPLIED-P arg.
+  ;;
+  ;; For &REST arguments this may contain information about more context
+  ;; the rest list comes from.
   (default nil :type t)
   ;; the actual key for a &KEY argument. Note that in ANSI CL this is
   ;; not necessarily a keyword: (DEFUN FOO (&KEY ((BAR BAR))) ...).
@@ -1101,7 +1110,17 @@
   ;; This is set by physical environment analysis if it chooses an
   ;; indirect (value cell) representation for this variable because it
   ;; is both set and closed over.
-  indirect)
+  indirect
+  ;; true if the last reference has been deleted (and new references
+  ;; should not be made)
+  deleted
+  ;; This is set by physical environment analysis if, should it be an
+  ;; indirect lambda-var, an actual value cell object must be
+  ;; allocated for this variable because one or more of the closures
+  ;; that refer to it are not dynamic-extent.  Note that both
+  ;; attributes must be set for the value-cell object to be created.
+  explicit-value-cell
+  )
 
 (def!struct (lambda-var (:include basic-var))
   (flags (lambda-var-attributes)
@@ -1123,6 +1142,14 @@
   ;; determine that this is a set closure variable, and is thus not a
   ;; good subject for flow analysis.
   (constraints nil :type (or null t #| FIXME: conset |#))
+  ;; Content-addressed indices for the CONSTRAINTs on this variable.
+  ;; These are solely used by FIND-CONSTRAINT
+  (ctype-constraints nil :type (or null hash-table))
+  (eq-constraints    nil :type (or null hash-table))
+  ;; sorted sets of constraints we like to iterate over
+  (eql-var-constraints     nil :type (or null (array t 1)))
+  (inheritable-constraints nil :type (or null (array t 1)))
+  (private-constraints     nil :type (or null (array t 1)))
   ;; Initial type of a LET variable as last seen by PROPAGATE-FROM-SETS.
   (last-initial-type *universal-type* :type ctype)
   ;; The FOP handle of the lexical variable represented by LAMBDA-VAR
@@ -1142,6 +1169,10 @@
   `(lambda-var-attributep (lambda-var-flags ,var) ignore))
 (defmacro lambda-var-indirect (var)
   `(lambda-var-attributep (lambda-var-flags ,var) indirect))
+(defmacro lambda-var-deleted (var)
+  `(lambda-var-attributep (lambda-var-flags ,var) deleted))
+(defmacro lambda-var-explicit-value-cell (var)
+  `(lambda-var-attributep (lambda-var-flags ,var) explicit-value-cell))
 
 ;;;; basic node types
 
@@ -1226,6 +1257,8 @@
   (kind :full :type (member :local :full :error :known))
   ;; if a call to a known global function, contains the FUN-INFO.
   (fun-info nil :type (or fun-info null))
+  ;; Untrusted type we have asserted for this combination.
+  (type-validated-for-leaf nil)
   ;; some kind of information attached to this node by the back end
   (info nil)
   (step-info))

@@ -56,14 +56,7 @@
 (defevent make-value-cell-event "Allocate heap value cell for lexical var.")
 (defun emit-make-value-cell (node block value res)
   (event make-value-cell-event node)
-  (let* ((leaf (tn-leaf res))
-         (dx (when leaf (leaf-dynamic-extent leaf))))
-    (when (and dx (neq :truly dx) (leaf-has-source-name-p leaf))
-      (compiler-notify "cannot stack allocate value cell for ~S" (leaf-source-name leaf)))
-    (vop make-value-cell node block value
-         ;; FIXME: See bug 419
-         (eq :truly dx)
-         res)))
+  (vop make-value-cell node block value nil res))
 
 ;;;; leaf reference
 
@@ -98,29 +91,41 @@
 
 ;;; If LEAF already has a constant TN, return that, otherwise make a
 ;;; TN for it.
-(defun constant-tn (leaf)
+(defun constant-tn (leaf boxedp)
   (declare (type constant leaf))
-  (or (leaf-info leaf)
-      (setf (leaf-info leaf)
-            (make-constant-tn leaf))))
+  ;; When convenient we can have both a boxed and unboxed TN for
+  ;; constant.
+  (if boxedp
+      (or (constant-boxed-tn leaf)
+          (setf (constant-boxed-tn leaf) (make-constant-tn leaf t)))
+      (or (leaf-info leaf)
+          (setf (leaf-info leaf) (make-constant-tn leaf nil)))))
 
 ;;; Return a TN that represents the value of LEAF, or NIL if LEAF
 ;;; isn't directly represented by a TN. ENV is the environment that
 ;;; the reference is done in.
-(defun leaf-tn (leaf env)
+(defun leaf-tn (leaf env boxedp)
   (declare (type leaf leaf) (type physenv env))
   (typecase leaf
     (lambda-var
      (unless (lambda-var-indirect leaf)
        (find-in-physenv leaf env)))
-    (constant (constant-tn leaf))
+    (constant (constant-tn leaf boxedp))
     (t nil)))
 
 ;;; This is used to conveniently get a handle on a constant TN during
 ;;; IR2 conversion. It returns a constant TN representing the Lisp
 ;;; object VALUE.
 (defun emit-constant (value)
-  (constant-tn (find-constant value)))
+  (constant-tn (find-constant value) t))
+
+(defun boxed-ref-p (ref)
+  (let ((dest (lvar-dest (ref-lvar ref))))
+    (cond ((and (basic-combination-p dest) (eq :full (basic-combination-kind dest)))
+           t)
+          ;; Other cases?
+          (t
+           nil))))
 
 ;;; Convert a REF node. The reference must not be delayed.
 (defun ir2-convert-ref (node block)
@@ -132,12 +137,23 @@
          (res (first locs)))
     (etypecase leaf
       (lambda-var
-       (let ((tn (find-in-physenv leaf (node-physenv node))))
-         (if (lambda-var-indirect leaf)
-             (vop value-cell-ref node block tn res)
-             (emit-move node block tn res))))
+       (let ((tn (find-in-physenv leaf (node-physenv node)))
+             (indirect (lambda-var-indirect leaf))
+             (explicit (lambda-var-explicit-value-cell leaf)))
+         (cond
+          ((and indirect explicit)
+           (vop value-cell-ref node block tn res))
+          ((and indirect
+                (not (eq (node-physenv node)
+                         (lambda-physenv (lambda-var-home leaf)))))
+           (let ((reffer (third (primitive-type-indirect-cell-type
+                                 (primitive-type (leaf-type leaf))))))
+             (if reffer
+                 (funcall reffer node block tn (leaf-info leaf) res)
+                 (vop ancestor-frame-ref node block tn (leaf-info leaf) res))))
+          (t (emit-move node block tn res)))))
       (constant
-       (emit-move node block (constant-tn leaf) res))
+       (emit-move node block (constant-tn leaf (boxed-ref-p node)) res))
       (functional
        (ir2-convert-closure node block leaf res))
       (global-var
@@ -239,6 +255,21 @@
              (emit-move ref ir2-block entry res)))))
   (values))
 
+(defun closure-initial-value (what this-env current-fp)
+  (declare (type (or nlx-info lambda-var clambda) what)
+           (type physenv this-env)
+           (type (or tn null) current-fp))
+  ;; If we have an indirect LAMBDA-VAR that does not require an
+  ;; EXPLICIT-VALUE-CELL, and is from this environment (not from being
+  ;; closed over), we need to store the current frame pointer.
+  (if (and (lambda-var-p what)
+           (lambda-var-indirect what)
+           (not (lambda-var-explicit-value-cell what))
+           (eq (lambda-physenv (lambda-var-home what))
+               this-env))
+    current-fp
+    (find-in-physenv what this-env)))
+
 (defoptimizer (%allocate-closures ltn-annotate) ((leaves) node ltn-policy)
   ltn-policy ; a hack to effectively (DECLARE (IGNORE LTN-POLICY))
   (when (lvar-dynamic-extent leaves)
@@ -280,11 +311,16 @@
                     ;; putting of all closures after all creations
                     ;; (though it may require more registers).
                     (if (lambda-p what)
-                        (delayed (list tn (find-in-physenv what this-env) n))
-                        (vop closure-init call 2block
-                             tn
-                             (find-in-physenv what this-env)
-                             n)))))))
+                      (delayed (list tn (find-in-physenv what this-env) n))
+                      (let ((initial-value (closure-initial-value
+                                            what this-env nil)))
+                        (if initial-value
+                          (vop closure-init call 2block
+                               tn initial-value n)
+                          ;; An initial-value of NIL means to stash
+                          ;; the frame pointer... which requires a
+                          ;; different VOP.
+                          (vop closure-init-from-fp call 2block tn n)))))))))
       (loop for (tn what n) in (delayed)
             do (vop closure-init call 2block
                     tn what n))))
@@ -306,10 +342,21 @@
     (etypecase leaf
       (lambda-var
        (when (leaf-refs leaf)
-         (let ((tn (find-in-physenv leaf (node-physenv node))))
-           (if (lambda-var-indirect leaf)
-               (vop value-cell-set node block tn val)
-               (emit-move node block val tn)))))
+         (let ((tn (find-in-physenv leaf (node-physenv node)))
+               (indirect (lambda-var-indirect leaf))
+               (explicit (lambda-var-explicit-value-cell leaf)))
+           (cond
+            ((and indirect explicit)
+             (vop value-cell-set node block tn val))
+            ((and indirect
+                  (not (eq (node-physenv node)
+                           (lambda-physenv (lambda-var-home leaf)))))
+             (let ((setter (fourth (primitive-type-indirect-cell-type
+                                    (primitive-type (leaf-type leaf))))))
+             (if setter
+                 (funcall setter node block tn val (leaf-info leaf))
+                 (vop ancestor-frame-set node block tn val (leaf-info leaf)))))
+            (t (emit-move node block val tn))))))
       (global-var
        (aver (symbolp (leaf-source-name leaf)))
        (ecase (global-var-kind leaf)
@@ -343,7 +390,7 @@
           (ecase (ir2-lvar-kind 2lvar)
             (:delayed
              (let ((ref (lvar-uses lvar)))
-               (leaf-tn (ref-leaf ref) (node-physenv ref))))
+               (leaf-tn (ref-leaf ref) (node-physenv ref) (boxed-ref-p ref))))
             (:fixed
              (aver (= (length (ir2-lvar-locs 2lvar)) 1))
              (first (ir2-lvar-locs 2lvar)))))
@@ -387,7 +434,7 @@
 ;;; an lvar.
 ;;;
 ;;; If the lvar isn't annotated (meaning the values are discarded) or
-;;; is unknown-values, the then we make temporaries for each supplied
+;;; is unknown-values, then we make temporaries for each supplied
 ;;; value, providing a place to compute the result in until we decide
 ;;; what to do with it (if anything.)
 ;;;
@@ -436,7 +483,7 @@
 
 ;;; Return a list of TNs wired to the standard value passing
 ;;; conventions that can be used to receive values according to the
-;;; unknown-values convention. This is used with together
+;;; unknown-values convention. This is used together with
 ;;; MOVE-LVAR-RESULT for delivering unknown values to a fixed values
 ;;; lvar.
 ;;;
@@ -494,7 +541,7 @@
 ;;; If necessary, emit coercion code needed to deliver the RESULTS to
 ;;; the specified lvar. NODE and BLOCK provide context for emitting
 ;;; code. Although usually obtained from STANDARD-RESULT-TNs or
-;;; LVAR-RESULT-TNs, RESULTS my be a list of any type or
+;;; LVAR-RESULT-TNs, RESULTS may be a list of any type or
 ;;; number of TNs.
 ;;;
 ;;; If the lvar is fixed values, then move the results into the lvar
@@ -604,13 +651,15 @@
            (emit-template node block template args nil
                           (list* (block-label consequent) not-p
                                  info-args))
-           (unless (drop-thru-p if alternative)
-             (vop branch node block (block-label alternative))))
+           (if (drop-thru-p if alternative)
+               (register-drop-thru alternative)
+               (vop branch node block (block-label alternative))))
           (t
            (emit-template node block template args nil info-args)
            (vop branch-if node block (block-label consequent) flags not-p)
-           (unless (drop-thru-p if alternative)
-             (vop branch node block (block-label alternative)))))))
+           (if (drop-thru-p if alternative)
+               (register-drop-thru alternative)
+               (vop branch node block (block-label alternative)))))))
 
 ;;; Convert an IF that isn't the DEST of a conditional template.
 (defun ir2-convert-if (node block)
@@ -630,7 +679,7 @@
   (let* ((type (node-derived-type call))
          (types
           (mapcar #'primitive-type
-                  (if (values-type-p type)
+                  (if (args-type-p type)
                       (append (args-type-required type)
                               (args-type-optional type))
                       (list type))))
@@ -737,7 +786,8 @@
           (when arg
             (let ((src (lvar-tn node block arg))
                   (dest (leaf-info var)))
-              (if (lambda-var-indirect var)
+              (if (and (lambda-var-indirect var)
+                       (lambda-var-explicit-value-cell var))
                   (emit-make-value-cell node block src dest)
                   (emit-move node block src dest)))))
         (lambda-vars fun) (basic-combination-args node))
@@ -755,9 +805,15 @@
 ;;; OLD-FP. If null, then the call is to the same environment (an
 ;;; :ASSIGNMENT), so we only move the arguments, and leave the
 ;;; environment alone.
-(defun emit-psetq-moves (node block fun old-fp)
+;;;
+;;; CLOSURE-FP is for calling a closure that has "implicit" value
+;;; cells (stored in the allocating stack frame), and is the frame
+;;; pointer TN to use for values allocated in the outbound stack
+;;; frame.  This is distinct from OLD-FP for the specific case of a
+;;; tail-local-call.
+(defun emit-psetq-moves (node block fun old-fp &optional (closure-fp old-fp))
   (declare (type combination node) (type ir2-block block) (type clambda fun)
-           (type (or tn null) old-fp))
+           (type (or tn null) old-fp closure-fp))
   (let ((actuals (mapcar (lambda (x)
                            (when x
                              (lvar-tn node block x)))
@@ -769,7 +825,8 @@
               (loc (leaf-info var)))
           (when actual
             (cond
-             ((lambda-var-indirect var)
+             ((and (lambda-var-indirect var)
+                   (lambda-var-explicit-value-cell var))
               (let ((temp
                      (make-normal-tn *backend-t-primitive-type*)))
                 (emit-make-value-cell node block actual temp)
@@ -786,7 +843,7 @@
         (let ((this-1env (node-physenv node))
               (called-env (physenv-info (lambda-physenv fun))))
           (dolist (thing (ir2-physenv-closure called-env))
-            (temps (find-in-physenv (car thing) this-1env))
+            (temps (closure-initial-value (car thing) this-1env closure-fp))
             (locs (cdr thing)))
           (temps old-fp)
           (locs (ir2-physenv-old-fp called-env))))
@@ -799,9 +856,16 @@
 ;;; function's passing location.
 (defun ir2-convert-tail-local-call (node block fun)
   (declare (type combination node) (type ir2-block block) (type clambda fun))
-  (let ((this-env (physenv-info (node-physenv node))))
+  (let ((this-env (physenv-info (node-physenv node)))
+        (current-fp (make-stack-pointer-tn)))
     (multiple-value-bind (temps locs)
-        (emit-psetq-moves node block fun (ir2-physenv-old-fp this-env))
+        (emit-psetq-moves node block fun
+                          (ir2-physenv-old-fp this-env) current-fp)
+
+      ;; If we're about to emit a move from CURRENT-FP then we need to
+      ;; initialize it.
+      (when (find current-fp temps)
+        (vop current-fp node block current-fp))
 
       (mapc (lambda (temp loc)
               (emit-move node block temp loc))
@@ -905,7 +969,7 @@
           ((node-tail-p node)
            (ir2-convert-tail-local-call node block fun))
           (t
-           (let ((start (block-label (lambda-block fun)))
+           (let ((start (block-trampoline (lambda-block fun)))
                  (returns (tail-set-info (lambda-tail-set fun)))
                  (lvar (node-lvar node)))
              (ecase (if returns
@@ -1162,7 +1226,8 @@
           (when (leaf-refs arg)
             (let ((pass (standard-arg-location n))
                   (home (leaf-info arg)))
-              (if (lambda-var-indirect arg)
+              (if (and (lambda-var-indirect arg)
+                       (lambda-var-explicit-value-cell arg))
                   (emit-make-value-cell node block pass home)
                   (emit-move node block pass home))))
           (incf n))))
@@ -1207,7 +1272,10 @@
 
     (let ((lab (gen-label)))
       (setf (ir2-physenv-environment-start env) lab)
-      (vop note-environment-start node block lab)))
+      (vop note-environment-start node block lab)
+      #!+sb-safepoint
+      (unless (policy fun (>= inhibit-safepoints 2))
+        (vop sb!vm::insert-safepoint node block))))
 
   (values))
 
@@ -1301,7 +1369,8 @@
     (mapc (lambda (src var)
             (when (leaf-refs var)
               (let ((dest (leaf-info var)))
-                (if (lambda-var-indirect var)
+                (if (and (lambda-var-indirect var)
+                         (lambda-var-explicit-value-cell var))
                     (emit-make-value-cell node block src dest)
                     (emit-move node block src dest)))))
           (lvar-tns node block lvar
@@ -1428,7 +1497,17 @@
   (binding* ((lvar (node-lvar node) :exit-if-null)
              (2lvar (lvar-info lvar)))
     (ecase (ir2-lvar-kind 2lvar)
-      (:fixed (ir2-convert-full-call node block))
+      (:fixed
+       ;; KLUDGE: this is very much unsafe, and can leak random stack values.
+       ;; OTOH, I think the :FIXED case can only happen with (safety 0) in the
+       ;; first place.
+       ;;  -PK
+       (loop for loc in (ir2-lvar-locs 2lvar)
+             for idx upfrom 0
+             do (vop sb!vm::more-arg node block
+                     (lvar-tn node block context)
+                     (emit-constant idx)
+                     loc)))
       (:unknown
        (let ((locs (ir2-lvar-locs 2lvar)))
          (vop* %more-arg-values node block
@@ -1463,8 +1542,7 @@
              (progn
                (labels ((,unbind (vars)
                           (declare (optimize (speed 2) (debug 0)))
-                          (let ((unbound-marker (%primitive make-other-immediate-type
-                                                            0 sb!vm:unbound-marker-widetag)))
+                          (let ((unbound-marker (%primitive make-unbound-marker)))
                             (dolist (var vars)
                               ;; CLHS says "bound and then made to have no value" -- user
                               ;; should not be able to tell the difference between that and this.
@@ -1729,6 +1807,22 @@
                        2block
                        #!+sb-dyncount *dynamic-counts-tn* #!-sb-dyncount nil
                        num))))
+              #!+sb-safepoint
+              (let ((first-node (block-start-node block)))
+                (unless (or (and (bind-p first-node)
+                                 (xep-p (bind-lambda first-node)))
+                            (and (valued-node-p first-node)
+                                 (node-lvar first-node)
+                                 (eq (lvar-fun-name
+                                      (node-lvar first-node))
+                                     '%nlx-entry)))
+                  (when (and (rest (block-pred block))
+                             (block-loop block)
+                             (member (loop-kind (block-loop block))
+                                     '(:natural :strange))
+                             (eq block (loop-head (block-loop block)))
+                             (policy first-node (< inhibit-safepoints 2)))
+                    (vop sb!vm::insert-safepoint first-node 2block))))
             (ir2-convert-block block)
             (incf num))))))
   (values))
@@ -1765,7 +1859,9 @@
                                 (aver (not named))
                                 tn)))))))
               ((not (eq (ir2-block-next 2block) (block-info target)))
-               (vop branch last 2block (block-label target)))))))
+               (vop branch last 2block (block-label target)))
+              (t
+               (register-drop-thru target))))))
 
   (values))
 

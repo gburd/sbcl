@@ -224,6 +224,7 @@
                               ;; This seems silly, is there something better?
                               '(integer 0 (0))))))
 
+(declaim (ftype (function (t t t) nil) sequence-bounding-indices-bad-error))
 (defun sequence-bounding-indices-bad-error (sequence start end)
   (let ((size (length sequence)))
     (error 'bounding-indices-bad-error
@@ -232,6 +233,7 @@
                                  (integer ,start ,size))
            :object sequence)))
 
+(declaim (ftype (function (t t t) nil) array-bounding-indices-bad-error))
 (defun array-bounding-indices-bad-error (array start end)
   (let ((size (array-total-size array)))
     (error 'bounding-indices-bad-error
@@ -239,6 +241,16 @@
            :expected-type `(cons (integer 0 ,size)
                                  (integer ,start ,size))
            :object array)))
+
+(declaim (ftype (function (t) nil) circular-list-error))
+(defun circular-list-error (list)
+  (let ((*print-circle* t))
+    (error 'simple-type-error
+           :format-control "List is circular:~%  ~S"
+           :format-arguments (list list)
+           :datum list
+           :type '(and list (satisfies list-length)))))
+
 
 (defun elt (sequence index)
   #!+sb-doc "Return the element of SEQUENCE specified by INDEX."
@@ -284,20 +296,22 @@
   "Return a sequence of the given TYPE and LENGTH, with elements initialized
   to INITIAL-ELEMENT."
   (declare (fixnum length))
-  (let* ((adjusted-type
-          (typecase type
+  (let* ((expanded-type (typexpand type))
+         (adjusted-type
+          (typecase expanded-type
             (atom (cond
-                    ((eq type 'string) '(vector character))
-                    ((eq type 'simple-string) '(simple-array character (*)))
+                    ((eq expanded-type 'string) '(vector character))
+                    ((eq expanded-type 'simple-string)
+                     '(simple-array character (*)))
                     (t type)))
             (cons (cond
-                    ((eq (car type) 'string) `(vector character ,@(cdr type)))
-                    ((eq (car type) 'simple-string)
-                     `(simple-array character ,(if (cdr type)
-                                                   (cdr type)
+                    ((eq (car expanded-type) 'string)
+                     `(vector character ,@(cdr expanded-type)))
+                    ((eq (car expanded-type) 'simple-string)
+                     `(simple-array character ,(if (cdr expanded-type)
+                                                   (cdr expanded-type)
                                                    '(*))))
-                    (t type)))
-            (t type)))
+                    (t type)))))
          (type (specifier-type adjusted-type)))
     (cond ((csubtypep type (specifier-type 'list))
            (cond
@@ -360,42 +374,27 @@
 
 ;;;; SUBSEQ
 ;;;;
+
+(define-array-dispatch vector-subseq-dispatch (array start end)
+  (declare (optimize speed (safety 0)))
+  (declare (type index start end))
+  (subseq array start end))
+
 ;;;; The support routines for SUBSEQ are used by compiler transforms,
 ;;;; so we worry about dealing with END being supplied or defaulting
 ;;;; to NIL at this level.
 
-(defun string-subseq* (sequence start end)
-  (with-array-data ((data sequence)
-                    (start start)
-                    (end end)
-                    :force-inline t
-                    :check-fill-pointer t)
-    (declare (optimize (speed 3) (safety 0)))
-    (string-dispatch ((simple-array character (*))
-                      (simple-array base-char (*))
-                      (vector nil))
-        data
-        (subseq data start end))))
-
 (defun vector-subseq* (sequence start end)
   (declare (type vector sequence))
   (declare (type index start)
-           (type (or null index) end))
+           (type (or null index) end)
+           (optimize speed))
   (with-array-data ((data sequence)
                     (start start)
                     (end end)
                     :check-fill-pointer t
                     :force-inline t)
-    (let* ((copy (%make-sequence-like sequence (- end start)))
-           (setter (!find-data-vector-setter copy))
-           (reffer (!find-data-vector-reffer data)))
-      (declare (optimize (speed 3) (safety 0)))
-      (do ((old-index start (1+ old-index))
-           (new-index 0 (1+ new-index)))
-          ((= old-index end) copy)
-        (declare (index old-index new-index))
-        (funcall setter copy new-index
-                 (funcall reffer data old-index))))))
+    (vector-subseq-dispatch data start end)))
 
 (defun list-subseq* (sequence start end)
   (declare (type list sequence)
@@ -667,8 +666,13 @@
 (define-sequence-traverser replace
     (sequence1 sequence2 &rest args &key start1 end1 start2 end2)
   #!+sb-doc
-  "The target sequence is destructively modified by copying successive
-   elements into it from the source sequence."
+  "Destructively modifies SEQUENCE1 by copying successive elements
+into it from the SEQUENCE2.
+
+Elements are copied to the subseqeuence bounded by START1 and END1,
+from the subsequence bounded by START2 and END2. If these subsequences
+are not of the same length, then the shorter length determines how
+many elements are copied."
   (declare (truly-dynamic-extent args))
   (let* (;; KLUDGE: absent either rewriting FOO-REPLACE-FROM-BAR, or
          ;; excessively polluting DEFINE-SEQUENCE-TRAVERSER, we rebind
@@ -778,7 +782,7 @@
         (let ((,sequence ,s))
           (seq-dispatch ,sequence
             (dolist (,e ,sequence ,return) ,@body)
-            (dovector (,e ,sequence ,return) ,@body)
+            (do-vector-data (,e ,sequence ,return) ,@body)
             (multiple-value-bind (state limit from-end step endp elt)
                 (sb!sequence:make-sequence-iterator ,sequence)
               (do ((state state (funcall step ,sequence state from-end)))
@@ -791,87 +795,82 @@
                   ,@decls
                   (tagbody
                      ,@forms))))))))))
-
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro concatenate-to-list (sequences)
-  `(let ((result (list nil)))
-     (do ((sequences ,sequences (cdr sequences))
-          (splice result))
-         ((null sequences) (cdr result))
-       (let ((sequence (car sequences)))
-         (sb!sequence:dosequence (e sequence)
-           (setq splice (cdr (rplacd splice (list e)))))))))
-
-(sb!xc:defmacro concatenate-to-mumble (output-type-spec sequences)
-  `(do ((seqs ,sequences (cdr seqs))
-        (total-length 0)
-        (lengths ()))
-       ((null seqs)
-        (do ((sequences ,sequences (cdr sequences))
-             (lengths lengths (cdr lengths))
-             (index 0)
-             (result (make-sequence ,output-type-spec total-length)))
-            ((= index total-length) result)
-          (declare (fixnum index))
-          (let ((sequence (car sequences)))
-            (sb!sequence:dosequence (e sequence)
-              (setf (aref result index) e)
-              (incf index)))))
-     (let ((length (length (car seqs))))
-       (declare (fixnum length))
-       (setq lengths (nconc lengths (list length)))
-       (setq total-length (+ total-length length)))))
-
-) ; EVAL-WHEN
 
 (defun concatenate (output-type-spec &rest sequences)
   #!+sb-doc
   "Return a new sequence of all the argument sequences concatenated together
   which shares no structure with the original argument sequences of the
   specified OUTPUT-TYPE-SPEC."
-  (let ((type (specifier-type output-type-spec)))
-  (cond
-    ((csubtypep type (specifier-type 'list))
-     (cond
-       ((type= type (specifier-type 'list))
-        (apply #'concat-to-list* sequences))
-       ((eq type *empty-type*)
-        (bad-sequence-type-error nil))
-       ((type= type (specifier-type 'null))
-        (if (every (lambda (x) (or (null x)
-                                   (and (vectorp x) (= (length x) 0))))
-                   sequences)
-            'nil
-            (sequence-type-length-mismatch-error
-             type
-             ;; FIXME: circular list issues.
-             (reduce #'+ sequences :key #'length))))
-       ((cons-type-p type)
-        (multiple-value-bind (min exactp)
-            (sb!kernel::cons-type-length-info type)
-          (let ((length (reduce #'+ sequences :key #'length)))
-            (if exactp
-                (unless (= length min)
-                  (sequence-type-length-mismatch-error type length))
-                (unless (>= length min)
-                  (sequence-type-length-mismatch-error type length)))
-            (apply #'concat-to-list* sequences))))
-       (t (sequence-type-too-hairy (type-specifier type)))))
-    ((csubtypep type (specifier-type 'vector))
-     (apply #'concat-to-simple* output-type-spec sequences))
-    ((and (csubtypep type (specifier-type 'sequence))
-          (find-class output-type-spec nil))
-     (coerce (apply #'concat-to-simple* 'vector sequences) output-type-spec))
-    (t
-     (bad-sequence-type-error output-type-spec)))))
+  (flet ((concat-to-list* (sequences)
+           (let ((result (list nil)))
+             (do ((sequences sequences (cdr sequences))
+                  (splice result))
+                 ((null sequences) (cdr result))
+               (let ((sequence (car sequences)))
+                 (sb!sequence:dosequence (e sequence)
+                   (setq splice (cdr (rplacd splice (list e)))))))))
+         (concat-to-simple* (type-spec sequences)
+           (do ((seqs sequences (cdr seqs))
+                (total-length 0)
+                (lengths ()))
+               ((null seqs)
+                (do ((sequences sequences (cdr sequences))
+                     (lengths lengths (cdr lengths))
+                     (index 0)
+                     (result (make-sequence type-spec total-length)))
+                    ((= index total-length) result)
+                  (declare (fixnum index))
+                  (let ((sequence (car sequences)))
+                    (sb!sequence:dosequence (e sequence)
+                      (setf (aref result index) e)
+                      (incf index)))))
+             (let ((length (length (car seqs))))
+               (declare (fixnum length))
+               (setq lengths (nconc lengths (list length)))
+               (setq total-length (+ total-length length))))))
+    (let ((type (specifier-type output-type-spec)))
+      (cond
+        ((csubtypep type (specifier-type 'list))
+         (cond
+           ((type= type (specifier-type 'list))
+            (concat-to-list* sequences))
+           ((eq type *empty-type*)
+            (bad-sequence-type-error nil))
+           ((type= type (specifier-type 'null))
+            (if (every (lambda (x) (or (null x)
+                                       (and (vectorp x) (= (length x) 0))))
+                       sequences)
+                'nil
+                (sequence-type-length-mismatch-error
+                 type
+                 ;; FIXME: circular list issues.
+                 (reduce #'+ sequences :key #'length))))
+           ((cons-type-p type)
+            (multiple-value-bind (min exactp)
+                (sb!kernel::cons-type-length-info type)
+              (let ((length (reduce #'+ sequences :key #'length)))
+                (if exactp
+                    (unless (= length min)
+                      (sequence-type-length-mismatch-error type length))
+                    (unless (>= length min)
+                      (sequence-type-length-mismatch-error type length)))
+                (concat-to-list* sequences))))
+           (t (sequence-type-too-hairy (type-specifier type)))))
+        ((csubtypep type (specifier-type 'vector))
+         (concat-to-simple* output-type-spec sequences))
+        ((and (csubtypep type (specifier-type 'sequence))
+              (find-class output-type-spec nil))
+         (coerce (concat-to-simple* 'vector sequences) output-type-spec))
+        (t
+         (bad-sequence-type-error output-type-spec))))))
 
 ;;; Efficient out-of-line concatenate for strings. Compiler transforms
 ;;; CONCATENATE 'STRING &co into these.
 (macrolet ((def (name element-type)
              `(defun ,name (&rest sequences)
                 (declare (dynamic-extent sequences)
-                         (optimize speed))
+                         (optimize speed)
+                         (optimize (sb!c::insert-array-bounds-checks 0)))
                 (let* ((lengths (mapcar #'length sequences))
                        (result (make-array (the integer (apply #'+ lengths))
                                            :element-type ',element-type))
@@ -888,19 +887,8 @@
                   result))))
   (def %concatenate-to-string character)
   (def %concatenate-to-base-string base-char))
-
-;;; internal frobs
-;;; FIXME: These are weird. They're never called anywhere except in
-;;; CONCATENATE. It seems to me that the macros ought to just
-;;; be expanded directly in CONCATENATE, or in CONCATENATE-STRING
-;;; and CONCATENATE-LIST variants. Failing that, these ought to be local
-;;; functions (FLET).
-(defun concat-to-list* (&rest sequences)
-  (concatenate-to-list sequences))
-(defun concat-to-simple* (type &rest sequences)
-  (concatenate-to-mumble type sequences))
 
-;;;; MAP and MAP-INTO
+;;;; MAP
 
 ;;; helper functions to handle arity-1 subcases of MAP
 (declaim (ftype (function (function sequence) list) %map-list-arity-1))
@@ -1064,34 +1052,79 @@
          first-sequence
          more-sequences))
 
-;;; KLUDGE: MAP has been rewritten substantially since the fork from
-;;; CMU CL in order to give reasonable performance, but this
-;;; implementation of MAP-INTO still has the same problems as the old
-;;; MAP code. Ideally, MAP-INTO should be rewritten to be efficient in
-;;; the same way that the corresponding cases of MAP have been
-;;; rewritten. Instead of doing it now, though, it's easier to wait
-;;; until we have DYNAMIC-EXTENT, at which time it should become
-;;; extremely easy to define a reasonably efficient MAP-INTO in terms
-;;; of (MAP NIL ..). -- WHN 20000920
+;;;; MAP-INTO
+
+(defmacro map-into-lambda (sequences params &body body)
+  (check-type sequences symbol)
+  `(flet ((f ,params ,@body))
+     (declare (truly-dynamic-extent #'f))
+     ;; Note (MAP-INTO SEQ (LAMBDA () ...)) is a different animal,
+     ;; hence the awkward flip between MAP and LOOP.
+     (if ,sequences
+         (apply #'map nil #'f ,sequences)
+         (loop (f)))))
+
+(define-array-dispatch vector-map-into (data start end fun sequences)
+  (declare (optimize speed (safety 0))
+           (type index start end)
+           (type function fun)
+           (type list sequences))
+  (let ((index start))
+    (declare (type index index))
+    (block mapping
+      (map-into-lambda sequences (&rest args)
+        (declare (truly-dynamic-extent args))
+        (when (eql index end)
+          (return-from mapping))
+        (setf (aref data index) (apply fun args))
+        (incf index)))
+    index))
+
+;;; Uses the machinery of (MAP NIL ...). For non-vectors we avoid
+;;; computing the length of the result sequence since we can detect
+;;; the end during mapping (if MAP even gets that far).
+;;;
+;;; For each result type, define a mapping function which is
+;;; responsible for replacing RESULT-SEQUENCE elements and for
+;;; terminating itself if the end of RESULT-SEQUENCE is reached.
+;;; The mapping function is defined with MAP-INTO-LAMBDA.
+;;;
+;;; MAP-INTO-LAMBDAs are optimized since they are the inner loops.
+;;; Because we are manually doing bounds checking with known types,
+;;; safety is turned off for vectors and lists but kept for generic
+;;; sequences.
 (defun map-into (result-sequence function &rest sequences)
-  (let* ((fp-result
-          (and (arrayp result-sequence)
-               (array-has-fill-pointer-p result-sequence)))
-         (len (apply #'min
-                     (if fp-result
-                         (array-dimension result-sequence 0)
-                         (length result-sequence))
-                     (mapcar #'length sequences))))
-
-    (when fp-result
-      (setf (fill-pointer result-sequence) len))
-
-    (let ((really-fun (%coerce-callable-to-fun function)))
-      (dotimes (index len)
-        (setf (elt result-sequence index)
-              (apply really-fun
-                     (mapcar (lambda (seq) (elt seq index))
-                             sequences))))))
+  (let ((really-fun (%coerce-callable-to-fun function)))
+    (etypecase result-sequence
+      (vector
+       (with-array-data ((data result-sequence) (start) (end)
+                         ;; MAP-INTO ignores fill pointer when mapping
+                         :check-fill-pointer nil)
+         (let ((new-end (vector-map-into data start end really-fun sequences)))
+           (when (array-has-fill-pointer-p result-sequence)
+             (setf (fill-pointer result-sequence) (- new-end start))))))
+      (list
+       (let ((node result-sequence))
+         (declare (type list node))
+         (map-into-lambda sequences (&rest args)
+           (declare (truly-dynamic-extent args)
+                    (optimize speed (safety 0)))
+           (when (null node)
+             (return-from map-into result-sequence))
+           (setf (car node) (apply really-fun args))
+           (setf node (cdr node)))))
+      (sequence
+       (multiple-value-bind (iter limit from-end)
+           (sb!sequence:make-sequence-iterator result-sequence)
+         (map-into-lambda sequences (&rest args)
+           (declare (truly-dynamic-extent args) (optimize speed))
+           (when (sb!sequence:iterator-endp result-sequence
+                                            iter limit from-end)
+             (return-from map-into result-sequence))
+           (setf (sb!sequence:iterator-element result-sequence iter)
+                 (apply really-fun args))
+           (setf iter (sb!sequence:iterator-step result-sequence
+                                                           iter from-end)))))))
   result-sequence)
 
 ;;;; quantifiers
@@ -1151,7 +1184,7 @@
                 ;; from the old seq.lisp into target-seq.lisp.
                 (define-compiler-macro ,name (pred first-seq &rest more-seqs)
                   (let ((elements (make-gensym-list (1+ (length more-seqs))))
-                        (blockname (gensym "BLOCK")))
+                        (blockname (sb!xc:gensym "BLOCK")))
                     (once-only ((pred pred))
                       `(block ,blockname
                          (map nil
@@ -2186,7 +2219,7 @@
 (macrolet (;; shared logic for defining %FIND-POSITION and
            ;; %FIND-POSITION-IF in terms of various inlineable cases
            ;; of the expression defined in FROB and VECTOR*-FROB
-           (frobs ()
+           (frobs (&optional bit-frob)
              `(seq-dispatch sequence-arg
                (frob sequence-arg from-end)
                (with-array-data ((sequence sequence-arg :offset-var offset)
@@ -2194,14 +2227,28 @@
                                  (end end)
                                  :check-fill-pointer t)
                  (multiple-value-bind (f p)
-                     (macrolet ((frob2 () '(if from-end
-                                            (frob sequence t)
-                                            (frob sequence nil))))
+                     (macrolet ((frob2 () `(if from-end
+                                               (frob sequence t)
+                                               (frob sequence nil))))
                        (typecase sequence
                          #!+sb-unicode
                          ((simple-array character (*)) (frob2))
                          ((simple-array base-char (*)) (frob2))
-                         (t (vector*-frob sequence))))
+                         ,@(when bit-frob
+                             `((simple-bit-vector
+                                (if (and (typep item 'bit)
+                                         (eq #'identity key)
+                                         (or (eq #'eq test)
+                                             (eq #'eql test)
+                                             (eq #'equal test)))
+                                    (let ((p (%bit-position item sequence
+                                                            from-end start end)))
+                                      (if p
+                                          (values item p)
+                                          (values nil nil)))
+                                    (vector*-frob sequence)))))
+                         (t
+                          (vector*-frob sequence))))
                    (declare (type (or index null) p))
                    (values f (and p (the index (- p offset)))))))))
   (defun %find-position (item sequence-arg from-end start end key test)
@@ -2211,7 +2258,7 @@
                (vector*-frob (sequence)
                  `(%find-position-vector-macro item ,sequence
                                                from-end start end key test)))
-      (frobs)))
+      (frobs t)))
   (defun %find-position-if (predicate sequence-arg from-end start end key)
     (macrolet ((frob (sequence from-end)
                  `(%find-position-if predicate ,sequence
