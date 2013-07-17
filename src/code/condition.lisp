@@ -31,8 +31,13 @@
   (class-slots nil :type list)
   ;; report function or NIL
   (report nil :type (or function null))
-  ;; list of alternating initargs and initforms
-  (default-initargs () :type list)
+  ;; list of specifications of the form
+  ;;
+  ;;   (INITARG INITFORM THUNK)
+  ;;
+  ;; where THUNK, when called without arguments, returns the value for
+  ;; INITARG.
+  (direct-default-initargs () :type list)
   ;; class precedence list as a list of CLASS objects, with all
   ;; non-CONDITION classes removed
   (cpl () :type list)
@@ -53,9 +58,6 @@
   :metaclass-name condition-classoid
   :metaclass-constructor make-condition-classoid
   :dd-type structure)
-
-(defun make-condition-object (actual-initargs)
-  (%make-condition-object actual-initargs nil))
 
 (defstruct (condition-slot (:copier nil))
   (name (missing-arg) :type symbol)
@@ -173,16 +175,17 @@
 (defun find-slot-default (class slot)
   (let ((initargs (condition-slot-initargs slot))
         (cpl (condition-classoid-cpl class)))
+    ;; When CLASS or a superclass has a default initarg for SLOT, use
+    ;; that.
     (dolist (class cpl)
-      (let ((default-initargs (condition-classoid-default-initargs class)))
+      (let ((direct-default-initargs
+              (condition-classoid-direct-default-initargs class)))
         (dolist (initarg initargs)
-          (let ((val (getf default-initargs initarg *empty-condition-slot*)))
-            (unless (eq val *empty-condition-slot*)
-              (return-from find-slot-default
-                           (if (functionp val)
-                               (funcall val)
-                               val)))))))
+          (let ((initfunction (third (assoc initarg direct-default-initargs))))
+            (when initfunction
+              (return-from find-slot-default (funcall initfunction)))))))
 
+    ;; Otherwise use the initform of SLOT, if there is one.
     (if (condition-slot-initform-p slot)
         (let ((initform (condition-slot-initform slot)))
           (if (functionp initform)
@@ -233,19 +236,15 @@
 
 ;;;; MAKE-CONDITION
 
-(defun make-condition (type &rest args)
-  #!+sb-doc
-  "Make an instance of a condition object using the specified initargs."
-  ;; Note: ANSI specifies no exceptional situations in this function.
-  ;; signalling simple-type-error would not be wrong.
-  (let* ((type (or (and (symbolp type) (find-classoid type nil))
-                    type))
+(defun allocate-condition (type &rest initargs)
+  (let* ((type (if (symbolp type)
+                   (find-classoid type nil)
+                   type))
          (class (typecase type
                   (condition-classoid type)
                   (class
-                   ;; Punt to CLOS.
-                   (return-from make-condition
-                     (apply #'make-instance type args)))
+                   (return-from allocate-condition
+                     (apply #'allocate-condition (class-name type) initargs)))
                   (classoid
                    (error 'simple-type-error
                           :datum type
@@ -257,25 +256,39 @@
                           :datum type
                           :expected-type 'condition-class
                           :format-control
-                          "~s doesn't designate a condition class."
+                          "~s does not designate a condition class."
                           :format-arguments (list type)))))
-         (res (make-condition-object args)))
-    (setf (%instance-layout res) (classoid-layout class))
+         (condition (%make-condition-object initargs '())))
+    (setf (%instance-layout condition) (classoid-layout class))
+    (values condition class)))
+
+(defun make-condition (type &rest initargs)
+  #!+sb-doc
+  "Make an instance of a condition object using the specified initargs."
+  ;; Note: ANSI specifies no exceptional situations in this function.
+  ;; signalling simple-type-error would not be wrong.
+  (multiple-value-bind (condition class)
+      (apply #'allocate-condition type initargs)
+
     ;; Set any class slots with initargs present in this call.
     (dolist (cslot (condition-classoid-class-slots class))
       (dolist (initarg (condition-slot-initargs cslot))
-        (let ((val (getf args initarg *empty-condition-slot*)))
+        (let ((val (getf initargs initarg *empty-condition-slot*)))
           (unless (eq val *empty-condition-slot*)
             (setf (car (condition-slot-cell cslot)) val)))))
+
     ;; Default any slots with non-constant defaults now.
     (dolist (hslot (condition-classoid-hairy-slots class))
       (when (dolist (initarg (condition-slot-initargs hslot) t)
-              (unless (eq (getf args initarg *empty-condition-slot*)
+              (unless (eq (getf initargs initarg *empty-condition-slot*)
                           *empty-condition-slot*)
                 (return nil)))
-        (setf (getf (condition-assigned-slots res) (condition-slot-name hslot))
+        (setf (getf (condition-assigned-slots condition)
+                    (condition-slot-name hslot))
               (find-slot-default class hslot))))
-    res))
+
+    condition))
+
 
 ;;;; DEFINE-CONDITION
 
@@ -385,7 +398,7 @@
         report))
 
 (defun %define-condition (name parent-types layout slots documentation
-                          default-initargs all-readers all-writers
+                          direct-default-initargs all-readers all-writers
                           source-location)
   (with-single-package-locked-error
       (:symbol name "defining ~A as a condition")
@@ -394,9 +407,9 @@
       (setf (layout-source-location layout)
             source-location))
     (let ((class (find-classoid name)))
-      (setf (condition-classoid-slots class) slots)
-      (setf (condition-classoid-default-initargs class) default-initargs)
-      (setf (fdocumentation name 'type) documentation)
+      (setf (condition-classoid-slots class) slots
+            (condition-classoid-direct-default-initargs class) direct-default-initargs
+            (fdocumentation name 'type) documentation)
 
       (dolist (slot slots)
 
@@ -409,11 +422,12 @@
 
       ;; Compute effective slots and set up the class and hairy slots
       ;; (subsets of the effective slots.)
+      (setf (condition-classoid-hairy-slots class) '())
       (let ((eslots (compute-effective-slots class))
             (e-def-initargs
              (reduce #'append
-                     (mapcar #'condition-classoid-default-initargs
-                           (condition-classoid-cpl class)))))
+                     (mapcar #'condition-classoid-direct-default-initargs
+                             (condition-classoid-cpl class)))))
         (dolist (slot eslots)
           (ecase (condition-slot-allocation slot)
             (:class
@@ -430,7 +444,7 @@
              (setf (condition-slot-allocation slot) :instance)
              (when (or (functionp (condition-slot-initform slot))
                        (dolist (initarg (condition-slot-initargs slot) nil)
-                         (when (functionp (getf e-def-initargs initarg))
+                         (when (functionp (third (assoc initarg e-def-initargs)))
                            (return t))))
                (push slot (condition-classoid-hairy-slots class)))))))
       (when (boundp '*define-condition-hooks*)
@@ -462,7 +476,7 @@
          (layout (find-condition-layout name parent-types))
          (documentation nil)
          (report nil)
-         (default-initargs ()))
+         (direct-default-initargs ()))
     (collect ((slots)
               (all-readers nil append)
               (all-writers nil append))
@@ -518,10 +532,9 @@
                      :writers ',(writers)
                      :initform-p ',initform-p
                      :documentation ',documentation
-                     :initform
-                     ,(if (sb!xc:constantp initform)
-                          `',(constant-form-value initform)
-                          `#'(lambda () ,initform)))))))
+                     :initform ,(when initform-p
+                                  `#'(lambda () ,initform))
+                     :allocation ',allocation)))))
 
       (dolist (option options)
         (unless (consp option)
@@ -538,15 +551,9 @@
                        `#'(lambda (condition stream)
                             (funcall #',arg condition stream))))))
           (:default-initargs
-           (do ((initargs (rest option) (cddr initargs)))
-               ((endp initargs))
-             (let ((val (second initargs)))
-               (setq default-initargs
-                     (list* `',(first initargs)
-                            (if (sb!xc:constantp val)
-                                `',(constant-form-value val)
-                                `#'(lambda () ,val))
-                            default-initargs)))))
+           (doplist (initarg initform) (rest option)
+             (push ``(,',initarg ,',initform ,#'(lambda () ,initform))
+                   direct-default-initargs)))
           (t
            (error "unknown option: ~S" (first option)))))
 
@@ -560,7 +567,7 @@
                               ',layout
                               (list ,@(slots))
                               ,documentation
-                              (list ,@default-initargs)
+                              (list ,@direct-default-initargs)
                               ',(all-readers)
                               ',(all-writers)
                               (sb!c:source-location))
@@ -616,7 +623,9 @@
              (type-error-expected-type condition)))))
 
 (def!method print-object ((condition type-error) stream)
-  (if *print-escape*
+  (if (and *print-escape*
+           (slot-boundp condition 'expected-type)
+           (slot-boundp condition 'datum))
       (flet ((maybe-string (thing)
                (ignore-errors
                  (write-to-string thing :lines 1 :readably nil :array nil :pretty t))))

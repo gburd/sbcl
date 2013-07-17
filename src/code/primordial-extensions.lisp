@@ -222,7 +222,8 @@
                 ;; but it will immediately lead to undefined to behavior,
                 ;; since almost any operation on a deleted package is
                 ;; undefined.
-                (package-name maybe-package))
+                #-sb-xc-host
+                (package-%name maybe-package))
            maybe-package)
           (t
            ;; We're in the undefined behavior zone. First, munge the
@@ -343,6 +344,21 @@
                                            0)
                                        (1- max))))
         (t nil)))
+
+(defun proper-list-p (x)
+  (unless (consp x)
+    (return-from proper-list-p (null x)))
+  (let ((rabbit (cdr x))
+        (turtle x))
+    (flet ((pop-rabbit ()
+             (when (eql rabbit turtle) ; circular
+               (return-from proper-list-p nil))
+             (when (atom rabbit)
+               (return-from proper-list-p (null rabbit)))
+             (pop rabbit)))
+      (loop (pop-rabbit)
+            (pop-rabbit)
+            (pop turtle)))))
 
 ;;; Helpers for defining error-signalling NOP's for "not supported
 ;;; here" operations.

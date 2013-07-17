@@ -119,7 +119,7 @@
  ("src/code/parse-defmacro")   ; on host for PARSE-DEFMACRO
  ("src/compiler/deftype")      ; on host for SB!XC:DEFTYPE
  ("src/compiler/defconstant")
- ("src/code/early-alieneval")  ; for vars needed both at build and run time
+ ("src/code/early-alieneval")  ; for funs and vars needed at build and run time
 
  ("src/code/specializable-array")
 
@@ -518,6 +518,7 @@
  ("src/compiler/float-tran")
  ("src/compiler/saptran")
  ("src/compiler/srctran")
+ ("src/compiler/bitops-derive-type")
  ("src/compiler/generic/vm-tran")
  ("src/compiler/locall")
  ("src/compiler/dfo")
@@ -550,6 +551,8 @@
 
  ("src/compiler/target/move")
  ("src/compiler/target/float")
+ #!+sb-simd-pack
+ ("src/compiler/target/simd-pack")
  ("src/compiler/target/sap")
  ("src/compiler/target/system")
  ("src/compiler/target/char")

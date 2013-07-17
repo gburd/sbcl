@@ -42,7 +42,6 @@
            "DEFINITION-SOURCE-CHARACTER-OFFSET"
            "DEFINITION-SOURCE-FILE-WRITE-DATE"
            "DEFINITION-SOURCE-PLIST"
-           "DEFINITION-NOT-FOUND" "DEFINITION-NAME"
            "FIND-FUNCTION-CALLEES"
            "FIND-FUNCTION-CALLERS"
            "MAP-ROOT"
@@ -123,6 +122,30 @@ FBOUNDP."
   ;; example the specializers of the method whose definition-source this
   ;; is.
   (description nil :type list))
+
+(defun vop-sources-from-fun-templates (name)
+  (let ((fun-info (sb-int:info :function :info name)))
+    (when fun-info
+      (loop for vop in (sb-c::fun-info-templates fun-info)
+            for source = (find-definition-source
+                          (sb-c::vop-info-generator-function vop))
+            do (setf (definition-source-description source)
+                     (list (sb-c::template-name vop)
+                           (sb-c::template-note vop)))
+            collect source))))
+
+(defun find-vop-source (name)
+  (let* ((templates (vop-sources-from-fun-templates name))
+         (vop (gethash name sb-c::*backend-template-names*))
+         (source (and vop
+                      (find-definition-source
+                       (sb-c::vop-info-generator-function vop)))))
+    (when source
+      (setf (definition-source-description source)
+            (list name)))
+    (if source
+        (cons source templates)
+        templates)))
 
 (defun find-definition-sources-by-name (name type)
   "Returns a list of DEFINITION-SOURCEs for the objects of type TYPE
@@ -222,9 +245,9 @@ If an unsupported TYPE is requested, the function will return NIL.
         (let ((expander (or (sb-int:info :setf :inverse name)
                             (sb-int:info :setf :expander name))))
           (when expander
-            (sb-introspect:find-definition-source (if (symbolp expander)
-                                                      (symbol-function expander)
-                                                      expander)))))
+            (find-definition-source (if (symbolp expander)
+                                        (symbol-function expander)
+                                        expander)))))
        ((:structure)
         (let ((class (get-class name)))
           (if class
@@ -272,36 +295,30 @@ If an unsupported TYPE is requested, the function will return NIL.
                                  (list note)))
                     collect source)))))
        ((:optimizer)
-        (when (symbolp name)
-          (let ((fun-info (sb-int:info :function :info name)))
-            (when fun-info
-              (let ((otypes '((sb-c::fun-info-derive-type . sb-c:derive-type)
-                              (sb-c::fun-info-ltn-annotate . sb-c:ltn-annotate)
-                              (sb-c::fun-info-ltn-annotate . sb-c:ltn-annotate)
-                              (sb-c::fun-info-optimizer . sb-c:optimizer))))
-                (loop for (reader . name) in otypes
-                      for fn = (funcall reader fun-info)
-                      when fn collect
-                      (let ((source (find-definition-source fn)))
-                        (setf (definition-source-description source)
-                              (list name))
-                        source)))))))
+        (let ((fun-info (and (symbolp name)
+                             (sb-int:info :function :info name))))
+          (when fun-info
+            (let ((otypes '((sb-c:fun-info-derive-type . sb-c:derive-type)
+                            (sb-c:fun-info-ltn-annotate . sb-c:ltn-annotate)
+                            (sb-c:fun-info-optimizer . sb-c:optimizer)
+                            (sb-c:fun-info-ir2-convert . sb-c:ir2-convert)
+                            (sb-c::fun-info-stack-allocate-result
+                             . sb-c::stack-allocate-result))))
+              (loop for (reader . name) in otypes
+                    for fn = (funcall reader fun-info)
+                    when fn collect
+                    (let ((source (find-definition-source fn)))
+                      (setf (definition-source-description source)
+                            (list name))
+                      source))))))
        ((:vop)
         (when (symbolp name)
-          (let ((fun-info (sb-int:info :function :info name)))
-            (when fun-info
-              (loop for vop in (sb-c::fun-info-templates fun-info)
-                    for source = (find-definition-source
-                                  (sb-c::vop-info-generator-function vop))
-                    do (setf (definition-source-description source)
-                             (list (sb-c::template-name vop)
-                                   (sb-c::template-note vop)))
-                    collect source)))))
+          (find-vop-source name)))
        ((:source-transform)
         (when (symbolp name)
           (let ((transform-fun (sb-int:info :function :source-transform name)))
             (when transform-fun
-              (sb-introspect:find-definition-source transform-fun)))))
+              (find-definition-source transform-fun)))))
        (t
         nil)))))
 
@@ -595,8 +612,7 @@ list of the symbols :dynamic, :static, or :read-only."
      (lambda (obj header size)
        (when (= sb-vm:code-header-widetag header)
          (funcall fn obj size)))
-     space
-     t)))
+     space)))
 
 (declaim (inline map-caller-code-components))
 (defun map-caller-code-components (function spaces fn)

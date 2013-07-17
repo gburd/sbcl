@@ -20,7 +20,7 @@
 ;;; and register specs, we use the Intel convention. But whenever we
 ;;; are talking about stuff the rest of the lisp system might be
 ;;; interested in, we use ``word'' to mean the size of a descriptor
-;;; object, which is 32 bits.
+;;; object, which is 64 bits.
 
 ;;;; machine architecture parameters
 
@@ -203,4 +203,8 @@
     sb!kernel:two-arg-ior
     sb!kernel:two-arg-xor
     sb!kernel:two-arg-gcd
-    sb!kernel:two-arg-lcm))
+    sb!kernel:two-arg-lcm
+    sb!kernel:%coerce-callable-to-fun))
+
+#!+sb-simd-pack
+(defvar *simd-pack-element-types* '(integer single-float double-float))

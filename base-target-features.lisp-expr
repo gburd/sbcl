@@ -152,6 +152,11 @@
  ; :sb-hash-table-debug
 
  ;; Enabled automatically by make-config.sh for platforms which implement
+ ;; short vector SIMD intrinsics.
+ ;;
+ ; :sb-simd-pack
+
+ ;; Enabled automatically by make-config.sh for platforms which implement
  ;; the %READ-CYCLE-COUNTER VOP. Can be disabled manually: affects TIME.
  ;;
  ;; FIXME: Should this be :SB-CYCLE-COUNTER instead? If so, then the same goes
@@ -347,6 +352,9 @@
  ;; can replace its use of setitimer with a background thread.
  ;; (Replaces use of SIGALRM.)
  ; :sb-wtimer
+
+ ;; This platform implements VOPs for %ash/right, variable-width shift right
+ ; :ash-right-vops
 
  ;;
  ;; miscellaneous notes on other things which could have special significance

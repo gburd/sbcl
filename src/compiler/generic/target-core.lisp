@@ -66,12 +66,10 @@
            (fill-ptr (code-instructions code-obj)))
       (declare (type index box-num total-length))
 
-      (sb!assem:on-segment-contents-vectorly
-       segment
-       (lambda (v)
-         (declare (type (simple-array sb!assem:assembly-unit 1) v))
-         (copy-byte-vector-to-system-area v fill-ptr)
-         (setf fill-ptr (sap+ fill-ptr (length v)))))
+      (let ((v (sb!assem:segment-contents-as-vector segment)))
+        (declare (type (simple-array sb!assem:assembly-unit 1) v))
+        (copy-byte-vector-to-system-area v fill-ptr)
+        (setf fill-ptr (sap+ fill-ptr (length v))))
 
       (do-core-fixups code-obj fixup-notes)
 
@@ -112,5 +110,8 @@
                 (reference-core-fun code-obj index (cdr const) object))
                (:fdefinition
                 (setf (code-header-ref code-obj index)
-                      (fdefinition-object (cdr const) t))))))))))
+                      (fdefinition-object (cdr const) t)))
+               (:known-fun
+                (setf (code-header-ref code-obj index)
+                      (%coerce-name-to-fun (cdr const)))))))))))
   (values))

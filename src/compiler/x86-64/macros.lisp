@@ -1,4 +1,4 @@
-;;;; a bunch of handy macros for the x86
+;;;; a bunch of handy macros for x86-64
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
@@ -13,21 +13,31 @@
 
 ;;;; instruction-like macros
 
-(defmacro move (dst src)
+;;; This used to be a macro (and still is on the other platforms) but
+;;; the support for SC-dependent move instructions needed here makes
+;;; that expand into so large an expression that the resulting code
+;;; bloat is not justifiable.
+(defun move (dst src)
   #!+sb-doc
   "Move SRC into DST unless they are location=."
-  (once-only ((n-dst dst)
-              (n-src src))
-    `(unless (location= ,n-dst ,n-src)
-       (sc-case ,n-dst
-         ((single-reg complex-single-reg)
-          (aver (xmm-register-p ,n-src))
-          (inst movaps ,n-dst ,n-src))
-         ((double-reg complex-double-reg)
-          (aver (xmm-register-p ,n-src))
-          (inst movapd ,n-dst ,n-src))
-         (t
-          (inst mov ,n-dst ,n-src))))))
+  (unless (location= dst src)
+    (sc-case dst
+      ((single-reg complex-single-reg)
+       (aver (xmm-register-p src))
+       (inst movaps dst src))
+      ((double-reg complex-double-reg)
+       (aver (xmm-register-p src))
+       (inst movapd dst src))
+      #!+sb-simd-pack
+      ((int-sse-reg sse-reg)
+       (aver (xmm-register-p src))
+       (inst movdqa dst src))
+      #!+sb-simd-pack
+      ((single-sse-reg double-sse-reg)
+       (aver (xmm-register-p src))
+       (inst movaps dst src))
+      (t
+       (inst mov dst src)))))
 
 (defmacro make-ea-for-object-slot (ptr slot lowtag)
   `(make-ea :qword :base ,ptr :disp (- (* ,slot n-word-bytes) ,lowtag)))
@@ -51,6 +61,14 @@
 
 (defmacro popw (ptr &optional (slot 0) (lowtag 0))
   `(inst pop (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
+
+(defun call-indirect (offset)
+  (typecase offset
+    ((signed-byte 32)
+     (inst call (make-ea :qword :disp offset)))
+    (t
+     (inst mov temp-reg-tn offset)
+     (inst call (make-ea :qword :base temp-reg-tn)))))
 
 ;;;; macros to generate useful values
 

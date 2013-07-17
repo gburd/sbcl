@@ -2382,4 +2382,51 @@
                   (with-output-to-string (*standard-output*)
                     (many-code-constants)))))
 
+(test-util:with-test (:name :bug-943953)
+  ;; we sometimes splice compiler structures like clambda in
+  ;; source, and our error reporting would happily use that
+  ;; as source forms.
+  (let* ((src "bug-943953.lisp")
+         (obj (compile-file-pathname src)))
+    (unwind-protect (compile-file src)
+      (ignore-errors (delete-file obj)))))
+
+(declaim (inline vec-1177703))
+(defstruct (vec-1177703 (:constructor vec-1177703 (&optional x)))
+  (x 0.0d0 :type double-float))
+
+(declaim (inline norm-1177703))
+(defun norm-1177703 (v)
+  (vec-1177703 (sqrt (vec-1177703-x v))))
+
+(test-util:with-test (:name :bug-1177703)
+  (compile nil `(lambda (x)
+                  (norm-1177703 (vec-1177703 x)))))
+
+(declaim (inline call-1035721))
+(defun call-1035721 (function)
+  (lambda (x)
+    (funcall function x)))
+
+(declaim (inline identity-1035721))
+(defun identity-1035721 (x)
+  x)
+
+(test-util:with-test (:name :bug-1035721)
+  (compile nil `(lambda ()
+                  (list
+                   (call-1035721 #'identity-1035721)
+                   (lambda (x)
+                     (identity-1035721 x))))))
+
+(test-util:with-test (:name :expt-type-derivation-and-method-redefinition)
+  (defmethod expt-type-derivation ((x list) &optional (y 0.0))
+    (declare (type float y))
+    (expt 2 y))
+  ;; the redefinition triggers a type lookup of the old
+  ;; fast-method-function's type, which had a bogus type specifier of
+  ;; the form (double-float 0) from EXPT type derivation
+  (defmethod expt-type-derivation ((x list) &optional (y 0.0))
+    (declare (type float y))
+    (expt 2 y)))
 ;;; success

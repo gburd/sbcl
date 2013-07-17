@@ -33,9 +33,9 @@
                                   :directory
                                   '(:relative :up :up "output")
                                   :name name :type type)
-                                 sb!xc:*compile-file-truename*)))
-         (let ((character-database
-                (with-open-file (stream (file "ucd" "dat")
+                                 sb!xc:*compile-file-truename*))
+              (read-ub8-vector (pathname)
+                (with-open-file (stream pathname
                                         :direction :input
                                         :element-type '(unsigned-byte 8))
                   (let* ((length (file-length stream))
@@ -43,9 +43,32 @@
                                  length :element-type '(unsigned-byte 8))))
                     (read-sequence array stream)
                     array))))
+         (let ((character-database (read-ub8-vector (file "ucd" "dat")))
+               (decompositions (read-ub8-vector (file "decomp" "dat")))
+               (long-decompositions (read-ub8-vector (file "ldecomp" "dat"))))
            `(progn
-              (declaim (type (simple-array (unsigned-byte 8) (*)) **character-database**))
+              (declaim (type (simple-array (unsigned-byte 8) (*)) **character-database** **character-decompositions** **character-long-decompositions**))
               (defglobal **character-database** ,character-database)
+              (defglobal **character-decompositions** ,decompositions)
+              (defglobal **character-long-decompositions** ,long-decompositions)
+              (defglobal **character-primary-compositions**
+                (let ((table (make-hash-table))
+                      (info ,(read-ub8-vector (file "comp" "dat"))))
+                  (flet ((code (j)
+                           (dpb (aref info (* 4 j))
+                                (byte 8 24)
+                                (dpb (aref info (+ (* 4 j) 1))
+                                     (byte 8 16)
+                                     (dpb (aref info (+ (* 4 j) 2))
+                                          (byte 8 8)
+                                          (aref info (+ (* 4 j) 3)))))))
+                    #!+sb-unicode
+                    (dotimes (i (/ (length info) 12))
+                      (setf (gethash (dpb (code (* 3 i)) (byte 21 21)
+                                          (code (1+ (* 3 i))))
+                                     table)
+                            (code-char (code (+ (* 3 i) 2)))))
+                    table)))
               (defun !character-database-cold-init ()
                 (setf **character-database** ,character-database))
               ,(with-open-file (stream (file "ucd-names" "lisp-expr")
@@ -162,7 +185,7 @@
 
 ;;;; UCD accessor functions
 
-;;; The first (* 8 215) => 1720 entries in **CHARACTER-DATABASE**
+;;; The first (* 8 396) => 3168 entries in **CHARACTER-DATABASE**
 ;;; contain entries for the distinct character attributes:
 ;;; specifically, indexes into the GC kinds, Bidi kinds, CCC kinds,
 ;;; the decimal digit property, the digit property and the
@@ -172,7 +195,7 @@
 ;;; the next (ash #x110000 -8) entries contain single-byte indexes
 ;;; into a table of 256-element 4-byte-sized entries.  These entries
 ;;; follow directly on, and are of the form
-;;; {attribute-index[1B],transformed-code-point[3B]}x256, where the
+;;; {attribute-index[11b],transformed-code-point[21b]}x256, where the
 ;;; attribute index is an index into the miscellaneous information
 ;;; table, and the transformed code point is the code point of the
 ;;; simple mapping of the character to its lowercase or uppercase
@@ -189,41 +212,56 @@
 ;;;
 ;;; To look up information about a character, take the high 13 bits of
 ;;; its code point, and index the character database with that and a
-;;; base of 1720 (going past the miscellaneous information[*], so
+;;; base of 3168 (going past the miscellaneous information[*], so
 ;;; treating (a) as the start of the array).  This, labelled A, gives
 ;;; us another index into the detailed pages[-], which we can use to
 ;;; look up the details for the character in question: we add the low
 ;;; 8 bits of the character, shifted twice (because we have four-byte
-;;; table entries) to 1024 times the `page' index, with a base of 6072
+;;; table entries) to 1024 times the `page' index, with a base of 7520
 ;;; to skip over everything else.  This gets us to point B.  If we're
 ;;; after a transformed code point (i.e. an upcase or downcase
 ;;; operation), we can simply read it off now, beginning with an
-;;; offset of 1 byte from point B in some endianness; if we're looking
-;;; for miscellaneous information, we take the value at B, and index
-;;; the character database once more to get to the relevant
-;;; miscellaneous information.
+;;; offset of 11 bits from point B in some endianness; if we're
+;;; looking for miscellaneous information, we take the 11-bit value at
+;;; B, and index the character database once more to get to the
+;;; relevant miscellaneous information.
+;;;
+;;; As an optimization to the common case (pun intended) of looking up
+;;; case information for a character, the entries in C above are
+;;; sorted such that the characters which are UPPER-CASE-P in CL terms
+;;; have index values lower than all others, followed by those which
+;;; are LOWER-CASE-P in CL terms; this permits implementation of
+;;; character case tests without actually going to the trouble of
+;;; looking up the value associated with the index.  (Actually, this
+;;; isn't just a speed optimization; the information about whether a
+;;; character is BOTH-CASE-P is used just in the ordering and not
+;;; explicitly recorded in the database).
 ;;;
 ;;; The moral of all this?  Next time, don't just say "FIXME: document
 ;;; this"
 (defun ucd-index (char)
   (let* ((cp (char-code char))
          (cp-high (ash cp -8))
-         (page (aref **character-database** (+ 1720 cp-high))))
-    (+ 6072 (ash page 10) (ash (ldb (byte 8 0) cp) 2))))
+         (page (aref **character-database** (+ 3168 cp-high))))
+    (+ 7520 (ash page 10) (ash (ldb (byte 8 0) cp) 2))))
 
-(declaim (ftype (sfunction (t) (unsigned-byte 8)) ucd-value-0))
+(declaim (ftype (sfunction (t) (unsigned-byte 11)) ucd-value-0))
 (defun ucd-value-0 (char)
-  (aref **character-database** (ucd-index char)))
+  (let ((index (ucd-index char))
+        (character-database **character-database**))
+    (dpb (aref character-database index)
+         (byte 8 3)
+         (ldb (byte 3 5) (aref character-database (+ index 1))))))
 
-(declaim (ftype (sfunction (t) (unsigned-byte 24)) ucd-value-1))
+(declaim (ftype (sfunction (t) (unsigned-byte 21)) ucd-value-1))
 (defun ucd-value-1 (char)
   (let ((index (ucd-index char))
         (character-database **character-database**))
-    (dpb (aref character-database (+ index 3))
-         (byte 8 16)
+    (dpb (aref character-database (+ index 1))
+         (byte 5 16)
          (dpb (aref character-database (+ index 2))
               (byte 8 8)
-              (aref character-database (1+ index))))))
+              (aref character-database (+ index 3))))))
 
 (declaim (ftype (sfunction (t) (unsigned-byte 8)) ucd-general-category))
 (defun ucd-general-category (char)
@@ -234,6 +272,9 @@
                              (+ 3 (* 8 (ucd-value-0 char))))))
     (when (< decimal-digit 10)
       decimal-digit)))
+(declaim (ftype (sfunction (t) (unsigned-byte 8)) ucd-ccc))
+(defun ucd-ccc (char)
+  (aref **character-database** (+ 2 (* 8 (ucd-value-0 char)))))
 
 (defun char-code (char)
   #!+sb-doc
@@ -359,20 +400,20 @@ argument is an alphabetic character, A-Z or a-z; otherwise NIL."
   #!+sb-doc
   "The argument must be a character object; UPPER-CASE-P returns T if the
 argument is an upper-case character, NIL otherwise."
-  (= (ucd-value-0 char) 0))
+  (< (ucd-value-0 char) 5))
 
 (defun lower-case-p (char)
   #!+sb-doc
   "The argument must be a character object; LOWER-CASE-P returns T if the
 argument is a lower-case character, NIL otherwise."
-  (= (ucd-value-0 char) 1))
+  (< 4 (ucd-value-0 char) 9))
 
 (defun both-case-p (char)
   #!+sb-doc
   "The argument must be a character object. BOTH-CASE-P returns T if the
 argument is an alphabetic character and if the character exists in both upper
 and lower case. For ASCII, this is the same as ALPHA-CHAR-P."
-  (< (ucd-value-0 char) 2))
+  (< (ucd-value-0 char) 9))
 
 (defun digit-char-p (char &optional (radix 10.))
   #!+sb-doc
@@ -472,7 +513,7 @@ is either numeric or alphabetic."
 (defmacro equal-char-code (character)
   (let ((ch (gensym)))
     `(let ((,ch ,character))
-      (if (= (ucd-value-0 ,ch) 0)
+      (if (< (ucd-value-0 ,ch) 5)
           (ucd-value-1 ,ch)
           (char-code ,ch)))))
 
@@ -568,14 +609,14 @@ Case is ignored."
   #!+sb-doc
   "Return CHAR converted to upper-case if that is possible. Don't convert
 lowercase eszet (U+DF)."
-  (if (= (ucd-value-0 char) 1)
+  (if (< 4 (ucd-value-0 char) 9)
       (code-char (ucd-value-1 char))
       char))
 
 (defun char-downcase (char)
   #!+sb-doc
   "Return CHAR converted to lower-case if that is possible."
-  (if (= (ucd-value-0 char) 0)
+  (if (< (ucd-value-0 char) 5)
       (code-char (ucd-value-1 char))
       char))
 
@@ -587,3 +628,234 @@ character exists."
   (and (typep weight 'fixnum)
        (>= weight 0) (< weight radix) (< weight 36)
        (code-char (if (< weight 10) (+ 48 weight) (+ 55 weight)))))
+
+(defun char-decomposition-info (char)
+  (aref **character-database** (+ 6 (* 8 (ucd-value-0 char)))))
+
+(defun char-decomposition (char)
+  (let* ((cp (char-code char))
+         (cp-high (ash cp -8))
+         (decompositions **character-decompositions**)
+         (long-decompositions **character-long-decompositions**)
+         (index (+ #x1100
+                   (ash (aref decompositions cp-high) 10)
+                   (ash (ldb (byte 8 0) cp) 2)))
+         (v0 (aref decompositions index))
+         (v1 (aref decompositions (+ index 1)))
+         (v2 (aref decompositions (+ index 2)))
+         (v3 (aref decompositions (+ index 3)))
+         (length (dpb v0 (byte 8 3) (ldb (byte 3 5) v1)))
+         (entry (dpb (ldb (byte 5 0) v1) (byte 5 16)
+                     (dpb v2 (byte 8 8) v3))))
+    (if (= length 1)
+        (string (code-char entry))
+        (if (<= #xac00 cp #xd7a3)
+            ;; see Unicode 6.2, section 3-12
+            (let* ((sbase #xac00)
+                   (lbase #x1100)
+                   (vbase #x1161)
+                   (tbase #x11a7)
+                   (lcount 19)
+                   (vcount 21)
+                   (tcount 28)
+                   (ncount (* vcount tcount))
+                   (scount (* lcount ncount))
+                   (sindex (- cp sbase))
+                   (lindex (floor sindex ncount))
+                   (vindex (floor (mod sindex ncount) tcount))
+                   (tindex (mod sindex tcount))
+                   (result (make-string length)))
+              (declare (ignore scount))
+              (setf (char result 0) (code-char (+ lbase lindex)))
+              (setf (char result 1) (code-char (+ vbase vindex)))
+              (when (> tindex 0)
+                (setf (char result 2) (code-char (+ tbase tindex))))
+              result)
+            (let ((result (make-string length))
+                  (e (* 4 entry)))
+              (dotimes (i length result)
+                (let ((code (dpb (aref long-decompositions (+ e 1))
+                                 (byte 8 16)
+                                 (dpb (aref long-decompositions (+ e 2))
+                                      (byte 8 8)
+                                      (aref long-decompositions (+ e 3))))))
+                  (setf (char result i) (code-char code)))
+                (incf e 4)))))))
+
+(defun decompose-char (char)
+  (if (= (char-decomposition-info char) 0)
+      (string char)
+      (char-decomposition char)))
+
+(defun decompose-string (string &optional (kind :canonical))
+  (declare (type (member :canonical :compatibility) kind))
+  (flet ((canonical (char)
+           (= 1 (char-decomposition-info char)))
+         (compat (char)
+           (/= 0 (char-decomposition-info char))))
+    (let (result
+          (fun (ecase kind
+                 (:canonical #'canonical)
+                 (:compatibility #'compat))))
+      (do* ((start 0 (1+ end))
+            (end (position-if fun string :start start)
+                 (position-if fun string :start start)))
+           ((null end) (push (subseq string start end) result))
+        (unless (= start end)
+          (push (subseq string start end) result))
+        ;; FIXME: this recursive call to DECOMPOSE-STRING is necessary
+        ;; for correctness given our direct encoding of the
+        ;; decomposition data in UnicodeData.txt.  It would, however,
+        ;; be straightforward enough to perform the recursion in table
+        ;; construction, and then have this simply revert to a single
+        ;; lookup.  (Wait for tests to be hooked in, then implement).
+        (push (decompose-string (decompose-char (char string end)) kind)
+              result))
+      (apply 'concatenate 'string (nreverse result)))))
+
+(defun sort-combiners (string)
+  (let (result (start 0) first-cc first-non-cc)
+    (tagbody
+     again
+       (setf first-cc (position 0 string :key #'ucd-ccc :test #'/= :start start))
+       (when first-cc
+         (setf first-non-cc (position 0 string :key #'ucd-ccc :test #'= :start first-cc)))
+       (push (subseq string start first-cc) result)
+       (when first-cc
+         (push (stable-sort (subseq string first-cc first-non-cc) #'< :key #'ucd-ccc) result))
+       (when first-non-cc
+         (setf start first-non-cc first-cc nil first-non-cc nil)
+         (go again)))
+    (apply 'concatenate 'string (nreverse result))))
+
+(defun primary-composition (char1 char2)
+  (let ((c1 (char-code char1))
+        (c2 (char-code char2)))
+    (cond
+      ((gethash (dpb (char-code char1) (byte 21 21) (char-code char2))
+                **character-primary-compositions**))
+      ((and (<= #x1100 c1) (<= c1 #x1112)
+            (<= #x1161 c2) (<= c2 #x1175))
+       (let ((lindex (- c1 #x1100))
+             (vindex (- c2 #x1161)))
+         (code-char (+ #xac00 (* lindex 588) (* vindex 28)))))
+      ((and (<= #xac00 c1) (<= c1 #.(+ #xac00 11171))
+            (<= #x11a8 c2) (<= c2 #x11c2)
+            (= 0 (rem (- c1 #xac00) 28)))
+       (code-char (+ c1 (- c2 #x11a7)))))))
+
+;;; This implements a sequence data structure, specialized for
+;;; efficient deletion of characters at an index, along with tolerable
+;;; random access.  The purpose is to support the canonical
+;;; composition algorithm from Unicode, which involves replacing (not
+;;; necessarily consecutive) pairs of code points with a single code
+;;; point (e.g. [#\e #\combining_acute_accent] with
+;;; #\latin_small_letter_e_with_acute).  The data structure is a list
+;;; of three-element lists, each denoting a chunk of string data
+;;; starting at the first index and ending at the second.
+;;;
+;;; Actually, the implementation isn't particularly efficient, and
+;;; would probably benefit from being rewritten in terms of displaced
+;;; arrays, which would substantially reduce copying.
+;;;
+;;; (also, generic sequences.  *sigh*.)
+(defun lref (lstring index)
+  (dolist (l lstring)
+    (when (and (<= (first l) index)
+               (< index (second l)))
+      (return (aref (third l) (- index (first l)))))))
+(defun (setf lref) (newchar lstring index)
+  (dolist (l lstring)
+    (when (and (<= (first l) index)
+               (< index (second l)))
+      (return (setf (aref (third l) (- index (first l))) newchar)))))
+(defun llength (lstring)
+  (second (first (last lstring))))
+(defun lstring (lstring)
+  (let ((result (make-string (llength lstring))))
+    (dolist (l lstring result)
+      (replace result (third l) :start1 (first l) :end1 (second l)))))
+(defun ldelete (lstring index)
+  (do* ((ls lstring (cdr ls))
+        (l (car ls) (car ls))
+        so-fars)
+       ((and (<= (first l) index)
+             (< index (second l)))
+        (append
+         (nreverse so-fars)
+         (cond
+           ((= (first l) index)
+            (list (list (first l) (1- (second l)) (subseq (third l) 1))))
+           ((= index (1- (second l)))
+            (list (list (first l) (1- (second l)) (subseq (third l) 0 (1- (length (third l)))))))
+           (t
+            (list
+             (list (first l) index
+                   (subseq (third l) 0 (- index (first l))))
+             (list index (1- (second l))
+                   (subseq (third l) (1+ (- index (first l))))))))
+         (mapcar (lambda (x) (list (1- (first x)) (1- (second x)) (third x)))
+                 (cdr ls))))
+    (push l so-fars)))
+
+(defun canonically-compose (string)
+  (labels ()
+    (let* ((result (list (list 0 (length string) string)))
+           (previous-starter-index (position 0 string :key #'ucd-ccc))
+           (i (and previous-starter-index (1+ previous-starter-index))))
+      (when (or (not i) (= i (length string)))
+        (return-from canonically-compose string))
+      (tagbody
+       again
+         (when (and (>= (- i previous-starter-index) 2)
+                    ;; test for Blocked (Unicode 3.11 para. D115)
+                    ;;
+                    ;; (assumes here that string has sorted combiners,
+                    ;; so can look back just one step)
+                    (>= (ucd-ccc (lref result (1- i)))
+                        (ucd-ccc (lref result i))))
+           (when (= (ucd-ccc (lref result i)) 0)
+             (setf previous-starter-index i))
+           (incf i)
+           (go next))
+
+         (let ((comp (primary-composition (lref result previous-starter-index)
+                                          (lref result i))))
+           (cond
+             (comp
+              (setf (lref result previous-starter-index) comp)
+              (setf result (ldelete result i)))
+             (t
+              (when (= (ucd-ccc (lref result i)) 0)
+                (setf previous-starter-index i))
+              (incf i))))
+       next
+         (unless (= i (llength result))
+           (go again)))
+      (if (= i (length string))
+          string
+          (lstring result)))))
+
+(defun normalize-string (string &optional (form :nfd))
+  (declare (type (member :nfd :nfkd :nfc :nfkc) form))
+  #!-sb-unicode
+  (etypecase string
+    ((array nil (*)) string)
+    (string
+     (ecase form
+       ((:nfc :nfkc) string)
+       ((:nfd :nfkd) (error "Cannot normalize to ~A form in #-SB-UNICODE builds" form)))))
+  #!+sb-unicode
+  (etypecase string
+    (base-string string)
+    ((array character (*))
+     (ecase form
+       ((:nfc)
+        (canonically-compose (sort-combiners (decompose-string string))))
+       ((:nfd)
+        (sort-combiners (decompose-string string)))
+       ((:nfkc)
+        (canonically-compose (sort-combiners (decompose-string string :compatibility))))
+       ((:nfkd)
+        (sort-combiners (decompose-string string :compatibility)))))
+    ((array nil (*)) string)))

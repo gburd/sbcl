@@ -159,37 +159,37 @@ means to wait indefinitely.")
         (t
          (/show0 "returning normally from INFINITE-ERROR-PROTECTOR")
          nil)))
-
-;;; FIXME: I had a badly broken version of INFINITE-ERROR-PROTECTOR at
-;;; one point (shown below), and SBCL cross-compiled it without
-;;; warning about FORMS being undefined. Check whether that problem
-;;; (missing warning) is repeatable in the final system and if so, fix
-;;; it.
-#|
-(defun infinite-error-protector ()
-  `(cond ((not *cold-init-complete-p*)
-          (%primitive print "Argh! error in cold init, halting")
-          (%primitive sb!c:halt))
-         ((or (not (boundp '*current-error-depth*))
-              (not (realp   *current-error-depth*))
-              (not (boundp '*maximum-error-depth*))
-              (not (realp   *maximum-error-depth*)))
-          (%primitive print "Argh! corrupted error depth, halting")
-          (%primitive sb!c:halt))
-         ((> *current-error-depth* *maximum-error-depth*)
-          (/show0 "in INFINITE-ERROR-PROTECTOR, calling ERROR-ERROR")
-          (error-error "Help! "
-                       *current-error-depth*
-                       " nested errors. "
-                       "SB-KERNEL:*MAXIMUM-ERROR-DEPTH* exceeded.")
-          (progn ,@forms)
-          t)
-         (t
-          (/show0 "in INFINITE-ERROR-PROTECTOR, returning normally")
-          nil)))
-|#
 
 ;;;; miscellaneous external functions
+
+(defun split-seconds-for-sleep (seconds)
+  (declare (optimize speed))
+  ;; KLUDGE: This whole thing to avoid consing floats
+  (flet ((split-float ()
+           (let ((whole-seconds (truly-the fixnum (%unary-truncate seconds))))
+             (values whole-seconds
+                     (truly-the fixnum
+                                (%unary-truncate (* (- seconds (float whole-seconds))
+                                                    (load-time-value 1s9 t))))))))
+    (declare (inline split-float))
+    (typecase seconds
+      ((single-float 0s0 #.(float most-positive-fixnum 1s0))
+       (split-float))
+      ((double-float 0d0 #.(float most-positive-fixnum 1d0))
+       (split-float))
+      (ratio
+       (multiple-value-bind (quot rem) (truncate (numerator seconds)
+                                                 (denominator seconds))
+         (values quot
+                 (* rem
+                    (if (typep 1000000000 'fixnum)
+                        (truncate 1000000000 (denominator seconds))
+                        ;; Can't truncate a bignum by a fixnum without consing
+                        (* 10 (truncate 100000000 (denominator seconds))))))))
+      (t
+       (multiple-value-bind (sec frac)
+           (truncate seconds)
+         (values sec (truncate frac (load-time-value 1s-9 t))))))))
 
 (defun sleep (seconds)
   #!+sb-doc
@@ -207,9 +207,7 @@ any non-negative real number."
   (multiple-value-bind (sec nsec)
       (if (integerp seconds)
           (values seconds 0)
-          (multiple-value-bind (sec frac)
-              (truncate seconds)
-            (values sec (truncate frac 1e-9))))
+          (split-seconds-for-sleep seconds))
     ;; nanosleep() accepts time_t as the first argument, but on some platforms
     ;; it is restricted to 100 million seconds. Maybe someone can actually
     ;; have a reason to sleep for over 3 years?
@@ -497,7 +495,8 @@ any non-negative real number."
 
     ;; Delete all the options that we processed, so that only
     ;; user-level options are left visible to user code.
-    (setf (rest *posix-argv*) options)
+    (when *posix-argv*
+      (setf (rest *posix-argv*) options))
 
     ;; Disable debugger before processing initialization files & co.
     (when disable-debugger

@@ -246,6 +246,10 @@
   (fp-complex-single-immediate immediate-constant)
   (fp-complex-double-immediate immediate-constant)
 
+  #!+sb-simd-pack (int-sse-immediate immediate-constant)
+  #!+sb-simd-pack (double-sse-immediate immediate-constant)
+  #!+sb-simd-pack (single-sse-immediate immediate-constant)
+
   (immediate immediate-constant)
 
   ;;
@@ -265,7 +269,12 @@
   (double-stack stack)
   (complex-single-stack stack)  ; complex-single-floats
   (complex-double-stack stack :element-size 2)  ; complex-double-floats
-
+  #!+sb-simd-pack
+  (int-sse-stack stack :element-size 2)
+  #!+sb-simd-pack
+  (double-sse-stack stack :element-size 2)
+  #!+sb-simd-pack
+  (single-sse-stack stack :element-size 2)
 
   ;;
   ;; magic SCs
@@ -377,6 +386,30 @@
                       :save-p t
                       :alternate-scs (complex-double-stack))
 
+  ;; temporary only
+  #!+sb-simd-pack
+  (sse-reg float-registers
+           :locations #.*float-regs*)
+  ;; regular values
+  #!+sb-simd-pack
+  (int-sse-reg float-registers
+               :locations #.*float-regs*
+               :constant-scs (int-sse-immediate)
+               :save-p t
+               :alternate-scs (int-sse-stack))
+  #!+sb-simd-pack
+  (double-sse-reg float-registers
+                  :locations #.*float-regs*
+                  :constant-scs (double-sse-immediate)
+                  :save-p t
+                  :alternate-scs (double-sse-stack))
+  #!+sb-simd-pack
+  (single-sse-reg float-registers
+                  :locations #.*float-regs*
+                  :constant-scs (single-sse-immediate)
+                  :save-p t
+                  :alternate-scs (single-sse-stack))
+
   ;; a catch or unwind block
   (catch-block stack :element-size kludge-nondeterministic-catch-block-size))
 
@@ -397,6 +430,9 @@
 (defparameter *double-sc-names* '(double-reg double-stack))
 (defparameter *complex-sc-names* '(complex-single-reg complex-single-stack
                                    complex-double-reg complex-double-stack))
+#!+sb-simd-pack
+(defparameter *oword-sc-names* '(sse-reg int-sse-reg single-sse-reg double-sse-reg
+                                 sse-stack int-sse-stack single-sse-stack double-sse-stack))
 ) ; EVAL-WHEN
 
 ;;;; miscellaneous TNs for the various registers
@@ -455,7 +491,7 @@
 
 ;;; If value can be represented as an immediate constant, then return
 ;;; the appropriate SC number, otherwise return NIL.
-(!def-vm-support-routine immediate-constant-sc (value)
+(defun immediate-constant-sc (value)
   (typecase value
     ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
          character)
@@ -478,9 +514,21 @@
        (sc-number-or-lose
         (if (eql value #c(0d0 0d0))
             'fp-complex-double-zero
-            'fp-complex-double-immediate)))))
+            'fp-complex-double-immediate)))
+    #!+sb-simd-pack
+    (#+sb-xc-host nil
+     #-sb-xc-host (simd-pack double-float)
+        (sc-number-or-lose 'double-sse-immediate))
+    #!+sb-simd-pack
+    (#+sb-xc-host nil
+     #-sb-xc-host (simd-pack single-float)
+     (sc-number-or-lose 'single-sse-immediate))
+    #!+sb-simd-pack
+    (#+sb-xc-host nil
+     #-sb-xc-host simd-pack
+     (sc-number-or-lose 'int-sse-immediate))))
 
-(!def-vm-support-routine boxed-immediate-sc-p (sc)
+(defun boxed-immediate-sc-p (sc)
   (eql sc (sc-number-or-lose 'immediate)))
 
 ;;;; miscellaneous function call parameters
@@ -514,7 +562,7 @@
 
 ;;; This function is called by debug output routines that want a pretty name
 ;;; for a TN's location. It returns a thing that can be printed with PRINC.
-(!def-vm-support-routine location-print-name (tn)
+(defun location-print-name (tn)
   (declare (type tn tn))
   (let* ((sc (tn-sc tn))
          (sb (sb-name (sc-sb sc)))
@@ -554,6 +602,34 @@
 
 (def!constant cfp-offset rbp-offset) ; pfw - needed by stuff in /code
 
-(!def-vm-support-routine combination-implementation-style (node)
-  (declare (type sb!c::combination node) (ignore node))
-  (values :default nil))
+(defun combination-implementation-style (node)
+  (declare (type sb!c::combination node))
+  (flet ((valid-funtype (args result)
+           (sb!c::valid-fun-use node
+                                (sb!c::specifier-type
+                                 `(function ,args ,result)))))
+    (case (sb!c::combination-fun-source-name node)
+      (logtest
+       (cond
+         ((or (valid-funtype '(fixnum fixnum) '*)
+              ;; todo: nothing prevents this from testing an unsigned word against
+              ;; a signed word, except for the mess of VOPs it would demand
+              (valid-funtype '((signed-byte 64) (signed-byte 64)) '*)
+              (valid-funtype '((unsigned-byte 64) (unsigned-byte 64)) '*))
+          (values :maybe nil))
+         (t
+          (values :default nil))))
+      (logbitp
+       (cond
+         ((or (and (valid-funtype '#.`((integer 0 ,(- 63 n-fixnum-tag-bits))
+                                       fixnum) '*)
+                   (sb!c::constant-lvar-p
+                    (first (sb!c::basic-combination-args node))))
+              (valid-funtype '((integer 0 63) (signed-byte 64)) '*)
+              (valid-funtype '((integer 0 63) (unsigned-byte 64)) '*))
+          (values :transform '(lambda (index integer)
+                               (%logbitp integer index))))
+         (t
+          (values :default nil))))
+      (t
+       (values :default nil)))))

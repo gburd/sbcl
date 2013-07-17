@@ -333,7 +333,7 @@
                                                 component)))))
                (locall-analyze-fun-1 functional)
                (when (lambda-p functional)
-                 (maybe-let-convert functional)))))))
+                 (maybe-let-convert functional component)))))))
   (values))
 
 (defun locall-analyze-clambdas-until-done (clambdas)
@@ -490,6 +490,24 @@
          (lexenv-policy (node-lexenv call))))))
   (values))
 
+;;; Convenience function to mark local calls as known bad.
+(defun transform-call-with-ir1-environment (node lambda default-name)
+  (aver (combination-p node))
+  (with-ir1-environment-from-node node
+    (transform-call node lambda
+                    (or (combination-fun-source-name node nil)
+                        default-name))))
+
+(defun warn-invalid-local-call (node count &rest warn-arguments)
+  (aver (combination-p node))
+  (aver (typep count 'unsigned-byte))
+  (apply 'warn warn-arguments)
+  (transform-call-with-ir1-environment node
+                                       `(lambda (&rest args)
+                                          (declare (ignore args))
+                                          (%arg-count-error ,count))
+                                       '%arg-count-error))
+
 ;;; Attempt to convert a call to a lambda. If the number of args is
 ;;; wrong, we give a warning and mark the call as :ERROR to remove it
 ;;; from future consideration. If the argcount is O.K. then we just
@@ -501,12 +519,11 @@
     (cond ((= n-call-args nargs)
            (convert-call ref call fun))
           (t
-           (warn
+           (warn-invalid-local-call call n-call-args
             'local-argument-mismatch
             :format-control
             "function called with ~R argument~:P, but wants exactly ~R"
-            :format-arguments (list n-call-args nargs))
-           (setf (basic-combination-kind call) :error)))))
+            :format-arguments (list n-call-args nargs))))))
 
 ;;;; &OPTIONAL, &MORE and &KEYWORD calls
 
@@ -522,12 +539,11 @@
         (max-args (optional-dispatch-max-args fun))
         (call-args (length (combination-args call))))
     (cond ((< call-args min-args)
-           (warn
+           (warn-invalid-local-call call call-args
             'local-argument-mismatch
             :format-control
             "function called with ~R argument~:P, but wants at least ~R"
-            :format-arguments (list call-args min-args))
-           (setf (basic-combination-kind call) :error))
+            :format-arguments (list call-args min-args)))
           ((<= call-args max-args)
            (convert-call ref call
                          (let ((*current-component* (node-component ref)))
@@ -536,13 +552,12 @@
           ((optional-dispatch-more-entry fun)
            (convert-more-call ref call fun))
           (t
-           (warn
+           (warn-invalid-local-call call call-args
             'local-argument-mismatch
             :format-control
             "function called with ~R argument~:P, but wants at most ~R"
             :format-arguments
-            (list call-args max-args))
-           (setf (basic-combination-kind call) :error))))
+            (list call-args max-args)))))
   (values))
 
 ;;; This function is used to convert a call to an entry point when
@@ -622,7 +637,12 @@
         (when (oddp (length more))
           (compiler-warn "function called with odd number of ~
                           arguments in keyword portion")
-          (setf (basic-combination-kind call) :error)
+          (transform-call-with-ir1-environment
+           call
+           `(lambda (&rest args)
+              (declare (ignore args))
+              (%odd-key-args-error))
+           '%odd-key-args-error)
           (return-from convert-more-call))
 
         (do ((key more (cddr key))
@@ -663,7 +683,12 @@
         (when (and loser (not (optional-dispatch-allowp fun)) (not allowp))
           (compiler-warn "function called with unknown argument keyword ~S"
                          (car loser))
-          (setf (basic-combination-kind call) :error)
+          (transform-call-with-ir1-environment
+           call
+           `(lambda (&rest args)
+              (declare (ignore args))
+              (%unknown-key-arg-error ',(car loser)))
+           '%unknown-key-arg-error)
           (return-from convert-more-call)))
 
       (collect ((call-args))
@@ -1055,12 +1080,70 @@
                 (eq (component-kind (lambda-component fun))
                     :initial)))))
 
+;;; ir1opt usually takes care of forwarding let-bound values directly
+;;; to their destination when possible.  However, locall analysis
+;;; greatly benefits from that transformation, and is executed in a
+;;; distinct phase from ir1opt.  After let-conversion, variables
+;;; bound to functional values are immediately substituted away.
+;;;
+;;; When called from locall, component is non-nil, and the functionals
+;;; are marked for reanalysis when appropriate.
+(defun substitute-let-funargs (call fun component)
+  (declare (type combination call) (type clambda fun)
+           (type (or null component) component))
+  (loop for arg in (combination-args call)
+        and var in (lambda-vars fun)
+        ;; only do that in the absence of assignment
+        when (and arg (null (lambda-var-sets var)))
+        do
+     (binding* ((use  (lvar-uses arg))
+                (()   (ref-p use) :exit-if-null)
+                (leaf (ref-leaf use))
+                (done-something nil))
+       ;; unlike propagate-let-args, we're only concerned with
+       ;; functionals.
+       (cond ((not (functional-p leaf)))
+             ;; if the types match, we can mutate refs to point to
+             ;;  the functional instead of var
+             ((csubtypep (single-value-type (node-derived-type use))
+                         (leaf-type var))
+              (let ((use-component (node-component use)))
+                (substitute-leaf-if
+                 (lambda (ref)
+                   (cond ((eq (node-component ref) use-component)
+                          (setf done-something t))
+                         (t
+                          (aver (lambda-toplevelish-p (lambda-home fun)))
+                          nil)))
+                 leaf var)))
+             ;; otherwise, we can still play LVAR-level tricks for single
+             ;;  destination variables.
+             ((and (singleton-p (leaf-refs var))
+                   ;; Don't substitute single-ref variables on high-debug /
+                   ;; low speed, to improve the debugging experience.
+                   (not (preserve-single-use-debug-var-p call var)))
+              (setf done-something t)
+              (substitute-single-use-lvar arg var)))
+       ;; if we've done something, the functional may now be used in
+       ;; more analysis-friendly manners.  Enqueue it if we're in
+       ;; locall.
+       (when (and done-something
+                  component
+                  (member leaf (component-lambdas component)))
+         (pushnew leaf (component-reanalyze-functionals component)))))
+  (values))
+
 ;;; This function is called when there is some reason to believe that
 ;;; CLAMBDA might be converted into a LET. This is done after local
 ;;; call analysis, and also when a reference is deleted. We return
 ;;; true if we converted.
-(defun maybe-let-convert (clambda)
-  (declare (type clambda clambda))
+;;;
+;;; COMPONENT is non-nil during local call analysis.  It is used to
+;;; re-enqueue functionals for reanalysis when they have been forwarded
+;;; directly to destination nodes.
+(defun maybe-let-convert (clambda &optional component)
+  (declare (type clambda clambda)
+           (type (or null component) component))
   (unless (or (declarations-suppress-let-conversion-p clambda)
               (functional-has-external-references-p clambda))
     ;; We only convert to a LET when the function is a normal local
@@ -1104,7 +1187,10 @@
               (let-convert clambda dest))
             (reoptimize-call dest)
             (setf (functional-kind clambda)
-                  (if (mv-combination-p dest) :mv-let :let))))
+                  (if (mv-combination-p dest) :mv-let :let))
+            (when (combination-p dest)  ;  mv-combinations are too hairy
+                                        ;  for me to handle - PK 2012-05-30
+              (substitute-let-funargs dest clambda component))))
         t))))
 
 ;;;; tail local calls and assignments

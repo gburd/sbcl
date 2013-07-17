@@ -1365,23 +1365,6 @@
         (make-code-segment code start-offset length)
         (nreverse segments))))
 
-;;; Return two values: the amount by which the last instruction in the
-;;; segment goes past the end of the segment, and the offset of the
-;;; end of the segment from the beginning of that instruction. If all
-;;; instructions fit perfectly, return 0 and 0.
-(defun segment-overflow (segment dstate)
-  (declare (type segment segment)
-           (type disassem-state dstate))
-  (let ((seglen (seg-length segment))
-        (last-start 0))
-    (map-segment-instructions (lambda (chunk inst)
-                                (declare (ignore chunk inst))
-                                (setf last-start (dstate-cur-offs dstate)))
-                              segment
-                              dstate)
-    (values (- (dstate-cur-offs dstate) seglen)
-            (- seglen last-start))))
-
 ;;; Compute labels for all the memory segments in SEGLIST and adds
 ;;; them to DSTATE. It's important to call this function with all the
 ;;; segments you're interested in, so that it can find references from
@@ -1428,13 +1411,15 @@
            (type stream stream)
            (type disassem-state dstate))
   (unless (null segments)
+    (format stream "~&; Size: ~a bytes"
+            (reduce #'+ segments :key #'seg-length))
     (let ((first (car segments))
           (last (car (last segments))))
       (set-location-printing-range dstate
-                                  (seg-virtual-location first)
-                                  (- (+ (seg-virtual-location last)
-                                        (seg-length last))
-                                     (seg-virtual-location first)))
+                                   (seg-virtual-location first)
+                                   (- (+ (seg-virtual-location last)
+                                         (seg-length last))
+                                      (seg-virtual-location first)))
       (setf (dstate-output-state dstate) :beginning)
       (dolist (seg segments)
         (disassemble-segment seg stream dstate)))))
@@ -1558,123 +1543,21 @@
       (label-segments segments dstate))
     (disassemble-segments segments stream dstate)))
 
-;;; code for making useful segments from arbitrary lists of code-blocks
-
-;;; the maximum size of an instruction. Note that this includes
-;;; pseudo-instructions like error traps with their associated
-;;; operands, so it should be big enough to include them, i.e. it's
-;;; not just 4 on a risc machine!
-(defconstant max-instruction-size 16)
-
-(defun add-block-segments (seg-code-block
-                           seglist
-                           location
-                           connecting-vec
-                           dstate)
-  (declare (type list seglist)
-           (type integer location)
-           (type (or null (vector (unsigned-byte 8))) connecting-vec)
-           (type disassem-state dstate))
-  (flet ((addit (seg overflow)
-           (let ((length (+ (seg-length seg) overflow)))
-             (when (> length 0)
-               (setf (seg-length seg) length)
-               (incf location length)
-               (push seg seglist)))))
-    (let ((connecting-overflow 0)
-          (amount (length seg-code-block)))
-      (when connecting-vec
-        ;; Tack on some of the new block to the old overflow vector.
-        (let* ((beginning-of-block-amount
-                (if seg-code-block (min max-instruction-size amount) 0))
-               (connecting-vec
-                (if seg-code-block
-                    (concatenate
-                     '(vector (unsigned-byte 8))
-                     connecting-vec
-                     (subseq seg-code-block 0 beginning-of-block-amount))
-                    connecting-vec)))
-          (when (and (< (length connecting-vec) max-instruction-size)
-                     (not (null seg-code-block)))
-            (return-from add-block-segments
-              ;; We want connecting vectors to be large enough to hold
-              ;; any instruction, and since the current seg-code-block
-              ;; wasn't large enough to do this (and is now entirely
-              ;; on the end of the overflow-vector), just save it for
-              ;; next time.
-              (values seglist location connecting-vec)))
-          (when (> (length connecting-vec) 0)
-            (let ((seg
-                   (make-vector-segment connecting-vec
-                                        0
-                                        (- (length connecting-vec)
-                                           beginning-of-block-amount)
-                                        :virtual-location location)))
-              (setf connecting-overflow (segment-overflow seg dstate))
-              (addit seg connecting-overflow)))))
-      (cond ((null seg-code-block)
-             ;; nothing more to add
-             (values seglist location nil))
-            ((< (- amount connecting-overflow) max-instruction-size)
-             ;; We can't create a segment with the minimum size
-             ;; required for an instruction, so just keep on accumulating
-             ;; in the overflow vector for the time-being.
-             (values seglist
-                     location
-                     (subseq seg-code-block connecting-overflow amount)))
-            (t
-             ;; Put as much as we can into a new segment, and the rest
-             ;; into the overflow-vector.
-             (let* ((initial-length
-                     (- amount connecting-overflow max-instruction-size))
-                    (seg
-                     (make-vector-segment seg-code-block
-                                          connecting-overflow
-                                          initial-length
-                                          :virtual-location location))
-                    (overflow
-                     (segment-overflow seg dstate)))
-               (addit seg overflow)
-               (values seglist
-                       location
-                       (subseq seg-code-block
-                               (+ connecting-overflow (seg-length seg))
-                               amount))))))))
-
 ;;;; code to disassemble assembler segments
 
-(defun assem-segment-to-disassem-segments (assem-segment dstate)
-  (declare (type sb!assem:segment assem-segment)
-           (type disassem-state dstate))
-  (let ((location 0)
-        (disassem-segments nil)
-        (connecting-vec nil))
-    (sb!assem:on-segment-contents-vectorly
-     assem-segment
-     (lambda (seg-code-block)
-       (multiple-value-setq (disassem-segments location connecting-vec)
-         (add-block-segments seg-code-block
-                             disassem-segments
-                             location
-                             connecting-vec
-                             dstate))))
-    (when connecting-vec
-      (setf disassem-segments
-            (add-block-segments nil
-                                disassem-segments
-                                location
-                                connecting-vec
-                                dstate)))
-    (sort disassem-segments #'< :key #'seg-virtual-location)))
+(defun assem-segment-to-disassem-segment (assem-segment)
+  (declare (type sb!assem:segment assem-segment))
+  (let ((contents (sb!assem:segment-contents-as-vector assem-segment)))
+    (make-vector-segment contents 0 (length contents) :virtual-location 0)))
 
 ;;; Disassemble the machine code instructions associated with
 ;;; ASSEM-SEGMENT (of type assem:segment).
 (defun disassemble-assem-segment (assem-segment stream)
   (declare (type sb!assem:segment assem-segment)
            (type stream stream))
-  (let* ((dstate (make-dstate))
-         (disassem-segments
-          (assem-segment-to-disassem-segments assem-segment dstate)))
+  (let ((dstate (make-dstate))
+        (disassem-segments
+         (list (assem-segment-to-disassem-segment assem-segment))))
     (label-segments disassem-segments dstate)
     (disassemble-segments disassem-segments stream dstate)))
 
@@ -1683,10 +1566,10 @@
 ;;; an alist of (SYMBOL-SLOT-OFFSET . ACCESS-FUN-NAME) for slots
 ;;; in a symbol object that we know about
 (defparameter *grokked-symbol-slots*
-  (sort `((,sb!vm:symbol-value-slot . symbol-value)
-          (,sb!vm:symbol-plist-slot . symbol-plist)
-          (,sb!vm:symbol-name-slot . symbol-name)
-          (,sb!vm:symbol-package-slot . symbol-package))
+  (sort (copy-list `((,sb!vm:symbol-value-slot . symbol-value)
+                     (,sb!vm:symbol-plist-slot . symbol-plist)
+                     (,sb!vm:symbol-name-slot . symbol-name)
+                     (,sb!vm:symbol-package-slot . symbol-package)))
         #'<
         :key #'car))
 
@@ -1742,22 +1625,35 @@
          t)
         (values nil nil))))
 
-(defun get-code-constant-absolute (addr dstate)
+(defstruct code-constant-raw value)
+(def!method print-object ((self code-constant-raw) stream)
+  (format stream "#x~8,'0x" (code-constant-raw-value self)))
+
+(defun get-code-constant-absolute (addr dstate &optional width)
   (declare (type address addr))
   (declare (type disassem-state dstate))
   (let ((code (seg-code (dstate-segment dstate))))
     (if (null code)
       (return-from get-code-constant-absolute (values nil nil)))
-    (let ((code-size (ash (sb!kernel:get-header-data code) sb!vm:word-shift)))
-      (sb!sys:without-gcing
-       (let ((code-addr (- (sb!kernel:get-lisp-obj-address code)
-                           sb!vm:other-pointer-lowtag)))
-         (if (or (< addr code-addr) (>= addr (+ code-addr code-size)))
-           (values nil nil)
-           (values (sb!kernel:code-header-ref
-                    code
-                    (ash (- addr code-addr) (- sb!vm:word-shift)))
-                   t)))))))
+    (sb!sys:without-gcing
+     (let* ((n-header-words (sb!kernel:get-header-data code))
+            (n-code-words (sb!kernel:%code-code-size code))
+            (header-addr (- (sb!kernel:get-lisp-obj-address code)
+                             sb!vm:other-pointer-lowtag)))
+         (cond ((<= header-addr addr (+ header-addr (ash (1- n-header-words)
+                                                         sb!vm:word-shift)))
+                (values (sb!sys:sap-ref-lispobj (sb!sys:int-sap addr) 0) t))
+               ;; guess it's a non-descriptor constant from the instructions
+               ((and (eq width :qword)
+                     (< n-header-words
+                        ;; convert ADDR to header-relative Nth word
+                        (ash (- addr header-addr) (- sb!vm:word-shift))
+                        (+ n-header-words n-code-words)))
+                (values (make-code-constant-raw
+                         :value (sb!sys:sap-ref-64 (sb!sys:int-sap addr) 0))
+                        t))
+               (t
+                (values nil nil)))))))
 
 (defvar *assembler-routines-by-addr* nil)
 
@@ -1779,7 +1675,17 @@
           (invert-address-hash sb!fasl:*assembler-routines*))
     (setf *assembler-routines-by-addr*
           (invert-address-hash sb!sys:*static-foreign-symbols*
-                               *assembler-routines-by-addr*)))
+                               *assembler-routines-by-addr*))
+    (loop for static in sb!vm:*static-funs*
+          for address = (+ sb!vm::nil-value
+                           (sb!vm::static-fun-offset static))
+          do
+          (setf (gethash address *assembler-routines-by-addr*)
+                static))
+    ;; Not really a routine, but it uses the similar logic for annotations
+    #!+sb-safepoint
+    (setf (gethash sb!vm::gc-safepoint-page-addr *assembler-routines-by-addr*)
+          "safepoint"))
   (gethash address *assembler-routines-by-addr*))
 
 ;;;; some handy function for machine-dependent code to use...
@@ -1875,11 +1781,11 @@
 ;;; Store a note about the lisp constant located at ADDR in the
 ;;; current code-component, to be printed as an end-of-line comment
 ;;; after the current instruction is disassembled.
-(defun note-code-constant-absolute (addr dstate)
+(defun note-code-constant-absolute (addr dstate &optional width)
   (declare (type address addr)
            (type disassem-state dstate))
   (multiple-value-bind (const valid)
-      (get-code-constant-absolute addr dstate)
+      (get-code-constant-absolute addr dstate width)
     (when valid
       (note (lambda (stream)
               (prin1-quoted-short const stream))
@@ -1987,7 +1893,7 @@
   (car (svref sb!c:*backend-internal-errors* errnum)))
 
 (defun get-sc-name (sc-offs)
-  (sb!c::location-print-name
+  (sb!c:location-print-name
    ;; FIXME: This seems like an awful lot of computation just to get a name.
    ;; Couldn't we just use lookup in *BACKEND-SC-NAMES*, without having to cons
    ;; up a new object?

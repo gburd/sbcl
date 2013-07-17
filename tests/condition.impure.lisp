@@ -122,6 +122,7 @@
               (return-from restart-test-finds-restarts 42))
          :test-function
          (lambda (condition)
+           (declare (ignore condition))
            (find-restart 'qux))))
     (when (find-restart 'bar)
       (invoke-restart 'bar))))
@@ -142,3 +143,152 @@
     (assert
      (eq (eval `(define-condition ,name () ()))
          name))))
+
+;;; bug-1164970
+
+(define-condition condition-with-default-initargs (condition)
+  ()
+  (:default-initargs :foo 1))
+
+(with-test (:name (sb-mop:class-direct-default-initargs :for-condition-class
+                   :bug-1164970))
+  ;; CLASS-DIRECT-DEFAULT-INITARGS used to return nil for all
+  ;; condition classes.
+  (let ((initargs (sb-mop:class-direct-default-initargs
+                   (find-class 'condition-with-default-initargs))))
+    (assert (equal (subseq (first initargs) 0 2) '(:foo 1)))))
+
+;;; bug-539517
+
+(defconstant +error-when-called+ (lambda () (error "oops")))
+
+(define-condition condition-with-constant-function-initarg ()
+  ((foo :initarg :foo
+        :reader condition-with-constant-function-initarg-foo))
+  (:default-initargs :foo +error-when-called+))
+
+(with-test (:name (:condition-with-constant-function-initarg :bug-539517))
+  ;; The default initarg handling for condition classes used to
+  ;; confuse constant functions (thus +ERROR-WHEN-CALLED+) and
+  ;; initfunctions. This lead to +ERROR-WHEN-CALLED+ being called as
+  ;; if it was an initfunction.
+  (assert (functionp
+           (condition-with-constant-function-initarg-foo
+            (make-condition 'condition-with-constant-function-initarg))))
+  (assert (functionp
+           (condition-with-constant-function-initarg-foo
+            (make-instance 'condition-with-constant-function-initarg)))))
+
+;; Same problem
+
+(define-condition condition-with-constant-function-initform ()
+  ((foo :initarg :foo
+        :reader condition-with-constant-function-initform-foo
+        :initform +error-when-called+)))
+
+(with-test (:name (:condition-with-constant-function-slot-initform))
+  (assert (functionp
+           (condition-with-constant-function-initform-foo
+            (make-condition 'condition-with-constant-function-initform))))
+  (assert (functionp
+           (condition-with-constant-function-initform-foo
+            (make-instance 'condition-with-constant-function-initform)))))
+
+;;; bug-1164969
+
+(defvar bar-counter 0)
+
+(defvar baz-counter 0)
+
+(define-condition condition-with-non-constant-default-initarg ()
+  ((bar :initarg :bar
+        :reader condition-with-non-constant-default-initarg-bar)
+   (baz :initarg :baz
+        :reader condition-with-non-constant-default-initarg-baz
+        :initform (incf baz-counter)))
+  (:default-initargs :bar (incf bar-counter)))
+(define-condition condition-with-non-constant-default-initarg ()
+  ((bar :initarg :bar
+        :reader condition-with-non-constant-default-initarg-bar)
+   (baz :initarg :baz
+        :reader condition-with-non-constant-default-initarg-baz
+        :initform (incf baz-counter)))
+  (:default-initargs :bar (incf bar-counter)))
+
+(with-test (:name (:redefining-condition-with-non-constant-default-initarg
+                   :bug-1164969))
+  ;; Redefining conditions could lead to multiple evaluations of
+  ;; initfunctions for slots and default initargs. We need all the
+  ;; combinations of make-condition/instance and eval/compile because
+  ;; they failed differently.
+  (macrolet ((test (case &body body)
+               `(progn
+                  (setf bar-counter 0
+                        baz-counter 0)
+                  (let ((instance (progn ,@body)))
+                    (assert
+                     (= 1 (condition-with-non-constant-default-initarg-bar
+                           instance))
+                     nil
+                     ,(format nil "Assertion failed for default initarg initfunction for ~A"
+                              case))
+                    (assert
+                     (= 1 (condition-with-non-constant-default-initarg-baz
+                           instance))
+                     nil
+                     ,(format nil "Assertion failed for slot initfunction for ~A"
+                              case)))
+                  (assert (= 1 bar-counter))
+                  (assert (= 1 baz-counter)))))
+
+    ;; Go through EVAL to avoid optimizations.
+    (test :eval+make-condition
+      (eval '(make-condition
+              'condition-with-non-constant-default-initarg)))
+    (test :eval+make-instance
+      (eval '(make-instance
+              'condition-with-non-constant-default-initarg)))
+
+    ;; Allow optimizations.
+    (test :compile+make-condition
+      (make-condition
+       'condition-with-non-constant-default-initarg))
+    (test :compile+make-instance
+      (make-instance
+       'condition-with-non-constant-default-initarg))))
+
+;;; bug-1049404
+
+(define-condition condition-with-class-allocation ()
+  ((count :accessor condition-with-class-allocation-count
+          :initform 0
+          :allocation :class)))
+
+(with-test (:name (:condition-with-class-allocation :bug-1049404))
+  (loop repeat 5 do
+           (incf (condition-with-class-allocation-count
+                  (make-condition 'condition-with-class-allocation))))
+  (assert (= 5 (condition-with-class-allocation-count
+                (make-condition 'condition-with-class-allocation)))))
+
+;;; bug-789497
+
+(with-test (:name (assert :print-intermediate-results :bug-789497))
+  (macrolet ((test (bindings expression expected-message)
+               `(let ,bindings
+                  (handler-case (assert ,expression)
+                    (simple-error (condition)
+                      (assert (string= (princ-to-string condition)
+                                       ,expected-message)))))))
+    ;; Constant and variables => no special report.
+    (test () nil "The assertion NIL failed.")
+    (test ((a nil)) a "The assertion A failed.")
+    ;; Special operators => no special report.
+    (test ((a nil) (b nil)) (or a b) "The assertion (OR A B) failed.")
+    (test ((a nil) (b t)) (and a b) "The assertion (AND A B) failed.")
+    ;; Functions with constant and non-constant arguments => include
+    ;; non-constant arguments in report.
+    (test ((a t)) (not a) "The assertion (NOT A) failed with A = T.")
+    (test () (not t) "The assertion (NOT T) failed.")
+    (test ((a -1)) (plusp (signum a))
+          "The assertion (PLUSP (SIGNUM A)) failed with (SIGNUM A) = -1.")))

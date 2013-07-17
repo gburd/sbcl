@@ -172,9 +172,9 @@
 ;;; Return the most specific integer type that can be quickly checked that
 ;;; includes the given type.
 (defun containing-integer-type (subtype)
-  (dolist (type '(fixnum
-                  (signed-byte 32)
-                  (unsigned-byte 32)
+  (dolist (type `(fixnum
+                  (signed-byte ,sb!vm:n-word-bits)
+                  (unsigned-byte ,sb!vm:n-word-bits)
                   integer)
                 (error "~S isn't an integer type?" subtype))
     (when (csubtypep subtype (specifier-type type))
@@ -182,6 +182,7 @@
 
 ;;; If TYPE has a CHECK-xxx template, but doesn't have a corresponding
 ;;; PRIMITIVE-TYPE, then return the template's name. Otherwise, return NIL.
+;;; The second value is T if the template needs TYPE to be passed.
 (defun hairy-type-check-template-name (type)
   (declare (type ctype type))
   (typecase type
@@ -208,6 +209,11 @@
            #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
            ((type= type (specifier-type '(unsigned-byte 64)))
             'sb!c:check-unsigned-byte-64)
+           #!+(or x86 x86-64) ; Not implemented yet on other platforms
+           ((and (eql (numeric-type-class type) 'integer)
+                 (eql (numeric-type-low type) 0)
+                 (fixnump (numeric-type-high type)))
+            (values 'sb!c:check-mod-fixnum t))
            (t nil)))
     (fun-type
      'sb!c:check-fun)

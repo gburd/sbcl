@@ -1,13 +1,170 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
-changes relative to sbcl-1.1.5:
-  * enhancement: the continuable error when defknown-ing over extant 
+changes relative to sbcl-1.1.8:
+  * enhancement: disassemble now annotates some previously missing static
+    functions, like LENGTH.
+  * optimization: calls to static functions on x86-64 use less instructions.
+  * optimization: compute encode-universal-time at compile time when possible.
+  * optimization: when referencing internal functions as #'x, don't go through
+    an indirect fdefn structure.
+  * optimization: SLEEP doesn't cons on non-immediate floats and on ratios.
+  * optimization: (mod fixnum) type-checks are performed using one unsigned
+    comparison, instead of two.
+  * bug fix: problems with NCONC type derivation (reported by Jerry James).
+  * bug fix: EXPT type derivation no longer constructs bogus floating-point
+    types.  (reported by Vsevolod Dyomkin)
+  * bug fix: sb-bsd-sockets has correct declaration of the canonname field of
+    addrinfo. (lp#1187041, patch by Jerry James)
+  * bug fix: uninitialized type-error conditions can now be printed.
+    (lp#1184586)
+  * bug fix: tests for sb-bsd-sockets no longer use a predefined port for
+    listening, allowing several tests to run in parallel.
+  * bug fix: during disassembly to *COMPILER-TRACE-OUTPUT* instruction
+    prefixes as used on x86 and x86-64 no longer sometimes print incorrectly.
+    (lp#1085729)
+  
+changes in sbcl-1.1.8 relative to sbcl-1.1.7:
+  * notice: The implementation of MAP-ALLOCATED-OBJECTS (the heart of
+    ROOM, plus a few SB-INTROSPECT functions) has been completely
+    rewritten; it may now exhibit different bugs than before.
+  * new feature: minimal runtime/compiler intrastructure support for SSE
+    SIMD values, as SB-EXT:SIMD-PACK. Enabled on x86-64 via the build-time
+    feature :sb-simd-pack. This should enable intrinsics extensions as
+    libraries, without patching SBCL itself. Thanks to Alexander Gavrilov
+    for maintaining a branch for so long.
+  * enhancement: RUN-PROGRAM supports a :DIRECTORY argument to set
+    the working directory of the spawned process.
+    (lp#791800) (patch by Matthias Benkard)
+  * enhancement: boxed vectors (vectors of T or of FIXNUM) can now be
+    stack-allocated on PPC.
+  * enhancement: "fixed objects" can now be stack-allocated on PPC.
+  * enhancement: WITH-PINNED-OBJECTS no longer conses on PPC/GENCGC.
+  * enhancement: (sb-introspect:find-definition-sources-by-name x :vop) now
+    also returns VOPs which do not translate any functions, and finds
+    defoptimizer types ir2convert and stack-allocate-result.
+  * enhancement: better type derivation for APPEND, NCONC, LIST.
+    (lp#538957)
+  * enhancement: MAP-ALLOCATED-OBJECTS (the heart of ROOM) now walks the
+    heap in a manner similar to the GC rather than its previous ad-hoc
+    scheme, and is therefore no less and possibly more accurate.
+  * fixes and enhancements related to Unicode:
+    ** the character database information has been updated to Unicode 6.2;
+    ** support for canonical and compatibility decomposition of characters has
+       been added, along with support for primary composition;
+    ** support for Unicode normalization forms of strings (NFC, NFKC, NFD and
+       NFKD) has been included;
+    ** querying the character database for code points not defined by Unicode
+       gives less wrong answers (lp#1178038, reported by Ken Harris)
+  * enhancement: print intermediate evaluation results for some ASSERTed
+    expressions. (lp#789497) (patch by Alexandra Barchunova)
+  * enhancement: x86-64 disassemblies are annotated with unboxed constant
+    values when there are references to (RIP-relative) unboxed constants.
+  * bug fix: type derivation for LOG{AND,IOR,XOR} scales linearly instead
+    of quadratically with the size of the input in the worst case.
+    (lp#1096444)
+  * bug fix: handle errors when initializing *default-pathname-defaults*,
+    sb-ext:*runtime-pathname*, sb-ext:*posix-argv* on startup, like character
+    decoding errors, or directories being deleted.
+  * bug fix: Loading a core with a discontiguous dynamic space now correctly
+    computes the amount of dynamic space used.
+  * bug fix: disassembler missing ",8" on SHLD
+  * bug fix: backtracing through INTERNAL-ERROR signal handlers on systems
+    that provide an "invalid" stack frame link for the signal handler
+    itself now use the saved-fp-and-pc mechanism to pick up from the stack
+    frame in the interrupt (signal) context.  This is known to affect
+    threaded FreeBSD/x86-64.
+  * bug fix: some LOOP statements couldn't be compiled.
+    (lp#1178989)
+  * bug fix: sb-sequence:dosequence works on literal vectors.
+  * bug fix: errors in generic arithmetic show the assembly routine's
+    caller on x86 and x86-64. (lp#800343)
+  * bug fix: Compile-time type errors should never result in COMPILE-FILE
+    failure. (lp#943953)
+  * bug fix: Known bad local calls do not cause strange failures when
+    emitting or dumping code. (lp#504121)
+  * bug fix: Multiply-inlined structure constructor don't cause IR2-time
+    codegen errors: type checks are inserted as necessary. (lp#1177703)
+  * bug fix: Unsigned modular arithmetic is correctly converted into signed
+    modular arithemtic (mostly to exploit fixnum-width VOPs). (lp#1026634)
+  * bug fix: a combination of inlined local function with &optional and
+    recursion no longer causes undescriptive compiler errors. (lp#1180992)
+  * bug fix: sub-word BOOLEAN alien types now disregard higher order bits
+    when testing for non-zero-ness.
+  * bug fix: (CONCATENATE 'null ...) no longer fails for generic sequences.
+    (lp#1162301)
+  * bug fix: Type mismatch for the value of conditional expressions are
+    correctly reported when detected at compile-time, instead of complaining
+    about a constant NIL (similar for non-EQ-comparable catch tags).
+  * bug fix: Referring to INLINE global functions as values should not result
+    in a compilation failure. (lp#1035721)
+  * optimization: faster ISQRT on fixnums and small bignums
+  * optimization: faster and smaller INTEGER-LENGTH on fixnums on x86-64.
+  * optimization: On x86-64, the number of multi-byte NOP instructions used
+    for code alignment is now always minimal.
+  * optimization: On 64-bit targets, the compiler generates much faster
+    code for type checks for types known at compile time that are smaller
+    than (SIGNED-BYTE 64) or (UNSIGNED-BYTE 64) and larger than FIXNUM, and
+    their COMPLEX variants.
+  * optimization: On x86 targets, more uses of ALIEN-FUNCALL during cross
+    compilation now inline the INVOKE-WITH-SAVED-FP-AND-PC dance.
+  * optimization: ROOM no longer conses so egregiously on non-x86oid
+    systems.
+  * optimization: associative bitwise operations reassociate patterns like
+    (f (f x k1) k2) to expose (f x (f k1 k2)).  Same for + and * of
+    rational values.
+  * optimization: quasiquote expressions now perform more constant folding,
+    instead of consing equal lists at runtime. (lp#1026439)
+  * optimization: local call analysis of inlined higher-order function
+    should converge more quickly, resulting in better code for complex
+    functions.
+  * optimization: On x86-64, medium (word-sized but wider than 32 bits)
+    integer constants are handled more cleverly, especially when they
+    can be represented as sign-extended (signed-byte 32). (Based on a
+    patch by Douglas Katzman)
+  * optimization: IF/IF conversion should reliably result in sane code
+    when (some of) the results of the inner IF are always false or
+    always true.
+  * optimization: On x86oids, variable right shifts of machine words are
+    compiled into straight SAR/SHR, instead of going through the generic
+    VOP. (lp#1066204)
+
+changes in sbcl-1.1.7 relative to sbcl-1.1.6:
+  * enhancement: TRACE :PRINT-ALL handles multiple-valued forms.
+    (lp#457053)
+  * bug fix: :allocation slot option works for condition slots
+    (lp#1049404)
+  * bug fix: redefining conditions does not lead to multiple evaluations of
+    hairy slot initfunctions anymore (lp#1164969)
+  * bug fix: CLASS-DIRECT-DEFAULT-INITARGS now works for condition classes
+    (lp#1164970)
+  * bug fix: function constants now work as initforms and default initarg
+    values of conditions (lp#539517)
+  * bug fix: svref/(setf svref) on symbol macros don't crash the compiler
+    anymore. (Minimal test case provided by James M. Lawrence on sbcl-devel)
+  * bug fix: no more bogus ## references when pretty printing backquoted
+    forms with non-trivial structure sharing. (lp#1161218)
+  * bug fix: Don't signal an error on (setf (documentation nil 'function)
+    "doc").  Signal a style-warning instead when trying to set documentation
+    of NIL for all other documentation types.  (Reported by Zach
+    Beane; regression since 2e52fa05.)
+  * bug fix: modular arithmetic involving large constants and conditionals
+    should no longer result in spurious dead code elimination.  (Reported by 
+    Eric Marsden).
+  * bug fix: our mach exception handler can seemingly called very early in
+    the program execution process on OS X 10.8.0. Try and handle that case
+    robustly, without potentially leaking mach ports too much.
+  * optimization: LOGBITP and LOGTEST optimizations from x86 ported to x86_64.
+
+changes in sbcl-1.1.6 relative to sbcl-1.1.5:
+  * enhancement: the continuable error when defknown-ing over extant
     fndb entries can be ignored by passing :overwrite-fndb-silently t
     as a keyword argument to sb-c:defknown (after attributes). Useful
     to allow defknown to be re-loaded. Use with :allow-other-keys t
     for backward compatibility.
+  * optimization: compiler is much faster in compiling SVREF and (SETF SVREF)
+    forms.
   * bug fix: Prevent a make-array transform from modifying source forms
     causing problems for inlined code. Thanks to Bart Botta.
-   (regression since 1.0.42.11-bis)
+    (regression since 1.0.42.11-bis)
   * bug fix: clear-output calls the correct gray stream routine,
     sb-gray:stream-clear-output. (lp#1153257)
   * bug fix: an error is signalled for an invalid format modifier: ~<~@>.
@@ -16,7 +173,13 @@ changes relative to sbcl-1.1.5:
   * bug fix: delete-package on a nonexistent package should signal a cerror.
     (regression since 1.0.37.44).
   * bug fix: accessing &MORE (stack allocated &REST) arguments checks bounds.
-    (lp#1154946)
+    (lp#1154946, lp#1072112)
+  * bug fix: compiling make-array no longer signals an error when the
+    element-type is an uknown type, a warning is issued instead.
+    Thanks to James Kalenius (lp#1156095)
+  * bug fix: SEARCH on generic (non-VECTOR non-LIST) sequence types no longer
+    produces wrong results for some inputs.  (Thanks to Jan Moringen.)
+    (lp#1153312)
 
 changes in sbcl-1.1.5 relative to sbcl-1.1.4:
   * minor incompatible change: SB-SPROF:WITH-PROFILING no longer loops

@@ -576,6 +576,8 @@
                (test x2)
                (test (1+ x2))
                (test (1- x2)))))
+    (test most-positive-fixnum)
+    (test (1+ most-positive-fixnum))
     (loop for i from 1 to 200
           for pow = (expt 2 (1- i))
           for j = (+ pow (random pow))
@@ -584,3 +586,15 @@
           (tests j))
     (dotimes (i 10)
       (tests (random (expt 2 (+ 1000 (random 10000))))))))
+
+;; bug 1026634 (reported by Eric Marsden on sbcl-devel)
+(with-test (:name :recursive-cut-to-width)
+  (assert (eql (funcall
+                (compile nil
+                         `(lambda (x)
+                            (declare (optimize (space 3))
+                                     (type (integer 12417236377505266230
+                                                    12417274239874990070) x))
+                            (logand 8459622733968096971 x)))
+                12417237222845306758)
+               2612793697039849090)))

@@ -35,7 +35,8 @@
          array-type
          character-set-type
          built-in-classoid
-         cons-type)
+         cons-type
+         #!+sb-simd-pack simd-pack-type)
      (values (%typep obj type) t))
     (classoid
      (if (if (csubtypep type (specifier-type 'function))
@@ -166,6 +167,12 @@
      (make-cons-type *universal-type* *universal-type*))
     (character
      (specifier-type 'character))
+    #!+sb-simd-pack
+    (simd-pack
+     (let ((type (nth (%simd-pack-tag x) *simd-pack-element-types*)))
+       (if type
+           (specifier-type `(simd-pack ,type))
+           (specifier-type 'simd-pack))))
     (t
      (classoid-of x))))
 

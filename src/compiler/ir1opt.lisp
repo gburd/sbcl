@@ -289,16 +289,20 @@
 ;;; What we do is intersect RTYPE with NODE's DERIVED-TYPE. If the
 ;;; intersection is different from the old type, then we do a
 ;;; REOPTIMIZE-LVAR on the NODE-LVAR.
-(defun derive-node-type (node rtype)
+(defun derive-node-type (node rtype &key from-scratch)
   (declare (type valued-node node) (type ctype rtype))
-  (let ((node-type (node-derived-type node)))
-    (unless (eq node-type rtype)
+  (let* ((initial-type (node-derived-type node))
+         (node-type (if from-scratch
+                        *wild-type*
+                        initial-type)))
+    (unless (eq initial-type rtype)
       (let ((int (values-type-intersection node-type rtype))
             (lvar (node-lvar node)))
-        (when (type/= node-type int)
+        (when (type/= initial-type int)
           (when (and *check-consistency*
                      (eq int *empty-type*)
                      (not (eq rtype *empty-type*)))
+            (aver (not from-scratch))
             (let ((*compiler-error-context* node))
               (compiler-warn
                "New inferred type ~S conflicts with old type:~
@@ -660,7 +664,8 @@
 ;;; is the case.
 ;;; Similarly, when both branches are equivalent, branch directly to either
 ;;; of them.
-;;; Also, if the test has multiple uses, replicate the node when possible.
+;;; Also, if the test has multiple uses, replicate the node when possible...
+;;; in fact, splice in direct jumps to the right branch if possible.
 (defun ir1-optimize-if (node)
   (declare (type cif node))
   (let ((test (if-test node))
@@ -675,23 +680,67 @@
                    alternative)
                   ((type= type (specifier-type 'null))
                    consequent)
-                  ((cblocks-equivalent-p alternative consequent)
+                  ((or (eq consequent alternative) ; Can this happen?
+                       (cblocks-equivalent-p alternative consequent))
                    alternative))))
       (when victim
-        (flush-dest test)
-        (when (rest (block-succ block))
-          (unlink-blocks block victim))
-        (setf (component-reanalyze (node-component node)) t)
-        (unlink-node node)
+        (kill-if-branch-1 node test block victim)
         (return-from ir1-optimize-if (values))))
+    (tension-if-if-1 node test block)
+    (duplicate-if-if-1 node test block)
+    (values)))
 
-    (when (and (eq (block-start-node block) node)
-               (listp (lvar-uses test)))
-      (do-uses (use test)
-        (when (immediately-used-p test use)
-          (convert-if-if use node)
-          (when (not (listp (lvar-uses test))) (return))))))
-  (values))
+;; When we know that we only have a single successor, kill the victim
+;; ... unless the victim and the remaining successor are the same.
+(defun kill-if-branch-1 (node test block victim)
+  (declare (type cif node))
+  (flush-dest test)
+  (when (rest (block-succ block))
+    (unlink-blocks block victim))
+  (setf (component-reanalyze (node-component node)) t)
+  (unlink-node node))
+
+;; When if/if conversion would leave (if ... (if nil ...)) or
+;; (if ... (if not-nil ...)), splice the correct successor right
+;; in.
+(defun tension-if-if-1 (node test block)
+  (when (and (eq (block-start-node block) node)
+             (listp (lvar-uses test)))
+    (do-uses (use test)
+      (when (immediately-used-p test use)
+        (let* ((type (single-value-type (node-derived-type use)))
+               (target (if (type= type (specifier-type 'null))
+                           (if-alternative node)
+                           (multiple-value-bind (typep surep)
+                               (ctypep nil type)
+                             (and (not typep) surep
+                                  (if-consequent node))))))
+          (when target
+            (let ((pred (node-block use)))
+              (cond ((listp (lvar-uses test))
+                     (change-block-successor pred block target)
+                     (delete-lvar-use use))
+                    (t
+                     ;; only one use left. Just kill the now-useless
+                     ;; branch to avoid spurious code deletion notes.
+                     (aver (rest (block-succ block)))
+                     (kill-if-branch-1
+                      node test block
+                      (if (eql target (if-alternative node))
+                          (if-consequent node)
+                          (if-alternative node)))
+                     (return-from tension-if-if-1))))))))))
+
+;; Finally, duplicate EQ-nil tests
+(defun duplicate-if-if-1 (node test block)
+  (when (and (eq (block-start-node block) node)
+             (listp (lvar-uses test)))
+    (do-uses (use test)
+      (when (immediately-used-p test use)
+        (convert-if-if use node)
+        ;; leave the last use as is, instead of replacing
+        ;; the (singly-referenced) CIF node with a duplicate.
+        (when (not (listp (lvar-uses test))) (return))))))
 
 ;;; Create a new copy of an IF node that tests the value of the node
 ;;; USE. The test must have >1 use, and must be immediately used by
@@ -889,7 +938,7 @@
                 ;; The VM mostly knows how to handle this.  We need
                 ;; to massage the call slightly, though.
                 (transform-call node transform (combination-fun-source-name node)))
-               (:default
+               ((:default :maybe)
                 ;; Let transforms have a crack at it.
                 (dolist (x (fun-info-transforms info))
                   #!+sb-show
@@ -2034,6 +2083,7 @@
           (flush-lvar-externally-checkable-type arg))
         (setf (combination-args use) nil)
         (flush-dest list)
+        (flush-combination use)
         (setf (combination-args node) args))
       t)))
 
@@ -2113,7 +2163,7 @@
 
           ;; FIXME: Do it in one step.
           (let ((context (cons (node-source-form cast)
-                               (lvar-source (cast-value cast)))))
+                               (lvar-all-sources (cast-value cast)))))
             (filter-lvar
              value
              (if (cast-single-value-p cast)

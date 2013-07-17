@@ -110,7 +110,7 @@
                       (first new-uses)
                       new-uses)))
           (setf (lvar-uses lvar) nil))
-      (setf (node-lvar node) nil)))
+      (flush-node node)))
   (values))
 ;;; Delete NODE from its LVAR uses; if LVAR has no other uses, delete
 ;;; its DEST's block, which must be unreachable.
@@ -322,9 +322,9 @@
 ;;;;
 
 ;;; Filter values of LVAR through FORM, which must be an ordinary/mv
-;;; call. First argument must be 'DUMMY, which will be replaced with
-;;; LVAR. In case of an ordinary call the function should not have
-;;; return type NIL. We create a new "filtered" lvar.
+;;; call. Exactly one argument must be 'DUMMY, which will be replaced
+;;; with LVAR. In case of an ordinary call the function should not
+;;; have return type NIL. We create a new "filtered" lvar.
 ;;;
 ;;; TODO: remove preconditions.
 (defun filter-lvar (lvar form)
@@ -358,11 +358,18 @@
         ;; Replace 'DUMMY with the LVAR. (We can find 'DUMMY because
         ;; no LET conversion has been done yet.) The [mv-]combination
         ;; code from the call in the form will be the use of the new
-        ;; check lvar. We substitute for the first argument of
-        ;; this node.
+        ;; check lvar. We substitute exactly one argument.
         (let* ((node (lvar-use filtered-lvar))
-               (args (basic-combination-args node))
-               (victim (first args)))
+               victim)
+          (dolist (arg (basic-combination-args node) (aver victim))
+            (let* ((arg (principal-lvar arg))
+                   (use (lvar-use arg))
+                   leaf)
+              (when (and (ref-p use)
+                         (constant-p (setf leaf (ref-leaf use)))
+                         (eql (constant-value leaf) 'dummy))
+                (aver (not victim))
+                (setf victim arg))))
           (aver (eq (constant-value (ref-leaf (lvar-use victim)))
                     'dummy))
 
@@ -758,11 +765,26 @@
 (defun source-path-forms (path)
   (subseq path 0 (position 'original-source-start path)))
 
+(defun tree-some (predicate tree)
+  (let ((seen (make-hash-table)))
+    (labels ((walk (tree)
+               (cond ((funcall predicate tree))
+                     ((and (consp tree)
+                           (not (gethash tree seen)))
+                      (setf (gethash tree seen) t)
+                      (or (walk (car tree))
+                          (walk (cdr tree)))))))
+      (walk tree))))
+
 ;;; Return the innermost source form for NODE.
 (defun node-source-form (node)
   (declare (type node node))
   (let* ((path (node-source-path node))
-         (forms (source-path-forms path)))
+         (forms (remove-if (lambda (x)
+                             (tree-some #'leaf-p x))
+                           (source-path-forms path))))
+    ;; another option: if first form includes a leaf, return
+    ;; find-original-source instead.
     (if forms
         (first forms)
         (values (find-original-source path)))))
@@ -774,6 +796,30 @@
     (if (listp use)
         (values nil nil)
         (values (node-source-form use) t))))
+
+(defun common-suffix (x y)
+  (let ((mismatch (mismatch x y :from-end t)))
+    (if mismatch
+        (subseq x mismatch)
+        x)))
+
+;;; If the LVAR has a single use, return NODE-SOURCE-FORM as a
+;;; singleton.  Otherwise, return a list of the lowest common
+;;; ancestor source form of all the uses (if it can be found),
+;;; followed by all the uses' source forms.
+(defun lvar-all-sources (lvar)
+  (let ((use (lvar-uses lvar)))
+    (if (listp use)
+        (let ((forms  '())
+              (path   (node-source-path (first use))))
+          (dolist (use use (cons (if (find 'original-source-start path)
+                                     (find-original-source path)
+                                     "a hairy form")
+                                 forms))
+            (pushnew (node-source-form use) forms)
+            (setf path (common-suffix path
+                                      (node-source-path use)))))
+        (list (node-source-form use)))))
 
 ;;; Return the unique node, delivering a value to LVAR.
 #!-sb-fluid (declaim (inline lvar-use))
@@ -1375,6 +1421,20 @@
 
   (values))
 
+;;; This function is called to unlink a node from its LVAR;
+;;; we assume that the LVAR's USE list has already been updated,
+;;; and that we only have to mark the node as up for dead code
+;;; elimination, and to clear it LVAR slot.
+(defun flush-node (node)
+  (declare (type node node))
+  (let* ((prev (node-prev node))
+         (block (ctran-block prev)))
+    (reoptimize-component (block-component block) t)
+    (setf (block-attributep (block-flags block)
+                            flush-p type-asserted type-check)
+          t))
+  (setf (node-lvar node) nil))
+
 ;;; This function is called by people who delete nodes; it provides a
 ;;; way to indicate that the value of a lvar is no longer used. We
 ;;; null out the LVAR-DEST, set FLUSH-P in the blocks containing uses
@@ -1387,13 +1447,7 @@
     (setf (lvar-dest lvar) nil)
     (flush-lvar-externally-checkable-type lvar)
     (do-uses (use lvar)
-      (let ((prev (node-prev use)))
-        (let ((block (ctran-block prev)))
-          (reoptimize-component (block-component block) t)
-          (setf (block-attributep (block-flags block)
-                                  flush-p type-asserted type-check)
-                t)))
-      (setf (node-lvar use) nil))
+      (flush-node use))
     (setf (lvar-uses lvar) nil))
   (values))
 
@@ -1840,7 +1894,7 @@ is :ANY, the function name is not checked."
 ;;;; leaf hackery
 
 ;;; Change the LEAF that a REF refers to.
-(defun change-ref-leaf (ref leaf)
+(defun change-ref-leaf (ref leaf &key recklessly)
   (declare (type ref ref) (type leaf leaf))
   (unless (eq (ref-leaf ref) leaf)
     (push ref (leaf-refs leaf))
@@ -1855,7 +1909,7 @@ is :ANY, the function name is not checked."
                  (eq lvar (basic-combination-fun dest))
                  (csubtypep ltype (specifier-type 'function))))
           (setf (node-derived-type ref) vltype)
-          (derive-node-type ref vltype)))
+          (derive-node-type ref vltype :from-scratch recklessly)))
     (reoptimize-lvar (node-lvar ref)))
   (values))
 

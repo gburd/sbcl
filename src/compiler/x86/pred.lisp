@@ -82,7 +82,7 @@
    the values, and VOP-name the name of the VOP that will be used
    to execute the conditional move.")
 
-(!def-vm-support-routine
+(defun
     convert-conditional-move-p (node dst-tn x-tn y-tn)
   (declare (ignore node))
   (let* ((ptype (sb!c::tn-primitive-type dst-tn))
@@ -177,7 +177,7 @@
   (:info)
   (:policy :fast-safe)
   (:translate eq)
-  (:generator 3
+  (:generator 8
     (let ((x-val (encode-value-if-immediate x))
           (y-val (encode-value-if-immediate y)))
       (cond
@@ -189,3 +189,15 @@
         ((sc-is x immediate) (inst cmp y x-val))
 
         (t (inst cmp x y-val))))))
+
+(macrolet ((def (eq-name eql-name)
+             `(define-vop (,eq-name ,eql-name)
+                (:translate eq))))
+  (def fast-if-eq-character fast-char=/character)
+  (def fast-if-eq-character/c fast-char=/character/c)
+  (def fast-if-eq-fixnum fast-eql/fixnum)
+  (def fast-if-eq-fixnum/c fast-eql-c/fixnum)
+  (def fast-if-eq/signed fast-if-eql/signed)
+  (def fast-if-eq-c/signed fast-if-eql-c/signed)
+  (def fast-if-eq/unsigned fast-if-eql/unsigned)
+  (def fast-if-eq-c/unsigned fast-if-eql-c/unsigned))

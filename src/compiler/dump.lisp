@@ -389,6 +389,14 @@
                   (float (dump-float x file))
                   (integer (dump-integer x file)))
                 (equal-save-object x file)))
+             #!+sb-simd-pack
+             (simd-pack
+              (unless (equal-check-table x file)
+                (dump-fop 'fop-simd-pack file)
+                (dump-integer-as-n-bytes (%simd-pack-tag  x) 8 file)
+                (dump-integer-as-n-bytes (%simd-pack-low  x) 8 file)
+                (dump-integer-as-n-bytes (%simd-pack-high x) 8 file))
+              (equal-save-object x file))
              (t
               ;; This probably never happens, since bad things tend to
               ;; be detected during IR1 conversion.
@@ -1139,7 +1147,10 @@
                 (dump-push (cdr entry) fasl-output))
                (:fdefinition
                 (dump-object (cdr entry) fasl-output)
-                (dump-fop 'fop-fdefinition fasl-output))))
+                (dump-fop 'fop-fdefinition fasl-output))
+               (:known-fun
+                (dump-object (cdr entry) fasl-output)
+                (dump-fop 'fop-known-fun fasl-output))))
             (null
              (dump-fop 'fop-misc-trap fasl-output)))))
 

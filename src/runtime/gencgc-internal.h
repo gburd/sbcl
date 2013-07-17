@@ -51,10 +51,14 @@ int gencgc_handle_wp_violation(void *);
  * output the C version in genesis. -- JES, 2006-12-30.
  */
 struct page {
-    /* This is the offset from the start of the page to the start of
-     * the alloc_region which contains/contained it.
+    /* This is the offset from the first byte of some object in memory
+     * prior to and no closer than the start of the page to the start
+     * of the page.  Lower values here are better, 0 is ideal.  This
+     * is useful for determining where to start when scanning forward
+     * through a heap page (either for conservative root validation or
+     * for scavenging).
      */
-    os_vm_size_t region_start_offset;
+    os_vm_size_t scan_start_offset;
 
     /* the number of bytes of this page that are used. This may be less
      * than the actual bytes used for pages within the current
@@ -75,10 +79,13 @@ struct page {
          * written during a GC. */
         write_protected_cleared :1,
         /*  000 free
-         *  10? boxed data
-         *  11? boxed code
-         *  01? unboxed data
-         *  ??1 open region
+         *  ?01 boxed data
+         *  ?10 unboxed data
+         *  ?11 code
+         *  1?? open region
+         *
+         * Constants for this field are defined in gc-internal.h, the
+         * xxx_PAGE_FLAG definitions.
          *
          * If the page is free the following slots are invalid, except
          * for the bytes_used which must be zero. */
@@ -109,9 +116,10 @@ extern struct page *page_table;
 
 
 /* forward declarations */
-
+#ifdef LISP_FEATURE_X86
 void sniff_code_object(struct code *code, os_vm_size_t displacement);
 void gencgc_apply_code_fixups(struct code *old_code, struct code *new_code);
+#endif
 
 sword_t update_dynamic_space_free_pointer(void);
 void gc_alloc_update_page_tables(int page_type_flag, struct alloc_region *alloc_region);

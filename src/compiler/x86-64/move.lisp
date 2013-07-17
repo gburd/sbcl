@@ -256,25 +256,49 @@
 
 
 ;;; Arg is a fixnum or bignum, figure out which and load if necessary.
+#-#.(cl:if (cl:= sb!vm:n-fixnum-tag-bits 1) '(:and) '(:or))
 (define-vop (move-to-word/integer)
-  (:args (x :scs (descriptor-reg) :target eax))
+  (:args (x :scs (descriptor-reg) :target rax))
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "integer to untagged word coercion")
-  (:temporary (:sc unsigned-reg :offset eax-offset
-                   :from (:argument 0) :to (:result 0) :target y) eax)
+  ;; I'm not convinced that increasing the demand for rAX is
+  ;; better than adding 1 byte to some instruction encodings.
+  ;; I'll leave it alone though.
+  (:temporary (:sc unsigned-reg :offset rax-offset
+               :from (:argument 0) :to (:result 0) :target y) rax)
   (:generator 4
-    (move eax x)
+    (move rax x)
     (inst test al-tn fixnum-tag-mask)
     (inst jmp :z FIXNUM)
-    (loadw y eax bignum-digits-offset other-pointer-lowtag)
+    (loadw y rax bignum-digits-offset other-pointer-lowtag)
     (inst jmp DONE)
     FIXNUM
-    (inst sar eax n-fixnum-tag-bits)
-    (move y eax)
+    (inst sar rax n-fixnum-tag-bits)
+    (move y rax)
     DONE))
+
+#+#.(cl:if (cl:= sb!vm:n-fixnum-tag-bits 1) '(:and) '(:or))
+(define-vop (move-to-word/integer)
+  (:args (x :scs (descriptor-reg) :target y))
+  (:results (y :scs (signed-reg unsigned-reg)))
+  (:note "integer to untagged word coercion")
+  (:temporary (:sc unsigned-reg) backup)
+  (:generator 4
+    (move y x)
+    (if (location= x y)
+        ;; It would be great if a principled way existed to advise GC of
+        ;; algebraic transforms such as 2*R being a conservative root.
+        ;; Until that is possible, emit straightforward code that uses
+        ;; a copy of the potential reference.
+        (move backup x)
+        (setf backup x))
+    (inst sar y 1)      ; optimistically assume it's a fixnum
+    (inst jmp :nc DONE) ; no carry implies tag was 0
+    (loadw y backup bignum-digits-offset other-pointer-lowtag)
+    DONE))
+
 (define-move-vop move-to-word/integer :move
   (descriptor-reg) (signed-reg unsigned-reg))
-
 
 ;;; Result is a fixnum, so we can just shift. We need the result type
 ;;; restriction because of the control-stack ambiguity noted above.
@@ -303,35 +327,44 @@
 ;;; as the case may be. Fixnum case inline, bignum case in an assembly
 ;;; routine.
 (define-vop (move-from-signed)
-  (:args (x :scs (signed-reg unsigned-reg) :to :result))
-  (:results (y :scs (any-reg descriptor-reg) :from :argument))
+  (:args (x :scs (signed-reg unsigned-reg) :to :result . #.(and (= 1 n-fixnum-tag-bits)
+                                                                '(:target y))))
+  (:results (y :scs (any-reg descriptor-reg) . #.(and (> n-fixnum-tag-bits 1)
+                                                      '(:from :argument))))
   (:note "signed word to integer coercion")
   ;; Worst case cost to make sure people know they may be number consing.
   (:generator 20
-     (aver (not (location= x y)))
-     (let ((done (gen-label)))
-       (inst imul y x #.(ash 1 n-fixnum-tag-bits))
-       (inst jmp :no done)
-       (inst mov y x)
-       (inst lea temp-reg-tn
-             (make-ea :qword :disp
-                      (make-fixup (ecase (tn-offset y)
-                                    (#.rax-offset 'alloc-signed-bignum-in-rax)
-                                    (#.rcx-offset 'alloc-signed-bignum-in-rcx)
-                                    (#.rdx-offset 'alloc-signed-bignum-in-rdx)
-                                    (#.rbx-offset 'alloc-signed-bignum-in-rbx)
-                                    (#.rsi-offset 'alloc-signed-bignum-in-rsi)
-                                    (#.rdi-offset 'alloc-signed-bignum-in-rdi)
-                                    (#.r8-offset  'alloc-signed-bignum-in-r8)
-                                    (#.r9-offset  'alloc-signed-bignum-in-r9)
-                                    (#.r10-offset 'alloc-signed-bignum-in-r10)
-                                    (#.r12-offset 'alloc-signed-bignum-in-r12)
-                                    (#.r13-offset 'alloc-signed-bignum-in-r13)
-                                    (#.r14-offset 'alloc-signed-bignum-in-r14)
-                                    (#.r15-offset 'alloc-signed-bignum-in-r15))
-                                  :assembly-routine)))
-       (inst call temp-reg-tn)
-       (emit-label done))))
+     (cond ((= 1 n-fixnum-tag-bits)
+            (move y x)
+            (inst shl y 1)
+            (inst jmp :no DONE)
+            (if (location= y x)
+                (inst rcr y 1) ; we're about to cons a bignum. this RCR is noise
+                (inst mov y x)))
+           (t
+            (aver (not (location= x y)))
+            (inst imul y x #.(ash 1 n-fixnum-tag-bits))
+            (inst jmp :no DONE)
+            (inst mov y x)))
+     (inst lea temp-reg-tn
+           (make-ea :qword :disp
+                    (make-fixup (ecase (tn-offset y)
+                                  (#.rax-offset 'alloc-signed-bignum-in-rax)
+                                  (#.rcx-offset 'alloc-signed-bignum-in-rcx)
+                                  (#.rdx-offset 'alloc-signed-bignum-in-rdx)
+                                  (#.rbx-offset 'alloc-signed-bignum-in-rbx)
+                                  (#.rsi-offset 'alloc-signed-bignum-in-rsi)
+                                  (#.rdi-offset 'alloc-signed-bignum-in-rdi)
+                                  (#.r8-offset  'alloc-signed-bignum-in-r8)
+                                  (#.r9-offset  'alloc-signed-bignum-in-r9)
+                                  (#.r10-offset 'alloc-signed-bignum-in-r10)
+                                  (#.r12-offset 'alloc-signed-bignum-in-r12)
+                                  (#.r13-offset 'alloc-signed-bignum-in-r13)
+                                  (#.r14-offset 'alloc-signed-bignum-in-r14)
+                                  (#.r15-offset 'alloc-signed-bignum-in-r15))
+                                :assembly-routine)))
+     (inst call temp-reg-tn)
+     DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
 

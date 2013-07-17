@@ -1441,7 +1441,9 @@
                      (declare (type (alien (* (unsigned 8))) a)
                               (type (unsigned-byte 32) i))
                      (deref a i))))
-  (compiler-note () (error "The code is not optimized.")))
+  (compiler-note (c)
+    (unless (search "%ASH/RIGHT" (first (simple-condition-format-arguments c)))
+      (error "The code is not optimized."))))
 
 (handler-case
     (compile nil '(lambda (x)
@@ -4378,3 +4380,235 @@
 (with-test (:name :second-open-coded)
   (let ((fun (compile nil `(lambda (x) (second x)))))
     (assert (not (ctu:find-named-callees fun)))))
+
+(with-test (:name :svref-of-symbol-macro)
+  (compile nil `(lambda (x)
+                  (symbol-macrolet ((sv x))
+                    (values (svref sv 0) (setf (svref sv 0) 99))))))
+
+;; The compiler used to update the receiving LVAR's type too
+;; aggressively when converting a large constant to a smaller
+;; (potentially signed) one, causing other branches to be
+;; inferred as dead.
+(with-test (:name :modular-cut-constant-to-width)
+  (let ((test (compile nil
+                       `(lambda (x)
+                          (logand 254
+                                  (case x
+                                    ((3) x)
+                                    ((2 2 0 -2 -1 2) 9223372036854775803)
+                                    (t 358458651)))))))
+    (assert (= (funcall test -10470605025) 26))))
+
+(with-test (:name :append-type-derivation)
+  (let ((test-cases
+          '((lambda () (append 10)) (integer 10 10)
+            (lambda () (append nil 10)) (integer 10 10)
+            (lambda (x) (append x 10)) (or (integer 10 10) cons)
+            (lambda (x) (append x (cons 1 2))) cons
+            (lambda (x y) (append x (cons 1 2) y)) cons
+            (lambda (x y) (nconc x (the list y) x)) t
+            (lambda (x y) (nconc (the atom x) y)) t
+            (lambda (x y) (nconc (the (or null (eql 10)) x) y)) t
+            (lambda (x y) (nconc (the (or cons vector) x) y)) cons
+            (lambda (x y) (nconc (the sequence x) y)) t
+            (lambda (x y) (print (length y)) (append x y)) sequence
+            (lambda (x y) (print (length y)) (append x y)) sequence
+            (lambda (x y) (append (the (member (a) (b)) x) y)) cons
+            (lambda (x y) (append (the (member (a) (b) c) x) y)) cons
+            (lambda (x y) (append (the (member (a) (b) nil) x) y)) t)))
+    (loop for (function result-type) on test-cases by #'cddr
+          do (assert (sb-kernel:type= (sb-kernel:specifier-type
+                                       (car (cdaddr (sb-kernel:%simple-fun-type
+                                                     (compile nil function)))))
+                                      (sb-kernel:specifier-type result-type))))))
+
+(with-test (:name :bug-504121)
+  (compile nil `(lambda (s)
+                  (let ((p1 #'upper-case-p))
+                    (funcall
+                     (lambda (g)
+                       (funcall p1 g))))
+                  (let ((p2 #'(lambda (char) (upper-case-p char))))
+                    (funcall p2 s)))))
+
+(with-test (:name (:bug-504121 :optional-missing))
+  (compile nil `(lambda (s)
+                  (let ((p1 #'upper-case-p))
+                    (funcall
+                     (lambda (g &optional x)
+                       (funcall p1 g))))
+                  (let ((p2 #'(lambda (char) (upper-case-p char))))
+                    (funcall p2 s)))))
+
+(with-test (:name (:bug-504121 :optional-superfluous))
+  (compile nil `(lambda (s)
+                  (let ((p1 #'upper-case-p))
+                    (funcall
+                     (lambda (g &optional x)
+                       (funcall p1 g))
+                     #\1 2 3))
+                  (let ((p2 #'(lambda (char) (upper-case-p char))))
+                    (funcall p2 s)))))
+
+(with-test (:name (:bug-504121 :key-odd))
+  (compile nil `(lambda (s)
+                  (let ((p1 #'upper-case-p))
+                    (funcall
+                     (lambda (g &key x)
+                       (funcall p1 g))
+                     #\1 :x))
+                  (let ((p2 #'(lambda (char) (upper-case-p char))))
+                    (funcall p2 s)))))
+
+(with-test (:name (:bug-504121 :key-unknown))
+  (compile nil `(lambda (s)
+                  (let ((p1 #'upper-case-p))
+                    (funcall
+                     (lambda (g &key x)
+                       (funcall p1 g))
+                     #\1 :y 2))
+                  (let ((p2 #'(lambda (char) (upper-case-p char))))
+                    (funcall p2 s)))))
+
+(with-test (:name :bug-1181684)
+  (compile nil `(lambda ()
+                  (let ((hash #xD13CCD13))
+                    (setf hash (logand most-positive-word
+                                       (ash hash 5)))))))
+
+(with-test (:name (local-&optional-recursive-inline :bug-1180992))
+  (compile nil
+           `(lambda ()
+              (labels ((called (&optional a))
+                       (recursed (&optional b)
+                         (called)
+                         (recursed)))
+                (declare (inline recursed called))
+                (recursed)))))
+
+(with-test (:name :constant-fold-logtest)
+  (assert (equal (sb-kernel:%simple-fun-type
+                  (compile nil `(lambda (x)
+                                  (declare (type (mod 1024) x)
+                                           (optimize speed))
+                                  (logtest x 2048))))
+                 '(function ((unsigned-byte 10)) (values null &optional)))))
+
+;; type mismatches on LVARs with multiple potential sources used to
+;; be reported as mismatches with the value NIL.  Make sure we get
+;; a warning, but that it doesn't complain about a constant NIL ...
+;; of type FIXNUM.
+(with-test (:name (:multiple-use-lvar-interpreted-as-NIL cast))
+  (block nil
+    (handler-bind ((sb-int:type-warning
+                     (lambda (c)
+                       (assert
+                        (not (search "Constant "
+                                     (simple-condition-format-control
+                                      c))))
+                       (return))))
+      (compile nil `(lambda (x y z)
+                      (declare (type fixnum y z))
+                      (aref (if x y z) 0))))
+    (error "Where's my warning?")))
+
+(with-test (:name (:multiple-use-lvar-interpreted-as-NIL catch))
+  (block nil
+    (handler-bind ((style-warning
+                     (lambda (c)
+                       (assert
+                        (not (position
+                              nil
+                              (simple-condition-format-arguments c))))
+                       (return))))
+      (compile nil `(lambda (x y z f)
+                      (declare (type fixnum y z))
+                      (catch (if x y z) (funcall f)))))
+    (error "Where's my style-warning?")))
+
+;; Smoke test for rightward shifts
+(with-test (:name (:ash/right-signed))
+  (let* ((f (compile nil `(lambda (x y)
+                            (declare (type (mod ,(* 2 sb-vm:n-word-bits)) y)
+                                     (type sb-vm:signed-word x)
+                                     (optimize speed))
+                            (ash x (- y)))))
+         (max (ash most-positive-word -1))
+         (min (- -1 max)))
+    (flet ((test (x y)
+             (assert (= (ash x (- y))
+                        (funcall f x y)))))
+      (dotimes (x 32)
+        (dotimes (y (* 2 sb-vm:n-word-bits))
+          (test x y)
+          (test (- x) y)
+          (test (- max x) y)
+          (test (+ min x) y))))))
+
+(with-test (:name (:ash/right-unsigned))
+  (let ((f (compile nil `(lambda (x y)
+                           (declare (type (mod ,(* 2 sb-vm:n-word-bits)) y)
+                                    (type word x)
+                                    (optimize speed))
+                           (ash x (- y)))))
+        (max most-positive-word))
+    (flet ((test (x y)
+             (assert (= (ash x (- y))
+                        (funcall f x y)))))
+      (dotimes (x 32)
+        (dotimes (y (* 2 sb-vm:n-word-bits))
+          (test x y)
+          (test (- max x) y))))))
+
+(with-test (:name (:ash/right-fixnum))
+  (let ((f (compile nil `(lambda (x y)
+                           (declare (type (mod ,(* 2 sb-vm:n-word-bits)) y)
+                                    (type fixnum x)
+                                    (optimize speed))
+                           (ash x (- y))))))
+    (flet ((test (x y)
+             (assert (= (ash x (- y))
+                        (funcall f x y)))))
+      (dotimes (x 32)
+        (dotimes (y (* 2 sb-vm:n-word-bits))
+          (test x y)
+          (test (- x) y)
+          (test (- most-positive-fixnum x) y)
+          (test (+ most-negative-fixnum x) y))))))
+
+;; expected failure
+(test-util:with-test (:name :fold-index-addressing-positive-offset
+                      :fails-on '(and))
+  (let ((f (compile nil `(lambda (i)
+                           (if (typep i '(integer -31 31))
+                               (aref #. (make-array 63) (+ i 31))
+                               (error "foo"))))))
+    (funcall f -31)))
+
+;; 5d3a728 broke something like this in CL-PPCRE
+(test-util:with-test (:name :fold-index-addressing-potentially-negative-index)
+  (compile nil `(lambda (index vector)
+                  (declare (optimize speed (safety 0))
+                           ((simple-array character (*)) vector)
+                           ((unsigned-byte 24) index))
+                  (aref vector (1+ (mod index (1- (length vector))))))))
+
+(test-util:with-test (:name :constant-fold-ash/right-fixnum)
+  (compile nil `(lambda (a b)
+                  (declare (type fixnum a)
+                           (type (integer * -84) b))
+                  (ash a b))))
+
+(test-util:with-test (:name :constant-fold-ash/right-word)
+  (compile nil `(lambda (a b)
+                  (declare (type word a)
+                           (type (integer * -84) b))
+                  (ash a b))))
+
+(test-util:with-test (:name :nconc-derive-type)
+  (let ((function (compile nil `(lambda (x y)
+                                  (declare (type (or cons fixnum) x))
+                                  (nconc x y)))))
+    (assert (equal (sb-kernel:%simple-fun-type function)
+                   '(function ((or cons fixnum) t) (values cons &optional))))))

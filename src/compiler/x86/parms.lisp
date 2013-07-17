@@ -287,13 +287,8 @@
     sb!kernel:two-arg-ior
     sb!kernel:two-arg-xor
     sb!kernel:two-arg-gcd
-    sb!kernel:two-arg-lcm))
+    sb!kernel:two-arg-lcm
+    sb!kernel:%coerce-callable-to-fun))
 
-;;;; stuff added by jrd
-
-;;; FIXME: Is this used? Delete it or document it.
-;;; cf the sparc PARMS.LISP
-(defparameter *assembly-unit-length* 8)
-
 #!+win32
 (defconstant +win32-tib-arbitrary-field-offset+ #.(+ #xE10 (* 4 63)))

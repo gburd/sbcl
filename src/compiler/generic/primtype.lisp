@@ -95,7 +95,16 @@
 (/show0 "about to !DEF-PRIMITIVE-TYPE COMPLEX-DOUBLE-FLOAT")
 (!def-primitive-type complex-double-float (complex-double-reg descriptor-reg)
   :type (complex double-float))
-
+#!+sb-simd-pack
+(progn
+  (/show0 "about to !DEF-PRIMITIVE-TYPE SIMD-PACK")
+  (!def-primitive-type simd-pack-single (single-sse-reg descriptor-reg)
+    :type (simd-pack single-float))
+  (!def-primitive-type simd-pack-double (double-sse-reg descriptor-reg)
+    :type (simd-pack double-float))
+  (!def-primitive-type simd-pack-int (int-sse-reg descriptor-reg)
+   :type (simd-pack integer))
+  (!def-primitive-type-alias simd-pack (:or simd-pack-single simd-pack-double simd-pack-int)))
 
 ;;; primitive other-pointer array types
 (/show0 "primtype.lisp 96")
@@ -123,7 +132,7 @@
 
 ;;; Return the most restrictive primitive type that contains OBJECT.
 (/show0 "primtype.lisp 147")
-(!def-vm-support-routine primitive-type-of (object)
+(defun primitive-type-of (object)
   (let ((type (ctype-of object)))
     (cond ((not (member-type-p type)) (primitive-type type))
           ((and (eql 1 (member-type-size type))
@@ -142,7 +151,7 @@
 ;;; We need an aux function because we need to use both
 ;;; !DEF-VM-SUPPORT-ROUTINE and DEFUN-CACHED.
 (/show0 "primtype.lisp 188")
-(!def-vm-support-routine primitive-type (type)
+(defun primitive-type (type)
   (sb!kernel::maybe-reparse-specifier! type)
   (primitive-type-aux type))
 (/show0 "primtype.lisp 191")
@@ -372,8 +381,21 @@
                     (= (cdar pairs) (1- sb!xc:char-code-limit)))
                (exactly character)
                (part-of character))))
+        #!+sb-simd-pack
+        (simd-pack-type
+         (let ((eltypes (simd-pack-type-element-type type)))
+           (cond ((member 'integer eltypes)
+                  (exactly simd-pack-int))
+                 ((member 'single-float eltypes)
+                  (exactly simd-pack-single))
+                 ((member 'double-float eltypes)
+                  (exactly simd-pack-double)))))
         (built-in-classoid
          (case (classoid-name type)
+           #!+sb-simd-pack
+           ;; Can't tell what specific type; assume integers.
+           (simd-pack
+            (exactly simd-pack-int))
            ((complex function system-area-pointer weak-pointer)
             (values (primitive-type-or-lose (classoid-name type)) t))
            (cons-type

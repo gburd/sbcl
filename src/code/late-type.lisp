@@ -451,10 +451,11 @@
          *empty-type*)
         ((not (values-type-p type))
          type)
-        (t (or (car (args-type-required type))
-               (car (args-type-optional type))
-               (args-type-rest type)
-               (specifier-type 'null)))))
+        ((car (args-type-required type)))
+        (t (type-union (specifier-type 'null)
+                       (or (car (args-type-optional type))
+                           (args-type-rest type)
+                           (specifier-type 'null))))))
 
 ;;; Return the minimum number of arguments that a function can be
 ;;; called with, and the maximum number or NIL. If not a function
@@ -654,6 +655,19 @@
                               :rest rest)
             exactp)))
 
+(defun compare-key-args (type1 type2)
+  (let ((keys1 (args-type-keywords type1))
+        (keys2 (args-type-keywords type2)))
+    (and (= (length keys1) (length keys2))
+         (eq (args-type-allowp type1)
+             (args-type-allowp type2))
+         (loop for key1 in keys1
+               for match = (find (key-info-name key1)
+                                 keys2 :key #'key-info-name)
+               always (and match
+                           (type= (key-info-type key1)
+                                  (key-info-type match)))))))
+
 (defun type=-args (type1 type2)
   (macrolet ((compare (comparator field)
                (let ((reader (symbolicate '#:args-type- field)))
@@ -668,7 +682,7 @@
      (and/type (and/type (compare type=-list required)
                          (compare type=-list optional))
                (if (or (args-type-keyp type1) (args-type-keyp type2))
-                   (values nil nil)
+                   (values (compare-key-args type1 type2) t)
                    (values t t))))))
 
 ;;; Do a union or intersection operation on types that might be values
@@ -3480,6 +3494,60 @@ used for a COMPLEX component.~:@>"
                     :element-type (if (eq element-type '*)
                                       *wild-type*
                                       (specifier-type element-type)))))
+
+;;;; SIMD-PACK types
+#!+sb-simd-pack
+(progn
+  (!define-type-class simd-pack)
+
+  (!def-type-translator simd-pack (&optional (element-type-spec '*))
+     (if (eql element-type-spec '*)
+         (%make-simd-pack-type *simd-pack-element-types*)
+         (make-simd-pack-type (single-value-specifier-type element-type-spec))))
+
+  (!define-type-method (simd-pack :negate) (type)
+     (let ((remaining (set-difference *simd-pack-element-types*
+                                      (simd-pack-type-element-type type)))
+           (not-simd-pack (make-negation-type :type (specifier-type 'simd-pack))))
+       (if remaining
+           (type-union2 not-simd-pack (%make-simd-pack-type remaining))
+           not-simd-pack)))
+
+  (!define-type-method (simd-pack :unparse) (type)
+     (let ((eltypes (simd-pack-type-element-type type)))
+       (cond ((equal eltypes *simd-pack-element-types*)
+              'simd-pack)
+             ((= 1 (length eltypes))
+              `(simd-pack ,(first eltypes)))
+             (t
+              `(or ,@(mapcar (lambda (eltype)
+                               `(simd-pack ,eltype))
+                             eltypes))))))
+
+  (!define-type-method (simd-pack :simple-=) (type1 type2)
+     (declare (type simd-pack-type type1 type2))
+     (null (set-exclusive-or (simd-pack-type-element-type type1)
+                             (simd-pack-type-element-type type2))))
+
+  (!define-type-method (simd-pack :simple-subtypep) (type1 type2)
+     (declare (type simd-pack-type type1 type2))
+     (subsetp (simd-pack-type-element-type type1)
+              (simd-pack-type-element-type type2)))
+
+  (!define-type-method (simd-pack :simple-union2) (type1 type2)
+     (declare (type simd-pack-type type1 type2))
+     (%make-simd-pack-type (union (simd-pack-type-element-type type1)
+                                  (simd-pack-type-element-type type2))))
+
+  (!define-type-method (simd-pack :simple-intersection2) (type1 type2)
+     (declare (type simd-pack-type type1 type2))
+     (let ((intersection (intersection (simd-pack-type-element-type type1)
+                                       (simd-pack-type-element-type type2))))
+       (if intersection
+           (%make-simd-pack-type intersection)
+           *empty-type*)))
+
+  (!define-superclasses simd-pack ((simd-pack)) !cold-init-forms))
 
 ;;;; utilities shared between cross-compiler and target system
 

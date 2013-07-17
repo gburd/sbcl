@@ -555,7 +555,8 @@ status slot."
   (search sb-alien:int)
   (envp (* sb-alien:c-string))
   (pty-name sb-alien:c-string)
-  (wait sb-alien:int))
+  (wait sb-alien:int)
+  (pwd sb-alien:c-string))
 
 ;;; FIXME: There shouldn't be two semiredundant versions of the
 ;;; documentation. Since this is a public extension function, the
@@ -617,7 +618,8 @@ status slot."
                     (error :output)
                     (if-error-exists :error)
                     status-hook
-                    (external-format :default))
+                    (external-format :default)
+                    (directory nil directory-p))
   #+sb-doc
   #.(concatenate
      'string
@@ -702,7 +704,10 @@ Users Manual for details about the PROCESS structure."#-win32"
       This is a function the system calls whenever the status of the
       process changes.  The function takes the process as an argument.
    :EXTERNAL-FORMAT
-      The external-format to use for :INPUT, :OUTPUT, and :ERROR :STREAMs.")
+      The external-format to use for :INPUT, :OUTPUT, and :ERROR :STREAMs.
+   :DIRECTORY
+      Specifies the directory in which the program should be run.
+      NIL (the default) means the directory is unchanged.")
   #-win32
   (when (and env-p environment-p)
     (error "can't specify :ENV and :ENVIRONMENT simultaneously"))
@@ -809,23 +814,26 @@ Users Manual for details about the PROCESS structure."#-win32"
                              (with-args-vec (args-vec simple-args)
                                (with-no-with (#+win32 (environment-vec))
                                  (with-environment-vec (environment-vec)
-                                   (setq child
-                                         #+win32
-                                         (sb-win32::mswin-spawn
-                                          progname
-                                          (with-output-to-string (argv)
-                                            (dolist (arg simple-args)
-                                              (write-string arg argv)
-                                              (write-char #\Space argv)))
-                                          stdin stdout stderr
-                                          search nil wait)
-                                         #-win32
-                                         (without-gcing
+                                   (let ((pwd-string
+                                           (and directory-p (native-namestring directory))))
+                                     (setq child
+                                           #+win32
+                                           (sb-win32::mswin-spawn
+                                            progname
+                                            (with-output-to-string (argv)
+                                              (dolist (arg simple-args)
+                                                (write-string arg argv)
+                                                (write-char #\Space argv)))
+                                            stdin stdout stderr
+                                            search nil wait pwd-string)
+                                           #-win32
+                                           (without-gcing
                                              (spawn progname args-vec
                                                     stdin stdout stderr
                                                     (if search 1 0)
                                                     environment-vec pty-name
-                                                    (if wait 1 0))))
+                                                    (if wait 1 0)
+                                                    pwd-string))))
                                    (unless (minusp child)
                                      (setf proc
                                            (apply
@@ -846,10 +854,15 @@ Users Manual for details about the PROCESS structure."#-win32"
                                      (push proc *active-processes*)))))))
                          ;; Report the error outside the lock.
                          (case child
-                           (-2
-                            (error "Couldn't execute ~S: ~A" progname (strerror)))
                            (-1
-                            (error "Couldn't fork child process: ~A" (strerror)))))))))))
+                            (error "Couldn't fork child process: ~A"
+                                   (strerror)))
+                           (-2
+                            (error "Couldn't execute ~S: ~A"
+                                   progname (strerror)))
+                           (-3
+                            (error "Couldn't change directory to ~S: ~A"
+                                   directory (strerror)))))))))))
         (dolist (fd *close-in-parent*)
           (sb-unix:unix-close fd))
         (unless proc

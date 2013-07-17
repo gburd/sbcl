@@ -55,6 +55,8 @@
    "Object is not of type SIMPLE-STRING.")
   (object-not-fixnum
    "Object is not of type FIXNUM.")
+  (object-not-mod
+   "Object is not of type (MOD X).")
   (object-not-vector
    "Object is not of type VECTOR.")
   (object-not-string
@@ -131,6 +133,9 @@
   #!+long-float
   (object-not-complex-long-float
    "Object is not of type (COMPLEX LONG-FLOAT).")
+  #!+sb-simd-pack
+  (object-not-simd-pack
+   "Object is not of type SIMD-PACK.")
   (object-not-weak-pointer
    "Object is not a WEAK-POINTER.")
   (object-not-instance

@@ -68,12 +68,15 @@
       (sleep 2))))
 
 ;;; SLEEP should not cons
-(with-test (:name (sleep :non-consing) :fails-on '(or (not :x86-64) :win32))
-  (ctu:assert-no-consing (sleep 0.00001)))
+(with-test (:name (sleep :non-consing) :fails-on :win32)
+  (ctu:assert-no-consing (sleep 0.00001s0))
+  (locally (declare (notinline sleep))
+    (ctu:assert-no-consing (sleep 0.00001s0))
+    (ctu:assert-no-consing (sleep 0.00001d0))
+    (ctu:assert-no-consing (sleep 1/100000003))))
 
-;;; SLEEP should work with large integers as well -- no timers
-;;; on win32, so don't test there.
-(with-test (:name (sleep pretty-much-forever) :skipped-on :win32)
+;;; SLEEP should work with large integers as well
+(with-test (:name (sleep pretty-much-forever))
   (assert (eq :timeout
               (handler-case
                   (sb-ext:with-timeout 1
@@ -135,3 +138,19 @@
   (disassemble (lambda (x y)
                  (= (the (complex single-float) x)
                     (the (complex single-float) y)))))
+
+;;; Check that SLEEP called with ratios (with no common factors with
+;;; 1000000000, and smaller than 1/1000000000) works more or less as
+;;; expected.
+(with-test (:name :sleep-ratios)
+  (let ((fun0a (compile nil '(lambda () (sleep 1/7))))
+        (fun0b (compile nil '(lambda () (sleep 1/100000000000000000000000000))))
+        (fun1 (compile nil '(lambda (x) (sleep x))))
+        (start-time (get-universal-time)))
+    (sleep 1/7)
+    (sleep 1/100000000000000000000000000)
+    (funcall fun0a)
+    (funcall fun0b)
+    (funcall fun1 1/7)
+    (funcall fun1 1/100000000000000000000000000)
+    (assert (< (- (get-universal-time) start-time) 2))))

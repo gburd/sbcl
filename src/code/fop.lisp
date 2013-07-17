@@ -322,6 +322,12 @@
     #!+long-float
     (define-float-fop fop-long-float 52 long-float)))
 
+#!+sb-simd-pack
+(define-fop (fop-simd-pack 88)
+  (with-fast-read-byte ((unsigned-byte 8) *fasl-input-stream*)
+    (%make-simd-pack (fast-read-s-integer 8)
+                     (fast-read-u-integer 8)
+                     (fast-read-u-integer 8))))
 
 ;;;; loading lists
 
@@ -593,6 +599,9 @@
 
 (define-fop (fop-fdefinition 60)
   (fdefinition-object (pop-stack) t))
+
+(define-fop (fop-known-fun 65)
+  (%coerce-name-to-fun (pop-stack)))
 
 (define-fop (fop-sanctify-for-execution 61)
   (let ((component (pop-stack)))
